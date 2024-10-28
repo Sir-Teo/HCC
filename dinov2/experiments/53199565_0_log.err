@@ -1,0 +1,39 @@
+/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/layers/swiglu_ffn.py:43: UserWarning: xFormers is available (SwiGLU)
+  warnings.warn("xFormers is available (SwiGLU)")
+/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/layers/attention.py:27: UserWarning: xFormers is available (Attention)
+  warnings.warn("xFormers is available (Attention)")
+/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/layers/block.py:33: UserWarning: xFormers is available (Block)
+  warnings.warn("xFormers is available (Block)")
+[rank0]:[W1028 01:42:06.902864856 ProcessGroupNCCL.cpp:4115] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier() to force use of a particular device,or call init_process_group() with a device_id.
+submitit ERROR (2024-10-28 01:42:13,118) - Submitted job triggered an exception
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/gpfs/scratch/wz1492/miniconda3/envs/dinov2/lib/python3.11/site-packages/submitit/core/_submit.py", line 11, in <module>
+[rank0]:     submitit_main()
+[rank0]:   File "/gpfs/scratch/wz1492/miniconda3/envs/dinov2/lib/python3.11/site-packages/submitit/core/submission.py", line 76, in submitit_main
+[rank0]:     process_job(args.folder)
+[rank0]:   File "/gpfs/scratch/wz1492/miniconda3/envs/dinov2/lib/python3.11/site-packages/submitit/core/submission.py", line 69, in process_job
+[rank0]:     raise error
+[rank0]:   File "/gpfs/scratch/wz1492/miniconda3/envs/dinov2/lib/python3.11/site-packages/submitit/core/submission.py", line 55, in process_job
+[rank0]:     result = delayed.result()
+[rank0]:              ^^^^^^^^^^^^^^^^
+[rank0]:   File "/gpfs/scratch/wz1492/miniconda3/envs/dinov2/lib/python3.11/site-packages/submitit/core/utils.py", line 137, in result
+[rank0]:     self._result = self.function(*self.args, **self.kwargs)
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/run/train/train.py", line 26, in __call__
+[rank0]:     train_main(self.args)
+[rank0]:   File "/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/train/train.py", line 313, in main
+[rank0]:     do_train(cfg, model, resume=not args.no_resume)
+[rank0]:   File "/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/train/train.py", line 194, in do_train
+[rank0]:     dataset = make_dataset(
+[rank0]:               ^^^^^^^^^^^^^
+[rank0]:   File "/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/data/loaders.py", line 88, in make_dataset
+[rank0]:     class_, kwargs = _parse_dataset_str(dataset_str)
+[rank0]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/gpfs/data/shenlab/wz1492/HCC/dinov2/dinov2/data/loaders.py", line 61, in _parse_dataset_str
+[rank0]:     elif class_ == "UnlabeledMedicalImageDataset":
+[rank0]:          ^^^^^^
+[rank0]: UnboundLocalError: cannot access local variable 'class_' where it is not associated with a value
+[rank0]:[W1028 01:42:13.754123155 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+srun: error: a100-4018: task 0: Exited with exit code 1
