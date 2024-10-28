@@ -36,7 +36,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         self,
         *,
         root: str,
-        extra: str,
+        extra: Optional[str] = None,  # Add extra as an argument
         transforms: Optional[Callable] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
