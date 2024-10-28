@@ -37,7 +37,11 @@ def get_args_parser(
         "--ngpus",
         "--gpus",
         "--gpus-per-node",
+<<<<<<< HEAD
         default=1,
+=======
+        default=8,
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
         type=int,
         help="Number of GPUs to request on each node",
     )
@@ -50,13 +54,21 @@ def get_args_parser(
     )
     parser.add_argument(
         "--timeout",
+<<<<<<< HEAD
         default=100,
+=======
+        default=2800,
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
         type=int,
         help="Duration of the job",
     )
     parser.add_argument(
         "--partition",
+<<<<<<< HEAD
         default="a100_short",
+=======
+        default=slurm_partition,
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
         type=str,
         help="Partition where to submit",
     )
@@ -84,14 +96,22 @@ def get_shared_folder() -> Path:
     user_checkpoint_path = get_user_checkpoint_path()
     if user_checkpoint_path is None:
         raise RuntimeError("Path to user checkpoint cannot be determined")
+<<<<<<< HEAD
     path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments")
+=======
+    path = user_checkpoint_path / "experiments"
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
     path.mkdir(exist_ok=True)
     return path
 
 
 def submit_jobs(task_class, args, name: str):
     if not args.output_dir:
+<<<<<<< HEAD
         args.output_dir = str(get_shared_folder() )
+=======
+        args.output_dir = str(get_shared_folder() / "%j")
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
@@ -118,5 +138,9 @@ def submit_jobs(task_class, args, name: str):
     job = executor.submit(task)
 
     logger.info(f"Submitted job_id: {job.job_id}")
+<<<<<<< HEAD
     str_output_dir = os.path.abspath(args.output_dir).replace("%J", str(job.job_id))
+=======
+    str_output_dir = os.path.abspath(args.output_dir).replace("%j", str(job.job_id))
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
     logger.info(f"Logs and checkpoints will be saved at: {str_output_dir}")

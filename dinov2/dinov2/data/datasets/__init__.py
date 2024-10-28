@@ -5,4 +5,7 @@
 
 from .image_net import ImageNet
 from .image_net_22k import ImageNet22k
+<<<<<<< HEAD
 from .medical_dataset import UnlabeledMedicalImageDataset
+=======
+>>>>>>> d9bc51f47e29558dccbf1cb9b97857285b4d2c6d
