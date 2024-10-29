@@ -1,1 +1,0 @@
-/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/53199573_submission.sh

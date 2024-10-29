@@ -1,8 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in the LICENSE file in the root directory of this source tree.
-
 import argparse
 import logging
 import os
@@ -36,8 +31,7 @@ def get_args_parser(
     parser.add_argument(
         "--ngpus",
         "--gpus",
-        "--gpus-per-node",
-        default=1,
+        default=2,
         type=int,
         help="Number of GPUs to request on each node",
     )
@@ -50,32 +44,28 @@ def get_args_parser(
     )
     parser.add_argument(
         "--timeout",
-        default=100,
+        default=280,  # 2 days in minutes
         type=int,
-        help="Duration of the job",
+        help="Duration of the job in minutes",
     )
     parser.add_argument(
+        "-p",
         "--partition",
-        default="a100_short",
+        default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium",
         type=str,
         help="Partition where to submit",
     )
     parser.add_argument(
-        "--use-volta32",
-        action="store_true",
-        help="Request V100-32GB GPUs",
+        "--cpus-per-task",
+        default=16,
+        type=int,
+        help="Number of CPUs per task",
     )
     parser.add_argument(
-        "--comment",
-        default="",
-        type=str,
-        help="Comment to pass to scheduler, e.g. priority message",
-    )
-    parser.add_argument(
-        "--exclude",
-        default="",
-        type=str,
-        help="Nodes to exclude",
+        "--mem",
+        default=100,
+        type=int,
+        help="Memory per node in GB",
     )
     return parser
 
@@ -91,18 +81,22 @@ def get_shared_folder() -> Path:
 
 def submit_jobs(task_class, args, name: str):
     if not args.output_dir:
-        args.output_dir = str(get_shared_folder() )
+        args.output_dir = str(get_shared_folder())
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
 
     kwargs = {}
-    if args.use_volta32:
+    if hasattr(args, 'use_volta32') and args.use_volta32:
         kwargs["slurm_constraint"] = "volta32gb"
-    if args.comment:
+    if hasattr(args, 'comment') and args.comment:
         kwargs["slurm_comment"] = args.comment
-    if args.exclude:
+    if hasattr(args, 'exclude') and args.exclude:
         kwargs["slurm_exclude"] = args.exclude
+
+    # Add new SLURM parameters
+    kwargs["slurm_cpus_per_task"] = args.cpus_per_task
+    kwargs["slurm_mem"] = f"{args.mem}GB"
 
     executor_params = get_slurm_executor_parameters(
         nodes=args.nodes,
