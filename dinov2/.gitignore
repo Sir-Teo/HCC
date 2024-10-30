@@ -3,9 +3,19 @@ dist/
 *.egg-info/
 **/__pycache__/
 
+
+experiments/
+
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**
 
 *.swp
+*.err
+*.log
+*.out
+*.pth
+*.pkl
+*.rank_0
+*.rank_1
 
 .vscode/

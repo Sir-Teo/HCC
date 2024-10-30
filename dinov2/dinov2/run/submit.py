@@ -44,14 +44,14 @@ def get_args_parser(
     )
     parser.add_argument(
         "--timeout",
-        default=280,  # 2 days in minutes
+        default=4319,  
         type=int,
         help="Duration of the job in minutes",
     )
     parser.add_argument(
         "-p",
         "--partition",
-        default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium",
+        default="a100_short", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium"
         type=str,
         help="Partition where to submit",
     )
