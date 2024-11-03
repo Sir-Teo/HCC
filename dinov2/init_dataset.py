@@ -1,5 +1,5 @@
-from dinov2.data.datasets import ImageNet,UnlabeledMedicalImageDataset
+from dinov2.data.datasets import ImageNet,UnlabeledMedicalImageDataset, CustomMRIClassificationDataset
 
 for split in ImageNet.Split:
-    dataset = ImageNet(split=split, root="/gpfs/data/mankowskilab/HCC/data/images", extra="/gpfs/data/mankowskilab/HCC/data/images")
+    dataset = CustomMRIClassificationDataset(split=split, root="/gpfs/data/mankowskilab/HCC/data/Series_Classification", extra="/gpfs/data/mankowskilab/HCC/data/Series_Classification")
     dataset.dump_extra()

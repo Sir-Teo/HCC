@@ -6,3 +6,4 @@
 from .image_net import ImageNet
 from .image_net_22k import ImageNet22k
 from .medical_dataset import UnlabeledMedicalImageDataset
+from .custom_classifcation import CustomMRIClassificationDataset

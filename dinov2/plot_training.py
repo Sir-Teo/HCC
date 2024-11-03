@@ -49,6 +49,7 @@ def plot_training_metrics(iterations, metrics):
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
+    plt.savefig('training_loss.png')
     
     # Create figure for training parameters
     plt.figure(figsize=(15, 10))
@@ -75,11 +76,11 @@ def plot_training_metrics(iterations, metrics):
     plt.legend()
     plt.tight_layout()
     
-    plt.show()
+    plt.savefig('training_metrics.png')
 
 if __name__ == "__main__":
     # Replace with your actual filename
-    filename = "dinov2/experiments/training_metrics.json"
+    filename = "/gpfs/data/mankowskilab/HCC/models/training_metrics.json"
     
     # Read and plot the metrics
     iterations, metrics = read_metrics(filename)

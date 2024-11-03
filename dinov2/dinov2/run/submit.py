@@ -74,7 +74,7 @@ def get_shared_folder() -> Path:
     user_checkpoint_path = get_user_checkpoint_path()
     if user_checkpoint_path is None:
         raise RuntimeError("Path to user checkpoint cannot be determined")
-    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments")
+    path = Path("/gpfs/data/mankowskilab/HCC/models")
     path.mkdir(exist_ok=True)
     return path
 
