@@ -47,16 +47,13 @@ val_df, test_df = train_test_split(temp_df, test_size=0.5, stratify=temp_df['Lab
 
 # Function to organize dataset by copying and converting image files into appropriate directories
 def organize_dataset(subset_df, subset_dir, subset_type):
-    entries = []
-    class_ids = []
-    class_names = []
+    image_count = {label: 0 for label in subset_df['Label'].unique()}
 
     for label in subset_df['Label'].unique():
         label_dir = os.path.join(subset_dir, label)
         os.makedirs(label_dir, exist_ok=True)
-        class_ids.append(label)
-        class_names.append(label)
 
+    total_images = 0
     for _, row in subset_df.iterrows():
         dlds_id = str(row['DLDS']).zfill(4)
         series_num = str(row['Series'])
@@ -65,13 +62,17 @@ def organize_dataset(subset_df, subset_dir, subset_type):
 
         for file_index in range(1, 51):  # Adjust as needed for the number of files
             source_file = f'/gpfs/data/mankowskilab/HCC/data/Series_Classification/{dlds_id}/{series_num}/{str(file_index).zfill(4)}.dicom'
-            destination_file = os.path.join(label_dir, f'{dlds_id}_{series_num}_{str(file_index).zfill(4)}.JPEG')
+            image_count[label] += 1
+            destination_file = os.path.join(label_dir, f'{label}_{image_count[label]}.JPEG')
             
             if os.path.exists(source_file):
                 convert_dicom_to_jpeg(source_file, destination_file)
-                entries.append(destination_file)
+                total_images += 1
             else:
-                print(f"Warning: {source_file} does not exist.")
+                pass
+                #print(f"Warning: {source_file} does not exist.")
+    
+    print(f"Total images in {subset_type}: {total_images}")
 
 # Organize training, validation, and test datasets
 organize_dataset(train_df, train_dir, 'TRAIN')

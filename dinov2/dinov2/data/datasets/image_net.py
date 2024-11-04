@@ -26,9 +26,9 @@ class _Split(Enum):
     @property
     def length(self) -> int:
         split_lengths = {
-            _Split.TRAIN: 1_281_167,
-            _Split.VAL: 50_000,
-            _Split.TEST: 100_000,
+            _Split.TRAIN: 34076,
+            _Split.VAL: 11290,
+            _Split.TEST: 11174,
         }
         return split_lengths[self]
 
@@ -40,7 +40,7 @@ class _Split(Enum):
         if self == _Split.TRAIN:
             basename = f"{class_id}_{actual_index}"
         else:  # self in (_Split.VAL, _Split.TEST):
-            basename = f"ILSVRC2012_{self.value}_{actual_index:08d}"
+            basename = f"{class_id}_{actual_index}"
         return os.path.join(dirname, basename + ".JPEG")
 
     def parse_image_relpath(self, image_relpath: str) -> Tuple[str, int]:
@@ -165,6 +165,8 @@ class ImageNet(ExtendedVisionDataset):
 
     def __len__(self) -> int:
         entries = self._get_entries()
+        print(f"Entries length: {len(entries)}")
+        print(f"Expected split length: {self.split.length}")
         assert len(entries) == self.split.length
         return len(entries)
 
