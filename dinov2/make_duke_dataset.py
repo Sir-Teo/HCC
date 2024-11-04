@@ -90,3 +90,11 @@ with open(labels_path, 'w') as f:
         f.write(label_entry)
 
 print("labels.txt generated in ImageNet label format.")
+
+from dinov2.data.datasets import ImageNet,UnlabeledMedicalImageDataset, CustomMRIClassificationDataset
+
+for split in ImageNet.Split:
+    dataset = CustomMRIClassificationDataset(split=split, root="/gpfs/data/mankowskilab/HCC/data/Series_Classification", extra="/gpfs/data/mankowskilab/HCC/data/Series_Classification")
+    dataset.dump_extra()
+
+print("Extra dataset files generated.")

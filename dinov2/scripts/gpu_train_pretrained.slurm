@@ -19,10 +19,10 @@ source ~/.bashrc
 conda activate dinov2
 
 python dinov2/run/eval/linear.py \
-    --config-file dinov2/configs/eval/vitg14_pretrain.yaml \
-    --pretrained-weights https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_pretrain.pth \
-    --output-dir /gpfs/data/mankowskilab/HCC/models/eval/training_24999/linear_pretrained \
+    --config-file dinov2/configs/eval/vitl14_pretrain.yaml \
+    --pretrained-weights https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth \
+    --output-dir /gpfs/data/shenlab/wz1492/HCC/dinov2/models/eval/training_24999/linear_pretrained-$SLURM_JOB_ID \
     --train-dataset ImageNet:split=TRAIN:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification \
-    --val-dataset ImageNet:split=VAL:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification
+    --val-dataset ImageNet:split=VAL:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification \
 
 
