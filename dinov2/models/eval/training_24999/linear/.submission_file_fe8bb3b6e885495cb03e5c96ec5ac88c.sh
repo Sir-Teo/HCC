@@ -1,1 +1,0 @@
-/gpfs/data/shenlab/wz1492/HCC/dinov2/models/eval/training_24999/linear/53746344_submission.sh
