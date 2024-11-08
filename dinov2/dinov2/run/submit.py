@@ -51,7 +51,7 @@ def get_args_parser(
     parser.add_argument(
         "-p",
         "--partition",
-        default="a100_short", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium"
+        default="a100_long,a100_short", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium"
         type=str,
         help="Partition where to submit",
     )
@@ -74,7 +74,9 @@ def get_shared_folder() -> Path:
     user_checkpoint_path = get_user_checkpoint_path()
     if user_checkpoint_path is None:
         raise RuntimeError("Path to user checkpoint cannot be determined")
-    path = Path("/gpfs/data/mankowskilab/HCC/models")
+    #path = Path("/gpfs/data/mankowskilab/HCC/models")
+    
+    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments")
     path.mkdir(exist_ok=True)
     return path
 

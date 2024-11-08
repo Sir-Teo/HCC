@@ -20,9 +20,20 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         self.samples = []
         for dirpath, _, filenames in os.walk(self.root):
             for file in filenames:
-                if file.lower().endswith(('.dcm', '.dicom', '.nii', '.nii.gz')):
-                    full_path = os.path.join(dirpath, file)
-                    self.samples.append(full_path)
+                full_path = os.path.join(dirpath, file)
+                if file.lower().endswith(('.dcm', '.dicom')):
+                    # For DICOM files, append as is
+                    self.samples.append((full_path, None))
+                elif file.lower().endswith(('.nii', '.nii.gz')):
+                    # For NIfTI files, append each slice as a separate sample
+                    nii_data = nib.load(full_path)
+                    shape = nii_data.shape  # Get the shape without loading the entire data
+                    slicing_axis = 2  # Choose the axis along which to slice (usually the axial axis)
+                    num_slices = shape[slicing_axis]
+                    for slice_index in range(num_slices):
+                        self.samples.append((full_path, slice_index))
+                else:
+                    continue
 
         if len(self.samples) == 0:
             raise ValueError(f"No DICOM or NIfTI files found in {root}")
@@ -37,7 +48,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
             image = ImageDataDecoder(image_data).decode()
         except Exception as e:
             raise RuntimeError(f"Cannot read image for sample {index}") from e
-        
+
         # Get target and decode it
         target = self.get_target(index)
         target = TargetDecoder(target).decode()
@@ -49,7 +60,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         return image, target
 
     def get_image_data(self, idx):
-        file_path = self.samples[idx]
+        file_path, slice_index = self.samples[idx]
 
         # Load the image and preprocess
         if file_path.lower().endswith(('.dcm', '.dicom')):
@@ -57,7 +68,14 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
             image = dicom_data.pixel_array
         elif file_path.lower().endswith(('.nii', '.nii.gz')):
             nii_data = nib.load(file_path)
-            image = nii_data.get_fdata()
+            # Read only the required slice
+            slicing_axis = 2  # Same as in __init__
+            # Build slicing object to get only the desired slice
+            slice_obj = [slice(None)] * 3  # Assuming data is 3D
+            slice_obj[slicing_axis] = slice(slice_index, slice_index + 1)
+            image_slice = nii_data.dataobj[tuple(slice_obj)]
+            image_slice = np.squeeze(image_slice)  # Remove the singleton dimension
+            image = image_slice
         else:
             raise ValueError(f'Unsupported file type: {file_path}')
 
@@ -84,7 +102,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         return image_bytes
 
     def get_target(self, idx):
-        file_path = self.samples[idx]
+        file_path, slice_index = self.samples[idx]
 
         if file_path.lower().endswith(('.dcm', '.dicom')):
             dicom_data = pydicom.dcmread(file_path)
@@ -110,6 +128,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         if image.ndim == 2:
             image = np.expand_dims(image, axis=0)  # [C, H, W]
         elif image.ndim == 3:
+            # If the image is still 3D after slicing, select the middle slice
             slice_dim = np.argmin(image.shape)
             if slice_dim != 0:
                 image = np.moveaxis(image, slice_dim, 0)

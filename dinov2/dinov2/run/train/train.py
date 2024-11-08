@@ -10,6 +10,10 @@ import sys
 from dinov2.logging import setup_logging
 from dinov2.train import get_args_parser as get_train_args_parser
 from dinov2.run.submit import get_args_parser, submit_jobs
+import torch
+torch.cuda.empty_cache()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
 
 
 logger = logging.getLogger("dinov2")
@@ -51,7 +55,7 @@ def main():
     setup_logging()
 
     assert os.path.exists(args.config_file), "Configuration file does not exist!"
-    submit_jobs(Trainer, args, name="dinov2:train")
+    submit_jobs(Trainer, args, name="dinov2:ssl")
     return 0
 
 
