@@ -12,6 +12,7 @@
 
 echo -e "GPUS = $CUDA_VISIBLE_DEVICES\n"
 nvidia-smi
+nvcc --version
 
 # activate conda environment
 module load gcc/8.1.0
@@ -20,8 +21,8 @@ conda activate dinov2
 
 python dinov2/run/eval/linear.py \
     --config-file /gpfs/data/mankowskilab/HCC/models/config.yaml \
-    --pretrained-weights /gpfs/data/mankowskilab/HCC/models/eval/training_24999/teacher_checkpoint.pth \
-    --output-dir /gpfs/data/shenlab/wz1492/HCC/dinov2/models/eval/training_24999/linear-$SLURM_JOB_ID \
+    --pretrained-weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_112499/teacher_checkpoint.pth \
+    --output-dir /gpfs/data/shenlab/wz1492/HCC/dinov2/models/eval/training_112499/linear-$SLURM_JOB_ID \
     --train-dataset ImageNet:split=TRAIN:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification \
     --val-dataset ImageNet:split=VAL:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification
 

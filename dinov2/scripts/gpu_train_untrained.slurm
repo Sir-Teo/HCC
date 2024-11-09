@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
 #SBATCH --time=12:00:00
-#SBATCH --job-name=dino_pretrained
+#SBATCH --job-name=dino_untrained
 #SBATCH --output=/gpfs/data/shenlab/wz1492/HCC/dinov2/logs/train-%J.log
 #SBATCH --exclude=a100-4020
 

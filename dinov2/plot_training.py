@@ -80,8 +80,7 @@ def plot_training_metrics(iterations, metrics):
 
 if __name__ == "__main__":
     # Replace with your actual filename
-    filename = "/gpfs/data/mankowskilab/HCC/models/training_metrics.json"
-    
+    filename = "/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/training_metrics.json"
     # Read and plot the metrics
     iterations, metrics = read_metrics(filename)
     plot_training_metrics(iterations, metrics)
