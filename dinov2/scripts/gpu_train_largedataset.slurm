@@ -20,10 +20,10 @@ source ~/.bashrc
 conda activate dinov2
 
 python dinov2/run/eval/linear.py \
-    --config-file /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/config.yaml \
-    --pretrained-weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_124999/teacher_checkpoint.pth \
-    --output-dir /gpfs/data/shenlab/wz1492/HCC/dinov2/models/eval/training_124999/linear-$SLURM_JOB_ID \
+    --config-file /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/config.yaml \
+    --pretrained-weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_24999/teacher_checkpoint.pth \
+    --output-dir /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/models/linear-$SLURM_JOB_ID \
     --train-dataset ImageNet:split=TRAIN:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification \
-    --val-dataset ImageNet:split=VAL:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification
+    --val-dataset ImageNet:split=VAL:root=/gpfs/data/mankowskilab/HCC/data/Series_Classification:extra=/gpfs/data/mankowskilab/HCC/data/Series_Classification \
 
 

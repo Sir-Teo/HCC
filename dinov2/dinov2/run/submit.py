@@ -51,13 +51,13 @@ def get_args_parser(
     parser.add_argument(
         "-p",
         "--partition",
-        default="a100_long,a100_short", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,a100_long,gpu8_short,gpu8_medium"
+        default="a100_short,a100_long", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,gpu8_short,gpu8_medium"
         type=str,
         help="Partition where to submit",
     )
     parser.add_argument(
         "--cpus-per-task",
-        default=16,
+        default=12,
         type=int,
         help="Number of CPUs per task",
     )
@@ -76,7 +76,7 @@ def get_shared_folder() -> Path:
         raise RuntimeError("Path to user checkpoint cannot be determined")
     #path = Path("/gpfs/data/mankowskilab/HCC/models")
     
-    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments")
+    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset_reg")
     path.mkdir(exist_ok=True)
     return path
 

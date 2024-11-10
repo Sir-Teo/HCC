@@ -5,6 +5,7 @@ dist/
 
 models/
 experiments/
+experiments*/
 
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**
