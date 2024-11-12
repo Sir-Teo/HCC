@@ -1,5 +1,3 @@
-Here's the enhanced markdown with hyperlinks added to each dataset:
-
 # HCC
 
 This is the repository for the Hepatocellular Carcinoma Recurrence Prediction project.
@@ -16,11 +14,19 @@ This is the repository for the Hepatocellular Carcinoma Recurrence Prediction pr
 
 - [**CHAOS Dataset**](https://chaos.grand-challenge.org/): The Combined (CT-MR) Healthy Abdominal Organ Segmentation dataset, featuring 40 CT and 120 MRI volumes with annotations for liver, kidneys, and spleen.
 
-With all combined, there are 330,000 images in total.
+With all combined, there are 330,000 images (MRI) in total.
 
 ### Classification Benchmark
 
 - [**Duke Liver Dataset**](https://scholars.duke.edu/publication/1589665): A publicly available liver MRI dataset with liver segmentation masks and series labels, consisting of 2,146 abdominal MRI series from 105 patients, including 310 image series with corresponding manually segmented liver masks.
+
+Dinov2 official evaluation code trains **52 linear classifiers** on top of frozen DINOv2 features to evaluate the model's representation quality. These classifiers are trained with different configurations, combining:
+
+1. **Number of Blocks Used**: Last 1 or last 4 blocks.
+2. **Average Pooling**: With and without pooling.
+3. **Learning Rates**: 13 different values.
+
+After training, each classifier's performance is evaluated, and the best one is selected based on accuracy.
 
 ### Our Task Dataset
 
