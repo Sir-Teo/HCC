@@ -1,19 +1,26 @@
+Here's the enhanced markdown with hyperlinks added to each dataset:
+
 # HCC
 
-This is the repository for the Hepatocellular Carcinoma Reoccurance Prediction project.
+This is the repository for the Hepatocellular Carcinoma Recurrence Prediction project.
 
 ## Dataset
 
-### SSL
+### SSL 
 
-- LLD dataset
-- Amos
-- LiverSegHCC
-- CHAOS
+- [**LLD-MMRI Dataset**](https://github.com/LMMMEng/LLD-MMRI-Dataset): An open-access dataset for liver lesion diagnosis on multi-phase MRI, comprising 498 cases with 7 different lesion types. (~220,000 images)
+  
+- [**AMOS Dataset**](https://arxiv.org/abs/2206.08023): A large-scale abdominal multi-organ benchmark for versatile medical image segmentation, including 500 CT and 100 MRI scans with annotations for 15 abdominal organs.
+  
+- [**LiverHCCSeg Dataset**](https://www.sciencedirect.com/science/article/pii/S2352340923007473) 17 HCC Cases
+
+- [**CHAOS Dataset**](https://chaos.grand-challenge.org/): The Combined (CT-MR) Healthy Abdominal Organ Segmentation dataset, featuring 40 CT and 120 MRI volumes with annotations for liver, kidneys, and spleen.
+
+With all combined, there are 330,000 images in total.
 
 ### Classification Benchmark
 
-- Duke Liver Dataset
+- [**Duke Liver Dataset**](https://scholars.duke.edu/publication/1589665): A publicly available liver MRI dataset with liver segmentation masks and series labels, consisting of 2,146 abdominal MRI series from 105 patients, including 310 image series with corresponding manually segmented liver masks.
 
 ### Our Task Dataset
 
