@@ -23,60 +23,81 @@ def read_metrics(filename):
     return iterations, metrics
 
 def plot_training_metrics(iterations, metrics):
-    """Create multiple subplot figures to visualize different metric groups."""
+    """Create a combined figure with enhanced styling for training metrics visualization."""
     
-    # Create figure for losses
-    plt.figure(figsize=(15, 10))
+    # Create figure with a grid of subplots
+    fig = plt.figure(figsize=(20, 15))
     
-    # Plot total loss
-    plt.subplot(2, 1, 1)
-    plt.plot(iterations, metrics['total_loss'], 'b-', label='Total Loss')
-    plt.title('Total Training Loss')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.legend()
+    # Color schemes
+    colors = plt.cm.Set2(np.linspace(0, 1, 8))
     
-    # Plot component losses
-    plt.subplot(2, 1, 2)
+    # Plot 1: Total Loss
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(iterations, metrics['total_loss'], color=colors[0], linewidth=2, label='Total Loss')
+    ax1.set_title('Total Training Loss', fontsize=14, pad=15)
+    ax1.set_xlabel('Iteration', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    ax1.legend(fontsize=10)
+    
+    # Plot 2: Component Losses
+    ax2 = plt.subplot(2, 2, 2)
     loss_components = ['dino_local_crops_loss', 'dino_global_crops_loss', 
                       'koleo_loss', 'ibot_loss']
-    for loss in loss_components:
-        plt.plot(iterations, metrics[loss], label=loss)
-    plt.title('Component Losses')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('training_loss.png')
+    for idx, loss in enumerate(loss_components):
+        ax2.plot(iterations, metrics[loss], color=colors[idx+1], 
+                linewidth=2, label=loss.replace('_', ' ').title())
+    ax2.set_title('Component Losses', fontsize=14, pad=15)
+    ax2.set_xlabel('Iteration', fontsize=12)
+    ax2.set_ylabel('Loss', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    ax2.legend(fontsize=10, bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # Create figure for training parameters
-    plt.figure(figsize=(15, 10))
+    # Plot 3: Training Parameters
+    ax3 = plt.subplot(2, 2, 3)
+    param_lines = []
+    param_lines.append(ax3.plot(iterations, metrics['lr'], 
+                              color=colors[5], linewidth=2, label='Learning Rate')[0])
+    param_lines.append(ax3.plot(iterations, metrics['last_layer_lr'], 
+                              color=colors[6], linewidth=2, label='Last Layer LR')[0])
     
-    # Plot learning rates and weight decay
-    plt.subplot(2, 1, 1)
-    plt.plot(iterations, metrics['lr'], label='Learning Rate')
-    plt.plot(iterations, metrics['last_layer_lr'], label='Last Layer LR')
-    plt.plot(iterations, metrics['wd'], label='Weight Decay')
-    plt.title('Training Parameters')
-    plt.xlabel('Iteration')
-    plt.ylabel('Value')
-    plt.grid(True)
-    plt.legend()
+    # Create twin axis for weight decay
+    ax3_twin = ax3.twinx()
+    param_lines.append(ax3_twin.plot(iterations, metrics['wd'], 
+                                   color=colors[7], linewidth=2, 
+                                   linestyle='--', label='Weight Decay')[0])
     
-    # Plot timing metrics
-    plt.subplot(2, 1, 2)
-    plt.plot(iterations, metrics['iter_time'], label='Iteration Time')
-    plt.plot(iterations, metrics['data_time'], label='Data Loading Time')
-    plt.title('Timing Metrics')
-    plt.xlabel('Iteration')
-    plt.ylabel('Time (seconds)')
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
+    ax3.set_title('Training Parameters', fontsize=14, pad=15)
+    ax3.set_xlabel('Iteration', fontsize=12)
+    ax3.set_ylabel('Learning Rate', fontsize=12)
+    ax3_twin.set_ylabel('Weight Decay', fontsize=12)
+    ax3.grid(True, linestyle='--', alpha=0.7)
     
-    plt.savefig('training_metrics.png')
+    # Combined legend for both axes
+    labs = [l.get_label() for l in param_lines]
+    ax3.legend(param_lines, labs, fontsize=10, loc='upper right')
+    
+    # Plot 4: Timing Metrics
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.plot(iterations, metrics['iter_time'], color=colors[3], 
+             linewidth=2, label='Iteration Time')
+    ax4.plot(iterations, metrics['data_time'], color=colors[4], 
+             linewidth=2, label='Data Loading Time')
+    ax4.set_title('Timing Metrics', fontsize=14, pad=15)
+    ax4.set_xlabel('Iteration', fontsize=12)
+    ax4.set_ylabel('Time (seconds)', fontsize=12)
+    ax4.grid(True, linestyle='--', alpha=0.7)
+    ax4.legend(fontsize=10)
+    
+    # Overall title
+    plt.suptitle('Training Progress Overview', fontsize=16, y=0.95)
+    
+    # Adjust layout
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save figure
+    plt.savefig('../img/training_overview_dinov2_reg.png', dpi=300, bbox_inches='tight')
+    plt.close()
 
 if __name__ == "__main__":
     # Replace with your actual filename
