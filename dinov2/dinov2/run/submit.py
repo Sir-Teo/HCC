@@ -76,7 +76,7 @@ def get_shared_folder() -> Path:
         raise RuntimeError("Path to user checkpoint cannot be determined")
     #path = Path("/gpfs/data/mankowskilab/HCC/models")
     
-    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset_reg")
+    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_superlarge")
     path.mkdir(exist_ok=True)
     return path
 

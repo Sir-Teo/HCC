@@ -20,3 +20,6 @@ experiments*/
 *.rank_1
 
 .vscode/
+pretrained_weights/
+logs/
+wandb/

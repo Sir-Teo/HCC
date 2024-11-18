@@ -65,6 +65,14 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
         # Load the image and preprocess
         if file_path.lower().endswith(('.dcm', '.dicom')):
             dicom_data = pydicom.dcmread(file_path)
+
+            # Fix the 'Bits Stored' warning if necessary
+            if dicom_data.file_meta.TransferSyntaxUID.is_compressed:
+                pixel_array = dicom_data.pixel_array
+                actual_bits_stored = pixel_array.dtype.itemsize * 8
+                if 'BitsStored' in dicom_data and dicom_data.BitsStored != actual_bits_stored:
+                    dicom_data.BitsStored = actual_bits_stored
+
             image = dicom_data.pixel_array
         elif file_path.lower().endswith(('.nii', '.nii.gz')):
             nii_data = nib.load(file_path)
@@ -100,6 +108,7 @@ class UnlabeledMedicalImageDataset(ExtendedVisionDataset):
             image_bytes = output.getvalue()
 
         return image_bytes
+
 
     def get_target(self, idx):
         file_path, slice_index = self.samples[idx]

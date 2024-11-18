@@ -2,12 +2,14 @@
 #
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
-
+import wandb
 import argparse
 import logging
 import math
 import os
 from functools import partial
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pydicom.pixel_data_handlers.pillow_handler")
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
@@ -281,6 +283,17 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
         metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
+        wandb.log({
+            "iteration": iteration,
+            "total_loss": losses_reduced,
+            "learning_rate": lr,
+            "weight_decay": wd,
+            "momentum": mom,
+            "last_layer_lr": last_layer_lr,
+            "current_batch_size": current_batch_size,
+            **loss_dict_reduced,  # Add all loss-related metrics
+        })
+
 
         # checkpointing and testing
 
@@ -295,6 +308,11 @@ def do_train(cfg, model, resume=False):
 
 
 def main(args):
+    wandb.init(
+    # set the wandb project where this run will be logged
+    project="HCC",
+    name = "super large dataset"
+    )
     cfg = setup(args)
 
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
@@ -315,4 +333,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args_parser(add_help=True).parse_args()
+    # start a new wandb run to track this script
     main(args)
