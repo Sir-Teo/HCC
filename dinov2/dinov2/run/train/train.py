@@ -6,7 +6,7 @@
 import logging
 import os
 import sys
-
+import wandb
 from dinov2.logging import setup_logging
 from dinov2.train import get_args_parser as get_train_args_parser
 from dinov2.run.submit import get_args_parser, submit_jobs
@@ -46,6 +46,7 @@ class Trainer(object):
 
 
 def main():
+    
     description = "Submitit launcher for DINOv2 training"
     train_args_parser = get_train_args_parser(add_help=False)
     parents = [train_args_parser]

@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 from typing import List, Optional
+import wandb
 
 import submitit
 
@@ -67,6 +68,12 @@ def get_args_parser(
         type=int,
         help="Memory per node in GB",
     )
+    parser.add_argument(
+        "--wandb-project-name",
+        default="Experiment001",
+        type=str,
+        help="Wandb project name",
+    )
     return parser
 
 
@@ -84,7 +91,7 @@ def get_shared_folder() -> Path:
 def submit_jobs(task_class, args, name: str):
     # if not args.output_dir:
     #     args.output_dir = str(get_shared_folder())
-
+    
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
 
@@ -115,4 +122,9 @@ def submit_jobs(task_class, args, name: str):
 
     logger.info(f"Submitted job_id: {job.job_id}")
     str_output_dir = os.path.abspath(args.output_dir).replace("%J", str(job.job_id))
+    wandb.init(
+    # set the wandb project where this run will be logged
+    project="HCC",
+    name = args.wandb_project_name,
+    )
     logger.info(f"Logs and checkpoints will be saved at: {str_output_dir}")
