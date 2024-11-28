@@ -51,7 +51,7 @@ def get_args_parser(
     parser.add_argument(
         "-p",
         "--partition",
-        default="a100_short,a100_long", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,gpu8_short,gpu8_medium"
+        default="a100_long,radiology", # default="a100_short,gpu4_short,gpu4_medium,a100_dev,gpu8_short,gpu8_medium"
         type=str,
         help="Partition where to submit",
     )
@@ -76,14 +76,14 @@ def get_shared_folder() -> Path:
         raise RuntimeError("Path to user checkpoint cannot be determined")
     #path = Path("/gpfs/data/mankowskilab/HCC/models")
     
-    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_superlarge")
+    path = Path("/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_superlarge2")
     path.mkdir(exist_ok=True)
     return path
 
 
 def submit_jobs(task_class, args, name: str):
-    if not args.output_dir:
-        args.output_dir = str(get_shared_folder())
+    # if not args.output_dir:
+    #     args.output_dir = str(get_shared_folder())
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)

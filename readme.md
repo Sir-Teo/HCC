@@ -34,16 +34,15 @@ After training, each classifier's performance is evaluated, and the best one is 
 
 ## How to Run SSL
 
-with registers
-
 ```
-python dinov2/run/train/train.py  --config-file dinov2/configs/train/vitl16_short_reg.yaml     train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images     output_dir=/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments2
-```
-
-without registers
-
-```
-python dinov2/run/train/train.py  --config-file dinov2/configs/train/vitl16_short.yaml     train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images     output_dir=/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments2
+python dinov2/run/train/train.py \
+--config-file dinov2/configs/train/vitl16_short.yaml  \
+--wandb-project-name "Experiment-001-Teo" \
+--output-dir "./models/Experiment_001" \
+--ngpus 4 \
+--timeout 10079 \
+--partition a100_long,radiology \
+train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images
 ```
 
 ## How to Run Classification Benchmark

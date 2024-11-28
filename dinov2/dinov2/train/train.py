@@ -56,7 +56,12 @@ For python-based LazyConfig, use "path.key=value".
         type=str,
         help="Output directory to save logs and checkpoints",
     )
-
+    parser.add_argument(
+        "--wandb-project-name",
+        default="Experiment001",
+        type=str,
+        help="Wandb project name",
+    )
     return parser
 
 
@@ -311,7 +316,7 @@ def main(args):
     wandb.init(
     # set the wandb project where this run will be logged
     project="HCC",
-    name = "super large dataset"
+    name = args.wandb_project_name,
     )
     cfg = setup(args)
 
