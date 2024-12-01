@@ -36,7 +36,7 @@ After training, each classifier's performance is evaluated, and the best one is 
 
 ```
 python dinov2/run/train/train.py \
---config-file dinov2/configs/train/vitl16_short.yaml  \
+--config-file dinov2/configs/train/vitl16_short_custom.yaml  \
 --wandb-project-name "Experiment-001-Teo" \
 --output-dir "./models/Experiment_001" \
 --ngpus 4 \

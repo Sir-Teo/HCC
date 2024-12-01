@@ -10,9 +10,9 @@ import os
 from functools import partial
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydicom.pixel_data_handlers.pillow_handler")
-
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
@@ -307,6 +307,14 @@ def do_train(cfg, model, resume=False):
 
 
 def main(args):
+
+    rank = distributed.get_global_rank()  # Get the rank of the current process
+
+    if rank == 0:  # Only the main process logs
+        wandb.init(project="HCC", name=args.wandb_project_name)
+    else:
+        # Suppress WandB in non-master processes
+        wandb.init(mode="disabled")
     cfg = setup(args)
 
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
@@ -327,5 +335,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args_parser(add_help=True).parse_args()
-    # start a new wandb run to track this script
+
     main(args)

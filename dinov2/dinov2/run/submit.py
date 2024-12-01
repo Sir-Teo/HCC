@@ -122,9 +122,4 @@ def submit_jobs(task_class, args, name: str):
 
     logger.info(f"Submitted job_id: {job.job_id}")
     str_output_dir = os.path.abspath(args.output_dir).replace("%J", str(job.job_id))
-    wandb.init(
-    # set the wandb project where this run will be logged
-    project="HCC",
-    name = args.wandb_project_name,
-    )
     logger.info(f"Logs and checkpoints will be saved at: {str_output_dir}")
