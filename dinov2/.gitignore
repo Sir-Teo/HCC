@@ -23,3 +23,6 @@ experiments*/
 pretrained_weights/
 logs/
 wandb/
+INFO
+result_prediction.png
+work_dirs/
