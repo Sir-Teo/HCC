@@ -18,4 +18,4 @@ module load gcc/8.1.0
 source ~/.bashrc 
 conda activate dinov2
 
-python segmentation.py
+python train_segmentation.py
