@@ -14,7 +14,10 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 from tqdm import tqdm
 
-# Keep the original ASPP, DeepLabV3PlusHead, and DinoV2Backbone classes the same
+# ---------------------------------------------
+# Model Components
+# ---------------------------------------------
+
 class ASPP(nn.Module):
     def __init__(self, in_channels, out_channels, atrous_rates=(6,12,18)):
         super(ASPP, self).__init__()
@@ -80,7 +83,7 @@ class DeepLabV3PlusHead(nn.Module):
         return x
 
 class DinoV2Backbone(nn.Module):
-    def __init__(self, weights_path, backbone_size="base"):
+    def __init__(self, weights_path=None, backbone_size="base", pretrained=True):
         super().__init__()
         # Map backbone size to model configuration
         backbone_configs = {
@@ -95,51 +98,62 @@ class DinoV2Backbone(nn.Module):
             
         config = backbone_configs[backbone_size]
         
-        # Initialize vision transformer with correct configuration
-        self.dino_model = torch.hub.load(
-            "facebookresearch/dinov2", 
-            f"dinov2_vit{backbone_size[0]}{config['patch_size']}", 
-            pretrained=False
-        )
-        
-        # Load local weights
-        try:
-            state_dict = torch.load(weights_path, map_location='cpu')
-            # Handle both cases where state_dict is wrapped in 'state_dict' key or not
-            if 'state_dict' in state_dict:
-                state_dict = state_dict['state_dict']
-            if 'teacher' in state_dict:
-                state_dict = state_dict['teacher']
+        # Load the official pre-trained DINOv2 model if pretrained=True
+        if pretrained:
+            self.dino_model = torch.hub.load(
+                "facebookresearch/dinov2", 
+                f"dinov2_vit{backbone_size[0]}{config['patch_size']}", 
+                pretrained=True  # Official pretrained weights
+            )
+            print(f"Loaded official pre-trained DINOv2 ViT{backbone_size[0]}{config['patch_size']} model from torch.hub")
+        else:
+            # Initialize vision transformer without pre-trained weights
+            self.dino_model = torch.hub.load(
+                "facebookresearch/dinov2", 
+                f"dinov2_vit{backbone_size[0]}{config['patch_size']}", 
+                pretrained=False
+            )
+            print(f"Initialized DINOv2 ViT{backbone_size[0]}{config['patch_size']} model without pre-trained weights")
+            
+            if weights_path:
+                # Load local weights
+                try:
+                    state_dict = torch.load(weights_path, map_location='cpu')
+                    # Handle both cases where state_dict is wrapped in 'state_dict' key or not
+                    if 'state_dict' in state_dict:
+                        state_dict = state_dict['state_dict']
+                    if 'teacher' in state_dict:
+                        state_dict = state_dict['teacher']
 
-            # Remove 'module.' and 'backbone.' prefixes if present (from DataParallel/DistributedDataParallel)
-            state_dict = {k.replace('module.', '').replace('backbone.', ''): v for k, v in state_dict.items()}
-            
-            # Identify keys to exclude
-            exclude_keys = ['pos_embed', 'patch_embed.proj.weight', 'patch_embed.proj.bias']
-            
-            # Create a new state_dict excluding the mismatched keys
-            filtered_state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(ex_key) for ex_key in exclude_keys)}
-            
-            # Load the filtered state_dict
-            missing_keys, unexpected_keys = self.dino_model.load_state_dict(filtered_state_dict, strict=False)
-            print(f"Loaded weights from {weights_path}")
-            if missing_keys:
-                print(f"Missing keys: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys: {unexpected_keys}")
-            
-            # Count loaded parameters that match the model's state_dict
-            model_state_dict = self.dino_model.state_dict()
-            loaded_params = 0
-            for k, v in filtered_state_dict.items():
-                if k in model_state_dict and v.shape == model_state_dict[k].shape:
-                    loaded_params += v.numel()
-            
-            total_params = sum(p.numel() for p in model_state_dict.values())
-            print(f"Loaded {loaded_params} / {total_params} parameters ({(loaded_params / total_params) * 100:.2f}%)")
-            
-        except Exception as e:
-            raise Exception(f"Error loading weights from {weights_path}: {str(e)}")
+                    # Remove 'module.' and 'backbone.' prefixes if present (from DataParallel/DistributedDataParallel)
+                    state_dict = {k.replace('module.', '').replace('backbone.', ''): v for k, v in state_dict.items()}
+                    
+                    # Identify keys to exclude
+                    exclude_keys = ['pos_embed', 'patch_embed.proj.weight', 'patch_embed.proj.bias']
+                    
+                    # Create a new state_dict excluding the mismatched keys
+                    filtered_state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(ex_key) for ex_key in exclude_keys)}
+                    
+                    # Load the filtered state_dict
+                    missing_keys, unexpected_keys = self.dino_model.load_state_dict(filtered_state_dict, strict=False)
+                    print(f"Loaded weights from {weights_path}")
+                    if missing_keys:
+                        print(f"Missing keys: {missing_keys}")
+                    if unexpected_keys:
+                        print(f"Unexpected keys: {unexpected_keys}")
+                    
+                    # Count loaded parameters that match the model's state_dict
+                    model_state_dict = self.dino_model.state_dict()
+                    loaded_params = 0
+                    for k, v in filtered_state_dict.items():
+                        if k in model_state_dict and v.shape == model_state_dict[k].shape:
+                            loaded_params += v.numel()
+                    
+                    total_params = sum(p.numel() for p in model_state_dict.values())
+                    print(f"Loaded {loaded_params} / {total_params} parameters ({(loaded_params / total_params) * 100:.2f}%)")
+                    
+                except Exception as e:
+                    raise Exception(f"Error loading weights from {weights_path}: {str(e)}")
         
         self.dino_model.eval()
         
@@ -147,9 +161,6 @@ class DinoV2Backbone(nn.Module):
         for param in self.dino_model.parameters():
             param.requires_grad = False
             
-        # Optionally, re-initialize excluded layers if necessary
-        # self._initialize_excluded_layers()
-        
     def forward(self, x):
         x = x.to(next(self.parameters()).device)
         x = self.dino_model.prepare_tokens_with_masks(x)
@@ -158,17 +169,13 @@ class DinoV2Backbone(nn.Module):
         x = self.dino_model.norm(x)
         patch_tokens = x[:, 1:, :]  # Remove CLS token
         N, P, C = patch_tokens.shape
-        H = W = int((P)**0.5)
+        H = W = int(np.sqrt(P))
         return patch_tokens.permute(0, 2, 1).reshape(N, C, H, W)
 
-
-# ---------------------------------------------
-# Full Model
-# ---------------------------------------------
 class LiverSegmentationModel(nn.Module):
-    def __init__(self, weights_path, num_classes=2, backbone_size="base"):
+    def __init__(self, backbone, num_classes=2):
         super().__init__()
-        self.backbone = DinoV2Backbone(weights_path=weights_path, backbone_size=backbone_size)
+        self.backbone = backbone
         
         # Map backbone sizes to their corresponding output channel dimensions
         backbone_embed_dims = {
@@ -178,16 +185,23 @@ class LiverSegmentationModel(nn.Module):
             "giant": 1536
         }
         
-        if backbone_size not in backbone_embed_dims:
-            raise ValueError(f"Unsupported backbone size: {backbone_size}")
+        # Determine embed_dim based on backbone configuration
+        if hasattr(backbone.dino_model, 'embed_dim'):
+            embed_dim = backbone.dino_model.embed_dim
+        else:
+            # Default to 'base' if embed_dim is not directly accessible
+            embed_dim = backbone_embed_dims.get("base", 768)
         
-        in_channels = backbone_embed_dims[backbone_size]
+        in_channels = embed_dim
         self.segmentation_head = DeepLabV3PlusHead(in_channels, num_classes)
         
     def forward(self, x):
         features = self.backbone(x)
         return self.segmentation_head(features)
 
+# ---------------------------------------------
+# Dataset and Data Handling
+# ---------------------------------------------
 
 class DICOMLiverDataset(Dataset):
     def __init__(self, image_paths, mask_paths, transform=None, target_transform=None):
@@ -270,6 +284,10 @@ def prepare_data_splits(root_dir, train_size=0.7, val_size=0.15, test_size=0.15)
         'test': (test_images, test_masks)
     }
 
+# ---------------------------------------------
+# Loss Function
+# ---------------------------------------------
+
 class DiceBCELoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super(DiceBCELoss, self).__init__()
@@ -293,6 +311,10 @@ class DiceBCELoss(nn.Module):
         
         # Combine losses
         return 0.5 * dice_loss + 0.5 * bce_loss
+
+# ---------------------------------------------
+# Training and Validation Functions
+# ---------------------------------------------
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -341,6 +363,10 @@ def validate(model, dataloader, criterion, device):
             dice_scores.append(dice.item())
     
     return total_loss / len(dataloader), np.mean(dice_scores)
+
+# ---------------------------------------------
+# Visualization Function
+# ---------------------------------------------
 
 def save_prediction_visualization(image, mask, pred, prob, save_path, alpha=0.5):
     """
@@ -403,6 +429,49 @@ def save_prediction_visualization(image, mask, pred, prob, save_path, alpha=0.5)
     plt.savefig(save_path)
     plt.close(fig)
 
+# ---------------------------------------------
+# Model Instantiation Function
+# ---------------------------------------------
+
+def instantiate_models():
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Paths
+    official_pretrained = True
+    custom_weights_path = "/gpfs/data/shenlab/wz1492/HCC/dinov2/models/Experiment_003/eval/training_149999/teacher_checkpoint.pth"
+    
+    # Backbone Sizes
+    backbone_size = "large"  # Change as per your requirement ("small", "base", "large", "giant")
+    
+    # Model A: Official Pre-trained DINOv2 Backbone
+    backbone_a = DinoV2Backbone(
+        weights_path=None, 
+        backbone_size=backbone_size, 
+        pretrained=True  # Load official pre-trained weights
+    )
+    model_a = LiverSegmentationModel(
+        backbone=backbone_a, 
+        num_classes=2
+    ).to(device)
+    
+    # Model B: Custom-Trained DINOv2 Backbone
+    backbone_b = DinoV2Backbone(
+        weights_path=custom_weights_path, 
+        backbone_size=backbone_size, 
+        pretrained=False  # Load custom-trained weights
+    )
+    model_b = LiverSegmentationModel(
+        backbone=backbone_b, 
+        num_classes=2
+    ).to(device)
+    
+    return model_a, model_b
+
+# ---------------------------------------------
+# Main Function
+# ---------------------------------------------
+
 def main():
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -411,8 +480,10 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     
     # Directory to save prediction visualizations
-    preds_save_dir = os.path.join(save_dir, "predictions")
-    os.makedirs(preds_save_dir, exist_ok=True)
+    preds_save_dir_a = os.path.join(save_dir, "predictions_official_pretrained")
+    preds_save_dir_b = os.path.join(save_dir, "predictions_custom_trained")
+    os.makedirs(preds_save_dir_a, exist_ok=True)
+    os.makedirs(preds_save_dir_b, exist_ok=True)
     
     # Data transforms
     transform = transforms.Compose([
@@ -446,108 +517,152 @@ def main():
             pin_memory=True
         )
     
-    # Initialize model
-    dino_weights_path = "/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth"
-    model = LiverSegmentationModel(
-        weights_path=dino_weights_path,
-        num_classes=2,
-        backbone_size="large"
-    ).to(device)
+    # Instantiate both models
+    model_a, model_b = instantiate_models()
     
-    # Training setup
+    # Training setup for both models
     criterion = DiceBCELoss()
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
     
-    # Training loop
-    num_epochs = 1
-    best_val_dice = 0
+    # Define separate optimizers for both models
+    optimizer_a = Adam(model_a.parameters(), lr=1e-4)
+    optimizer_b = Adam(model_b.parameters(), lr=1e-4)
+    
+    # Define separate schedulers
+    scheduler_a = ReduceLROnPlateau(optimizer_a, mode='min', factor=0.1, patience=5, verbose=True)
+    scheduler_b = ReduceLROnPlateau(optimizer_b, mode='min', factor=0.1, patience=5, verbose=True)
+    
+    # Training loop parameters
+    num_epochs = 75  # Increase epochs as needed
+    best_val_dice_a = 0
+    best_val_dice_b = 0
+    
+    # Dictionaries to hold models, optimizers, schedulers, and save paths
+    models = {
+        'official_pretrained': model_a,
+        'custom_trained': model_b
+    }
+    optimizers = {
+        'official_pretrained': optimizer_a,
+        'custom_trained': optimizer_b
+    }
+    schedulers = {
+        'official_pretrained': scheduler_a,
+        'custom_trained': scheduler_b
+    }
+    best_val_dice = {
+        'official_pretrained': best_val_dice_a,
+        'custom_trained': best_val_dice_b
+    }
+    save_paths = {
+        'official_pretrained': os.path.join(save_dir, 'best_model_official_pretrained.pth'),
+        'custom_trained': os.path.join(save_dir, 'best_model_custom_trained.pth')
+    }
+    preds_save_dirs = {
+        'official_pretrained': preds_save_dir_a,
+        'custom_trained': preds_save_dir_b
+    }
     
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         
-        # Train
-        train_loss = train_epoch(model, dataloaders['train'], criterion, optimizer, device)
-        
-        # Validate
-        val_loss, val_dice = validate(model, dataloaders['val'], criterion, device)
-        
-        # Update learning rate
-        scheduler.step(val_loss)
-        
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}")
-        
-        # Save best model
-        if val_dice > best_val_dice:
-            best_val_dice = val_dice
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_dice': val_dice,
-            }, os.path.join(save_dir, 'best_model.pth'))
-    
-    # Final evaluation on test set
-    model.load_state_dict(torch.load(os.path.join(save_dir, 'best_model.pth'))['model_state_dict'])
-    test_loss, test_dice = validate(model, dataloaders['test'], criterion, device)
-    print(f"\nFinal Test Results:")
-    print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test Dice Score: {test_dice:.4f}")
-    
-    # Save Prediction Visualizations
-    model.eval()
-    num_visualizations = 10  # Number of samples to visualize
-    saved = 0
-    with torch.no_grad():
-        for images, masks in dataloaders['test']:
-            images = images.to(device)
-            masks = masks.to(device)
+        for model_key in models:
+            print(f"\nTraining Model: {model_key}")
+            model = models[model_key]
+            optimizer = optimizers[model_key]
+            scheduler = schedulers[model_key]
             
-            outputs = model(images)
-            outputs = outputs[:, 1:2, :, :]  # Take only the foreground channel
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float()
+            # Train
+            train_loss = train_epoch(model, dataloaders['train'], criterion, optimizer, device)
             
-            for i in range(images.size(0)):
+            # Validate
+            val_loss, val_dice = validate(model, dataloaders['val'], criterion, device)
+            
+            # Update learning rate
+            scheduler.step(val_loss)
+            
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}")
+            
+            # Save best model
+            if val_dice > best_val_dice[model_key]:
+                best_val_dice[model_key] = val_dice
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_dice': val_dice,
+                }, save_paths[model_key])
+                print(f"Saved best model for {model_key} with Val Dice: {val_dice:.4f}")
+    
+    # Final evaluation on test set for both models
+    for model_key in models:
+        print(f"\nEvaluating Model: {model_key}")
+        model = models[model_key]
+        model.load_state_dict(torch.load(save_paths[model_key])['model_state_dict'])
+        test_loss, test_dice = validate(model, dataloaders['test'], criterion, device)
+        print(f"Final Test Results for {model_key}:")
+        print(f"Test Loss: {test_loss:.4f}")
+        print(f"Test Dice Score: {test_dice:.4f}")
+        
+        # Save Prediction Visualizations
+        model.eval()
+        num_visualizations = 10  # Number of samples to visualize
+        saved = 0
+        with torch.no_grad():
+            for images, masks in dataloaders['test']:
+                images = images.to(device)
+                masks = masks.to(device)
+                
+                outputs = model(images)
+                outputs = outputs[:, 1:2, :, :]  # Take only the foreground channel
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
+                
+                for i in range(images.size(0)):
+                    if saved >= num_visualizations:
+                        break
+                    image = images[i].cpu()
+                    mask = masks[i].cpu()
+                    pred = preds[i].cpu()
+                    prob = probs[i].cpu()
+                    
+                    # Reverse normalization for visualization
+                    inv_normalize = transforms.Normalize(
+                        mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                        std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
+                    )
+                    image_denorm = inv_normalize(image)
+                    image_denorm = torch.clamp(image_denorm, 0, 1)
+                    
+                    # Convert tensors to PIL Images
+                    image_pil = transforms.ToPILImage()(image_denorm)
+                    mask_pil = transforms.ToPILImage()(mask)
+                    pred_pil = transforms.ToPILImage()(pred)
+                    prob_pil = transforms.ToPILImage()(prob)
+                    
+                    # Define save path
+                    save_path = os.path.join(preds_save_dirs[model_key], f"prediction_{saved+1}.png")
+                    
+                    # Save visualization
+                    save_prediction_visualization(
+                        image_pil, 
+                        mask_pil, 
+                        pred_pil, 
+                        prob_pil, 
+                        save_path
+                    )
+                    
+                    saved += 1
                 if saved >= num_visualizations:
                     break
-                image = images[i].cpu()
-                mask = masks[i].cpu()
-                pred = preds[i].cpu()
-                prob = probs[i].cpu()
-                
-                # Reverse normalization for visualization
-                inv_normalize = transforms.Normalize(
-                    mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
-                    std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
-                )
-                image_denorm = inv_normalize(image)
-                image_denorm = torch.clamp(image_denorm, 0, 1)
-                
-                # Convert tensors to PIL Images
-                image_pil = transforms.ToPILImage()(image_denorm)
-                mask_pil = transforms.ToPILImage()(mask)
-                pred_pil = transforms.ToPILImage()(pred)
-                prob_pil = transforms.ToPILImage()(prob)
-                
-                # Define save path
-                save_path = os.path.join(preds_save_dir, f"prediction_{saved+1}.png")
-                
-                # Save visualization
-                save_prediction_visualization(
-                    image_pil, 
-                    mask_pil, 
-                    pred_pil, 
-                    prob_pil, 
-                    save_path
-                )
-                
-                saved += 1
-            if saved >= num_visualizations:
-                break
+        
+        print(f"Saved {saved} prediction visualizations in '{preds_save_dirs[model_key]}'")
     
-    print(f"\nSaved {saved} prediction visualizations in '{preds_save_dir}'")
+    print("\nTraining and Evaluation Complete for Both Models.")
+
+# ---------------------------------------------
+# Entry Point
+# ---------------------------------------------
 
 if __name__ == "__main__":
     main()

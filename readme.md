@@ -36,10 +36,10 @@ After training, each classifier's performance is evaluated, and the best one is 
 
 ```
 python dinov2/run/train/train.py \
---config-file dinov2/configs/train/vitl16_short_custom.yaml  \
---wandb-project-name "Experiment-001-Teo" \
---output-dir "./models/Experiment_001" \
---ngpus 4 \
+--config-file dinov2/configs/train/vitl14.yaml \
+--wandb-project-name "Experiment-003-Teo" \
+--output-dir "./models/Experiment_003" \
+--ngpus 2 \
 --timeout 10079 \
 --partition a100_long,radiology \
 train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images
