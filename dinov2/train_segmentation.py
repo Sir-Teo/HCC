@@ -89,7 +89,7 @@ class DinoV2Backbone(nn.Module):
         backbone_configs = {
             "small": {"embed_dim": 384, "depth": 12, "num_heads": 6, "patch_size": 14},
             "base": {"embed_dim": 768, "depth": 12, "num_heads": 12, "patch_size": 14},
-            "large": {"embed_dim": 1024, "depth": 24, "num_heads": 16, "patch_size": 14},
+            "large": {"embed_dim": 768, "depth": 24, "num_heads": 16, "patch_size": 14},
             "giant": {"embed_dim": 1536, "depth": 40, "num_heads": 24, "patch_size": 14}
         }
         
@@ -181,7 +181,7 @@ class LiverSegmentationModel(nn.Module):
         backbone_embed_dims = {
             "small": 384,
             "base": 768,
-            "large": 1024,
+            "large": 768,
             "giant": 1536
         }
         
