@@ -138,13 +138,24 @@ class HCCDicomDataset(Dataset):
         return torch.stack(image_stack)
 
     def is_axial(self, orientation):
-        """Check if orientation is approximately axial (within tolerance)"""
-        # Expected axial orientation: (1, 0, 0, 0, 1, 0)
-        ref_orientation = (1, 0, 0, 0, 1, 0)
-        tolerance = 1e-3
+        """Check if orientation is axial by verifying cross product aligns with z-axis."""
+        # Extract row and column direction vectors
+        row_dir = np.array(orientation[:3], dtype=np.float32)
+        col_dir = np.array(orientation[3:], dtype=np.float32)
         
-        return all(abs(a - b) < tolerance 
-                   for a, b in zip(orientation, ref_orientation))
+        # Compute cross product of row and column directions
+        cross = np.cross(row_dir, col_dir)
+        
+        # Normalize the cross product to get the direction
+        norm = np.linalg.norm(cross)
+        if norm < 1e-6:  # Avoid division by zero for invalid orientations
+            return False
+        cross_normalized = cross / norm
+        
+        # Check if the cross product is aligned with the z-axis (positive or negative)
+        return (np.abs(cross_normalized[0]) < 1e-3 and 
+                np.abs(cross_normalized[1]) < 1e-3 and 
+                np.abs(np.abs(cross_normalized[2]) - 1.0) < 1e-3)
 
     def dicom_to_tensor(self, dcm):
         """Convert DICOM pixel data to normalized tensor"""
