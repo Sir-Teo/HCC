@@ -1,282 +1,258 @@
 #!/usr/bin/env python
 
-import os
 import argparse
-from typing import List, Dict, Tuple
-import pandas as pd
-import numpy as np
+import os
+import random
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
-
-# For reading DICOM (you can use pydicom or a specialized library)
-import pydicom
-
-# PyTorch transforms
+import torch.nn as nn
+import torch.optim as optim
 import torchvision.transforms as T
-from torchvision import models
+import pytorch_lightning as pl
+from pytorch_lightning import seed_everything, Trainer
+from torch.utils.data import Dataset, DataLoader
 
-# Example: Using DINOV2 (Hugging Face, or from a local checkpoint)
-# If you have a local checkpoint or huggingface:
-#   pip install transformers timm
-#   from transformers import Dinov2Model, Dinov2Config
-# 
-# We'll do a placeholder import so that you can fill in the actual DINOV2 code
-try:
-    import timm
-except ImportError:
-    print("Please install timm or the relevant library to load DINOv2.")
+import wandb
+from pytorch_lightning.loggers import WandbLogger
 
+# Example: You might import your DinoV2 model or other PyTorch model here:
+# from torchvision.models import dino_v2_something as DinoV2
+# For simplicity, let's just use resnet18 as a placeholder for the Dino backbone
+import torchvision.models as models
 
-# For survival models
-from pycox.models import LogisticHazard
-from pycox.evaluation import EvalSurv
-import torchtuples as tt
+# If you want to do proper survival/time-to-event modeling, you can import pycox:
+# from pycox.models import CoxPH, LogisticHazard, MTLR, etc.
+# from pycox.evaluation import EvalSurv
 
+###############################################################################
+# 1) DATASET
+###############################################################################
 
-# 1) PARSE ARGUMENTS
-def parse_args():
-    parser = argparse.ArgumentParser(description="Training script for Time-to-Event with PyTorch Lightning and pycox.")
-    parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
-                        help="Root directory of dicom images.")
-    parser.add_argument("--csv_path", type=str, required=True, 
-                        help="Path to the CSV file containing patient_id and event_label (or censor info).")
-    parser.add_argument("--output_dir", type=str, default="./output",
-                        help="Output directory for logs and checkpoints.")
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Batch size for training.")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of workers for dataloader.")
-    parser.add_argument("--max_epochs", type=int, default=10,
-                        help="Number of epochs to train.")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate.")
-    parser.add_argument("--gpus", type=int, default=0,
-                        help="Number of GPUs.")
-    parser.add_argument("--check_val_every_n_epoch", type=int, default=1,
-                        help="Frequency of validation steps (in epochs).")
-    # Add more arguments if needed (e.g. pretrained checkpoint paths, etc.)
-    return parser.parse_args()
-
-
-# 2) CREATE A CUSTOM DATASET
-class HCCTimeToEventDataset(Dataset):
+class HCCDicomDataset(Dataset):
     """
-    Custom dataset that:
-    - Reads (patient_id, label) from CSV.
-    - Looks for axial DICOM images under dicom_root/patient_id/*.dcm
-    - Filters out non-axial images, and possible other metadata filtering (e.g. SeriesTime).
-    - Loads all images for that patient, applies transformations, and average-pools them.
+    A placeholder dataset that:
+    - Reads from CSV with columns [patient_id, label].
+    - For each patient, loads all axial images (here we just create random tensors).
+    - Returns the 3D stack or a single image representation (placeholder).
+    
+    Replace this with your logic to:
+      - parse the DICOM folder
+      - filter images by orientation (axial)
+      - possibly group all images belonging to the same patient and series
+      - load them as torch Tensors
     """
-    def __init__(self, 
-                 csv_path: str, 
-                 dicom_root: str,
-                 transform=None,
-                 orientation_axial: Tuple[str, ...] = ('1','0','0','0','1','0')):
-        """
-        Args:
-            csv_path: Path to CSV with columns: [patient_id, label, (optional) time, event].
-            dicom_root: Root directory of all DICOMs.
-            transform: Optional transforms to apply to the image (e.g. resize, normalization).
-            orientation_axial: Tuple representing the orientation for axial images.
-        """
-        super().__init__()
-        self.df = pd.read_csv(csv_path)
+    def __init__(self, csv_file, dicom_root, transform=None):
+        # Placeholder for reading CSV
+        # For example: 
+        #    patient_id,label
+        #    9023679,1
+        #    1234567,0
+        #
+        # We'll fake it here.
         
-        # If your CSV has columns: [patient_id, event_label], possibly also [duration/event_time].
-        # For demonstration, let's assume we have:
-        #   self.df['patient_id'], self.df['event_label']  (0 or 1),
-        #   (Optional) self.df['time'] if you have it for survival
-        #   (Optional) self.df['event'] or self.df['label'] for event indicator
-        # Adjust accordingly for your data.
+        # In your real code, parse the CSV to get [patient_id, label]
+        # e.g., with pandas:
+        # import pandas as pd
+        # df = pd.read_csv(csv_file)
+        # self.samples = list(df.itertuples(index=False, name=None))
+        
+        # For demonstration, let's just assume 10 patients
+        self.samples = [(f"patient_{i}", random.randint(0,1)) for i in range(10)]
         
         self.dicom_root = dicom_root
         self.transform = transform
-        self.orientation_axial = orientation_axial
 
     def __len__(self):
-        return len(self.df)
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        patient_id = str(row['patient_id'])
+        patient_id, label = self.samples[idx]
         
-        # If you have time and event columns:
-        # time = row['time']  # or row['duration']
-        # event = row['event']  # or row['event_label'] 
-        # If you only have a label for now (no actual duration):
-        event_label = row['label']
+        # Here you would find all .dcm files for that patient, e.g.:
+        # patient_path = os.path.join(self.dicom_root, patient_id)
+        # image_paths = [os.path.join(patient_path, f) for f in os.listdir(patient_path) 
+        #                if f.endswith(".dcm") and is_axial(...)]
         
-        # 1) Collect the DICOM paths for this patient
-        patient_path = os.path.join(self.dicom_root, patient_id)
-        if not os.path.isdir(patient_path):
-            raise FileNotFoundError(f"Patient folder not found: {patient_path}")
+        # Then read them (with pydicom, e.g.), convert to array, etc.
+        # For simplicity, let's just create a random "stack" of 5 images, 3 channels, 224x224:
+        # shape: (5, 3, 224, 224)
+        # In practice, you'd likely read each DICOM, do your transforms, etc.
+        stack_of_images = torch.randn(5, 3, 224, 224)
         
-        dicom_files = [os.path.join(patient_path, f) for f in os.listdir(patient_path) 
-                       if f.lower().endswith('.dcm')]
+        if self.transform:
+            stack_of_images = torch.stack([self.transform(img) for img in stack_of_images])
         
-        # 2) Filter out non-axial or unneeded images 
-        #    (we do an example check with orientation)
-        axial_files = []
-        for dcm_path in dicom_files:
-            ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
-            
-            # Example orientation check: 
-            # ds.ImageOrientationPatient might be something like [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-            orientation = tuple([str(round(x)) for x in ds.ImageOrientationPatient])
-            if orientation == self.orientation_axial:
-                # Optionally also filter by SeriesTime if needed
-                # series_time = ds.get("SeriesTime", None) 
-                # or any other metadata-based filtering
-                axial_files.append(dcm_path)
-        
-        # 3) Load the pixel data from each axial file & transform. (In HPC, you might do caching or efficient I/O)
-        #    For demonstration, we'll just do a single pass.
-        #    Then we average-pool them into a single representation.
-        
-        images = []
-        for path_ in axial_files:
-            ds = pydicom.dcmread(path_)
-            pixel_array = ds.pixel_array.astype(np.float32)
-            # Convert to 3-channel or keep 1-channel (depends on your model's expected input)
-            # For simplicity, let's replicate 1-channel -> 3-channel
-            pixel_array_3ch = np.repeat(pixel_array[np.newaxis, :, :], 3, axis=0)  # shape: (3, H, W)
-            tensor_img = torch.tensor(pixel_array_3ch)
-            
-            if self.transform:
-                tensor_img = self.transform(tensor_img)  # transform is expected to handle torch tensors
-            
-            images.append(tensor_img)
-        
-        if len(images) == 0:
-            # If no axial images, handle gracefully (e.g., return dummy data or raise exception)
-            # We'll return a zero image
-            data = torch.zeros((3, 224, 224))  # example shape
-        else:
-            # Stack and average
-            data = torch.stack(images, dim=0)  # shape: (N, 3, H, W)
-            data = data.mean(dim=0)           # shape: (3, H, W)
-        
-        # For survival analysis with pycox, we typically want:
-        #   x: features (our image representation)
-        #   y_time: time to event (if available)
-        #   y_event: event indicator (0/1)
-        # If you do not have a real time, you might do a classification or partial usage.
-        
-        # Here, we return data, label. You could also store event_time if you have it.
-        return data, torch.tensor([event_label], dtype=torch.float)
+        # Return the entire stack plus the label
+        return stack_of_images, torch.tensor(label, dtype=torch.float32)
 
 
-# 3) MODEL DEFINITION (Example using DINOV2 or a placeholder)
-# ------------------------------------------------------------------
-# If you have a huggingface or timm-based DINOv2 model:
-#    model = timm.create_model("dino_v2_xxx", pretrained=True)
-# We'll define a small wrapper that chops off the final layer, or we do entire forward.
+###############################################################################
+# 2) MODEL (PyTorch Lightning Module)
+###############################################################################
 
-class DinoV2SurvivalModel(torch.nn.Module):
-    def __init__(self, pretrained=True):
-        super().__init__()
-        # Example with timm or huggingface if available. 
-        # Below is a placeholder using resnet18 for demonstration.
-        self.backbone = models.resnet18(pretrained=True)  # placeholder
-        # Replace final layer with identity to get feature vector
-        num_features = self.backbone.fc.in_features
-        self.backbone.fc = torch.nn.Identity()
+class TimeToEventModel(pl.LightningModule):
+    """
+    A placeholder LightningModule that:
+     - uses a pretrained backbone (mock: resnet18 here, or your DinoV2).
+     - pools across multiple slices (average).
+     - does a final linear head for classification or survival prediction.
+    """
+    def __init__(self, lr=1e-4, num_classes=1):
+        super(TimeToEventModel, self).__init__()
+        # Example using ResNet18 as a placeholder for Dino:
+        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        # Remove final layer, get a feature vector:
+        self.feature_extractor = nn.Sequential(*list(backbone.children())[:-1])
         
-        # Then an MLP for survival. With pycox, we often pass a final linear 
-        # that outputs logits for each discrete time bin (for e.g. LogisticHazard).
-        # If you only have binary event/no-event, you might do something simpler.
-        # We'll do a 1D logistic output for demonstration, but adapt as needed.
-        self.fc = torch.nn.Linear(num_features, 1)
-    
-    def forward(self, x):
-        """
-        x shape: (B, 3, H, W)
-        """
-        features = self.backbone(x)  # shape: (B, num_features)
-        out = self.fc(features)      # shape: (B, 1)
-        return out
-
-
-# 4) Pytorch Lightning Module to integrate with pycox
-# -----------------------------------------------------
-class SurvivalLightningModule(pl.LightningModule):
-    def __init__(self, model, lr=1e-4):
-        super().__init__()
-        self.save_hyperparameters()
-        self.model = model
-        self.loss_fn = torch.nn.BCEWithLogitsLoss()
+        # A linear head to produce 1 logit (for binary classification).
+        # For pycox, you might use different heads (e.g. multi-output for hazard).
+        self.classifier = nn.Linear(512, num_classes)  # 512 for resnet18
+        
         self.lr = lr
-    
+        self.save_hyperparameters()
+
+        # If you want a survival approach, you might store:
+        # self.survival_model = CoxPH(...) or LogisticHazard(...)
+
     def forward(self, x):
-        return self.model(x)
-    
+        """
+        x is shape (batch_size, 5, 3, 224, 224) if each sample has 5 images.
+        We want to:
+         - Flatten the batch dimension + number of slices
+         - Extract features
+         - Pool features (average) to get single representation
+         - Classify
+        """
+        b, n_slices, c, h, w = x.shape  # e.g. (batch, 5, 3, 224, 224)
+        x = x.view(b*n_slices, c, h, w)  # flatten slices => (b*5, 3, 224, 224)
+        
+        feats = self.feature_extractor(x)  # => shape (b*5, 512, 1, 1) for ResNet
+        feats = feats.view(feats.size(0), -1)  # => (b*5, 512)
+        
+        # Now group back by patient (batch):
+        feats = feats.view(b, n_slices, -1)  # => (b, 5, 512)
+        feats_mean = feats.mean(dim=1)       # => (b, 512) average pooling across slices
+        
+        logits = self.classifier(feats_mean) # => (b, num_classes)
+        return logits
+
     def training_step(self, batch, batch_idx):
-        x, label = batch
-        logits = self.forward(x)
-        loss = self.loss_fn(logits, label)
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        x, y = batch  # x: (batch_size, 5, 3, 224, 224), y: (batch_size,)
+        logits = self.forward(x).squeeze(dim=-1)  # => (batch_size,)
+        
+        # For demonstration: BCE with logits. If your label is 0 or 1:
+        loss_fn = nn.BCEWithLogitsLoss()
+        loss = loss_fn(logits, y)
+        
+        self.log("train_loss", loss, prog_bar=True)
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
-        x, label = batch
-        logits = self.forward(x)
-        loss = self.loss_fn(logits, label)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        x, y = batch
+        logits = self.forward(x).squeeze(dim=-1)
+        loss_fn = nn.BCEWithLogitsLoss()
+        loss = loss_fn(logits, y)
+        
+        self.log("val_loss", loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
 
 
-# 5) TRAIN FUNCTION
-# -----------------
+###############################################################################
+# 3) DATA MODULE (OPTIONAL)
+###############################################################################
+
+class HCCDataModule(pl.LightningDataModule):
+    """
+    Optional: A LightningDataModule to handle train/val/test splits and loaders.
+    """
+    def __init__(self, csv_file, dicom_root, batch_size=2):
+        super().__init__()
+        self.csv_file = csv_file
+        self.dicom_root = dicom_root
+        self.batch_size = batch_size
+
+        # define transforms if needed
+        self.transform = T.Compose([
+            # For each 2D slice, apply some transform
+            # In real code, you'd do more sophisticated transforms
+            T.Resize((224, 224)),  # just in case
+        ])
+
+    def setup(self, stage=None):
+        # Typically you read the entire dataset once, then split into train/val/test
+        full_dataset = HCCDicomDataset(self.csv_file, self.dicom_root, transform=self.transform)
+        
+        n_total = len(full_dataset)
+        n_train = int(n_total * 0.7)
+        n_val = int(n_total * 0.15)
+        n_test = n_total - n_train - n_val
+        
+        self.train_dataset, self.val_dataset, self.test_dataset = torch.utils.data.random_split(
+            full_dataset,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+
+
+###############################################################################
+# 4) TRAIN SCRIPT
+###############################################################################
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a Time-to-Event model using PyTorch Lightning + DinoV2 + pycox (placeholder).")
+    parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
+                        help="Path to the root DICOM directory.")
+    parser.add_argument("--csv_file", type=str, default="patients.csv",
+                        help="Path to CSV file with columns [patient_id, label].")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
+    parser.add_argument("--max_epochs", type=int, default=2, help="Max number of epochs to train.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
+    parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
+    return parser.parse_args()
+
+
 def main():
     args = parse_args()
     
-    # Create transforms if desired (Resize, etc.)
-    # NOTE: If using pretrained models, ensure you apply the proper normalization
-    transform = T.Compose([
-        T.Resize((224, 224)),
-        # T.Normalize(mean, std) if needed
-    ])
+    # Set random seed
+    seed_everything(args.seed, workers=True)
     
-    # Datasets
-    train_dataset = HCCTimeToEventDataset(
-        csv_path=args.csv_path,
-        dicom_root=args.dicom_root,
-        transform=transform
-    )
+    # Initialize Weights & Biases
+    wandb_logger = WandbLogger(project=args.project_name, name=args.run_name)
     
-    # In real scenario, you'd split into train and val sets. We'll do a naive split for demonstration.
-    val_fraction = 0.2
-    val_size = int(len(train_dataset) * val_fraction)
-    train_size = len(train_dataset) - val_size
-    train_ds, val_ds = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+    # Create DataModule
+    data_module = HCCDataModule(args.csv_file, args.dicom_root, batch_size=args.batch_size)
+    data_module.setup()
     
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Create model
+    model = TimeToEventModel(lr=args.lr)
     
-    # Initialize the model (DINOv2 placeholder)
-    dino_model = DinoV2SurvivalModel(pretrained=True)
-    
-    # Lightning module
-    lit_model = SurvivalLightningModule(model=dino_model, lr=args.lr)
-    
-    # Trainer
-    trainer = pl.Trainer(
-        default_root_dir=args.output_dir,
+    # Create trainer
+    trainer = Trainer(
+        logger=wandb_logger,
         max_epochs=args.max_epochs,
-        accelerator="gpu" if args.gpus > 0 else "cpu",
-        devices=args.gpus if args.gpus > 0 else None,
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
-        log_every_n_steps=1
+        accelerator="auto",  # Let PL figure out if there's a GPU
+        devices="auto"
     )
     
     # Fit
-    trainer.fit(lit_model, train_loader, val_loader)
+    trainer.fit(model, datamodule=data_module)
+    trainer.test(model, datamodule=data_module)
 
 
 if __name__ == "__main__":
