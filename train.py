@@ -82,12 +82,16 @@ class HCCDicomDataset(Dataset):
         for fname in dcm_files:
             try:
                 dcm = pydicom.dcmread(os.path.join(dicom_dir, fname), stop_before_pixels=True)
+                # Check for required attributes
+                if not hasattr(dcm, 'ImageOrientationPatient') or not hasattr(dcm, 'ImagePositionPatient'):
+                    print(f"Skipping {fname}: missing required DICOM attributes.")
+                    continue  # Skip DCMs missing required tags
                 series_time = dcm.get('SeriesTime', '000000.000')
                 orientation = tuple(map(float, dcm.ImageOrientationPatient))
                 series_dict[(series_time, orientation)].append(dcm)
             except Exception as e:
                 print(f"Error reading {fname}: {str(e)}")
-                continue
+                continue  # Skip DCMs that can't be read
 
         # 2. Select axial series with proper orientation
         axial_series = []
@@ -100,7 +104,11 @@ class HCCDicomDataset(Dataset):
             raise ValueError(f"No axial series found in {dicom_dir}")
 
         # 3. Sort slices by slice location (z-position)
-        axial_series.sort(key=lambda d: float(d.SliceLocation))
+        axial_series.sort(key=lambda d: (
+            float(d.SliceLocation) 
+            if hasattr(d, 'SliceLocation') 
+            else float(d.ImagePositionPatient[2])
+        ))
 
         # 4. Load and preprocess images
         image_stack = []
@@ -423,7 +431,7 @@ class HCCDataModule(pl.LightningDataModule):
             [n_train, n_val, n_test],
             generator=torch.Generator().manual_seed(42)
         )
-        
+
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
 
@@ -449,7 +457,7 @@ def parse_args():
                         help="Path to CSV with columns [patient_id, label, time, event].")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
-    parser.add_argument("--max_epochs", type=int, default=50, help="Max number of epochs.")
+    parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
