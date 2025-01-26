@@ -6,3 +6,5 @@ dinov2/experiments/
 *.png
 *.csv
 .ipynb_checkpoints/
+HCC-Recurrence/
+wandb/

@@ -15,14 +15,10 @@ from torch.utils.data import Dataset, DataLoader
 import wandb
 from pytorch_lightning.loggers import WandbLogger
 
-# Example: You might import your DinoV2 model or other PyTorch model here:
-# from torchvision.models import dino_v2_something as DinoV2
-# For simplicity, let's just use resnet18 as a placeholder for the Dino backbone
+# Example for placeholders:
 import torchvision.models as models
-
-# If you want to do proper survival/time-to-event modeling, you can import pycox:
-# from pycox.models import CoxPH, LogisticHazard, MTLR, etc.
-# from pycox.evaluation import EvalSurv
+# If you want to do proper survival/time-to-event modeling:
+# from pycox.models import CoxPH, LogisticHazard, etc.
 
 ###############################################################################
 # 1) DATASET
@@ -34,29 +30,9 @@ class HCCDicomDataset(Dataset):
     - Reads from CSV with columns [patient_id, label].
     - For each patient, loads all axial images (here we just create random tensors).
     - Returns the 3D stack or a single image representation (placeholder).
-    
-    Replace this with your logic to:
-      - parse the DICOM folder
-      - filter images by orientation (axial)
-      - possibly group all images belonging to the same patient and series
-      - load them as torch Tensors
     """
     def __init__(self, csv_file, dicom_root, transform=None):
         # Placeholder for reading CSV
-        # For example: 
-        #    patient_id,label
-        #    9023679,1
-        #    1234567,0
-        #
-        # We'll fake it here.
-        
-        # In your real code, parse the CSV to get [patient_id, label]
-        # e.g., with pandas:
-        # import pandas as pd
-        # df = pd.read_csv(csv_file)
-        # self.samples = list(df.itertuples(index=False, name=None))
-        
-        # For demonstration, let's just assume 10 patients
         self.samples = [(f"patient_{i}", random.randint(0,1)) for i in range(10)]
         
         self.dicom_root = dicom_root
@@ -68,91 +44,130 @@ class HCCDicomDataset(Dataset):
     def __getitem__(self, idx):
         patient_id, label = self.samples[idx]
         
-        # Here you would find all .dcm files for that patient, e.g.:
-        # patient_path = os.path.join(self.dicom_root, patient_id)
-        # image_paths = [os.path.join(patient_path, f) for f in os.listdir(patient_path) 
-        #                if f.endswith(".dcm") and is_axial(...)]
-        
-        # Then read them (with pydicom, e.g.), convert to array, etc.
-        # For simplicity, let's just create a random "stack" of 5 images, 3 channels, 224x224:
-        # shape: (5, 3, 224, 224)
-        # In practice, you'd likely read each DICOM, do your transforms, etc.
+        # Just create a random "stack" of 5 images, 3 channels, 224x224
         stack_of_images = torch.randn(5, 3, 224, 224)
         
         if self.transform:
             stack_of_images = torch.stack([self.transform(img) for img in stack_of_images])
         
-        # Return the entire stack plus the label
         return stack_of_images, torch.tensor(label, dtype=torch.float32)
 
-
 ###############################################################################
-# 2) MODEL (PyTorch Lightning Module)
+# 2) LIGHTNING MODULE
 ###############################################################################
 
-class TimeToEventModel(pl.LightningModule):
+class HCCLightningModel(pl.LightningModule):
     """
-    A placeholder LightningModule that:
-     - uses a pretrained backbone (mock: resnet18 here, or your DinoV2).
-     - pools across multiple slices (average).
-     - does a final linear head for classification or survival prediction.
+    A LightningModule that:
+     - uses either a ResNet backbone or a placeholder DINOv2 backbone
+     - can output either a binary classifier head (model_type='linear')
+       or a placeholder time-to-event head (model_type='time_to_event').
     """
-    def __init__(self, lr=1e-4, num_classes=1):
-        super(TimeToEventModel, self).__init__()
-        # Example using ResNet18 as a placeholder for Dino:
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        # Remove final layer, get a feature vector:
-        self.feature_extractor = nn.Sequential(*list(backbone.children())[:-1])
-        
-        # A linear head to produce 1 logit (for binary classification).
-        # For pycox, you might use different heads (e.g. multi-output for hazard).
-        self.classifier = nn.Linear(512, num_classes)  # 512 for resnet18
-        
-        self.lr = lr
+    def __init__(
+        self, 
+        backbone="resnet", 
+        model_type="linear", 
+        lr=1e-4, 
+        num_classes=1
+    ):
+        """
+        Args:
+            backbone (str): 'resnet' or 'dinov2'
+            model_type (str): 'linear' or 'time_to_event'
+            lr (float): Learning rate
+            num_classes (int): Number of output units for classification; 
+                               for time-to-event, this may differ
+        """
+        super().__init__()
         self.save_hyperparameters()
 
-        # If you want a survival approach, you might store:
-        # self.survival_model = CoxPH(...) or LogisticHazard(...)
+        # -------------------------------------------------------
+        # Build the backbone
+        # -------------------------------------------------------
+        if backbone == "resnet":
+            # Example: ResNet18
+            backbone_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            feature_dim = 512  # ResNet18 final embedding dim
+        elif backbone == "dinov2":
+            # Placeholder: using ResNet50 to stand in for a "DINOv2" style model
+            backbone_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+            feature_dim = 2048  # ResNet50 final embedding dim
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+
+        # Remove the classification layer of the chosen backbone
+        self.feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
+
+        # -------------------------------------------------------
+        # Build the head
+        # -------------------------------------------------------
+        if model_type == "linear":
+            # Simple linear classifier for binary classification
+            self.head = nn.Linear(feature_dim, num_classes)
+        elif model_type == "time_to_event":
+            # Placeholder head for time-to-event. 
+            # Could be multi-output for hazard function, etc.
+            self.head = nn.Linear(feature_dim, 1)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        self.model_type = model_type
+        self.lr = lr
 
     def forward(self, x):
         """
-        x is shape (batch_size, 5, 3, 224, 224) if each sample has 5 images.
-        We want to:
-         - Flatten the batch dimension + number of slices
-         - Extract features
-         - Pool features (average) to get single representation
-         - Classify
+        x is shape (batch_size, 5, 3, 224, 224) if each sample has 5 slices/images.
+        - Flatten the slice dimension
+        - Extract features
+        - Pool across slices
+        - Pass through head
         """
-        b, n_slices, c, h, w = x.shape  # e.g. (batch, 5, 3, 224, 224)
-        x = x.view(b*n_slices, c, h, w)  # flatten slices => (b*5, 3, 224, 224)
-        
-        feats = self.feature_extractor(x)  # => shape (b*5, 512, 1, 1) for ResNet
-        feats = feats.view(feats.size(0), -1)  # => (b*5, 512)
-        
-        # Now group back by patient (batch):
-        feats = feats.view(b, n_slices, -1)  # => (b, 5, 512)
-        feats_mean = feats.mean(dim=1)       # => (b, 512) average pooling across slices
-        
-        logits = self.classifier(feats_mean) # => (b, num_classes)
+        b, n_slices, c, h, w = x.shape  
+        x = x.view(b*n_slices, c, h, w)  # Flatten the slices
+
+        feats = self.feature_extractor(x)  # => (b*n_slices, feature_dim, 1, 1)
+        feats = feats.view(feats.size(0), -1)  # => (b*n_slices, feature_dim)
+
+        # Re-group by batch and average pool
+        feats = feats.view(b, n_slices, -1)  
+        feats_mean = feats.mean(dim=1)  # (b, feature_dim)
+
+        logits = self.head(feats_mean)  # => (b, out_dim)
         return logits
 
     def training_step(self, batch, batch_idx):
         x, y = batch  # x: (batch_size, 5, 3, 224, 224), y: (batch_size,)
-        logits = self.forward(x).squeeze(dim=-1)  # => (batch_size,)
-        
-        # For demonstration: BCE with logits. If your label is 0 or 1:
-        loss_fn = nn.BCEWithLogitsLoss()
-        loss = loss_fn(logits, y)
-        
+
+        # Forward
+        preds = self.forward(x).squeeze(dim=-1)  # => (batch_size,)
+
+        # -------------------------------------------------------
+        # Different losses depending on model_type
+        # -------------------------------------------------------
+        if self.model_type == "linear":
+            # Binary classification loss
+            loss_fn = nn.BCEWithLogitsLoss()
+            loss = loss_fn(preds, y)
+        else:
+            # time_to_event (placeholder!)
+            # Typically you'd have (time, event) data and use a 
+            # partial log-likelihood, e.g., from pycox. Here is a dummy example:
+            loss = ((preds - y)**2).mean()  # placeholder for demonstration
+
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        logits = self.forward(x).squeeze(dim=-1)
-        loss_fn = nn.BCEWithLogitsLoss()
-        loss = loss_fn(logits, y)
-        
+        preds = self.forward(x).squeeze(dim=-1)
+
+        if self.model_type == "linear":
+            loss_fn = nn.BCEWithLogitsLoss()
+            loss = loss_fn(preds, y)
+        else:
+            # Placeholder time-to-event
+            loss = ((preds - y)**2).mean()
+
         self.log("val_loss", loss, prog_bar=True)
         return loss
 
@@ -167,7 +182,7 @@ class TimeToEventModel(pl.LightningModule):
 
 class HCCDataModule(pl.LightningDataModule):
     """
-    Optional: A LightningDataModule to handle train/val/test splits and loaders.
+    A LightningDataModule to handle train/val/test splits and loaders.
     """
     def __init__(self, csv_file, dicom_root, batch_size=2):
         super().__init__()
@@ -177,13 +192,10 @@ class HCCDataModule(pl.LightningDataModule):
 
         # define transforms if needed
         self.transform = T.Compose([
-            # For each 2D slice, apply some transform
-            # In real code, you'd do more sophisticated transforms
-            T.Resize((224, 224)),  # just in case
+            T.Resize((224, 224)),  # Just for demonstration
         ])
 
     def setup(self, stage=None):
-        # Typically you read the entire dataset once, then split into train/val/test
         full_dataset = HCCDicomDataset(self.csv_file, self.dicom_root, transform=self.transform)
         
         n_total = len(full_dataset)
@@ -212,7 +224,10 @@ class HCCDataModule(pl.LightningDataModule):
 ###############################################################################
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a Time-to-Event model using PyTorch Lightning + DinoV2 + pycox (placeholder).")
+    parser = argparse.ArgumentParser(
+        description="Train a model using PyTorch Lightning with either a ResNet or DinoV2 backbone, "
+                    "and either a linear or time-to-event head."
+    )
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="patients.csv",
@@ -223,6 +238,17 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
+
+    # -------------------------------------------------------------------------
+    # NEW ARGUMENTS:
+    # -------------------------------------------------------------------------
+    parser.add_argument("--backbone", type=str, default="resnet",
+                        choices=["resnet", "dinov2"],
+                        help="Which model backbone to use.")
+    parser.add_argument("--model_type", type=str, default="linear",
+                        choices=["linear", "time_to_event"],
+                        help="Which type of model head to use (binary linear or time-to-event).")
+
     return parser.parse_args()
 
 
@@ -240,13 +266,17 @@ def main():
     data_module.setup()
     
     # Create model
-    model = TimeToEventModel(lr=args.lr)
+    model = HCCLightningModel(
+        backbone=args.backbone,
+        model_type=args.model_type,
+        lr=args.lr
+    )
     
     # Create trainer
     trainer = Trainer(
         logger=wandb_logger,
         max_epochs=args.max_epochs,
-        accelerator="auto",  # Let PL figure out if there's a GPU
+        accelerator="auto",
         devices="auto"
     )
     
