@@ -31,10 +31,11 @@ import lifelines
 ###############################################################################
 
 class HCCDicomDataset(Dataset):
-    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None):
+    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None,num_slices=10):
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
+        self.num_slices = num_slices
         self.patient_data = []
         
         # Read CSV and prepare patient data
@@ -104,15 +105,27 @@ class HCCDicomDataset(Dataset):
         # 4. Load and preprocess images
         image_stack = []
         for dcm in axial_series:
-            # Load full DICOM now that we've filtered
             dcm = pydicom.dcmread(dcm.filename)
             img = self.dicom_to_tensor(dcm)
             
-            # Apply transform to each individual slice
             if self.transform:
                 img = self.transform(img)
             
             image_stack.append(img)
+
+        # Handle variable slice counts
+        current_slices = len(image_stack)
+        
+        if current_slices < self.num_slices:
+            # Pad with empty slices
+            pad_size = self.num_slices - current_slices
+            slice_shape = image_stack[0].shape if image_stack else (3, 224, 224)
+            for _ in range(pad_size):
+                image_stack.append(torch.zeros(slice_shape))
+        else:
+            # Take center slices
+            start_idx = (current_slices - self.num_slices) // 2
+            image_stack = image_stack[start_idx:start_idx+self.num_slices]
 
         return torch.stack(image_stack)
 
@@ -379,29 +392,25 @@ class HCCLightningModel(pl.LightningModule):
 ###############################################################################
 
 class HCCDataModule(pl.LightningDataModule):
-    """
-    Data module that:
-     - Expects CSV with [Patient_id, Label, Time, Event]
-     - Splits data into train/val/test
-    """
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2):
+    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=100):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
+        self.num_slices = num_slices  # Add num_slices parameter
 
         self.transform = T.Compose([
             T.Resize((224, 224))
         ])
 
     def setup(self, stage=None):
-        # Read full dataset
         full_dataset = HCCDicomDataset(
             csv_file=self.csv_file,
             dicom_root=self.dicom_root,
             model_type=self.model_type,
-            transform=self.transform
+            transform=self.transform,
+            num_slices=self.num_slices  # Pass parameter here
         )
         
         n_total = len(full_dataset)
@@ -414,7 +423,7 @@ class HCCDataModule(pl.LightningDataModule):
             [n_train, n_val, n_test],
             generator=torch.Generator().manual_seed(42)
         )
-
+        
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
 
@@ -451,6 +460,8 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="linear",
                         choices=["linear", "time_to_event"],
                         help="Which type of head to use (binary classification vs survival).")
+    parser.add_argument("--num_slices", type=int, default=100,
+                        help="Fixed number of slices to use per patient (pad or crop)")
 
     return parser.parse_args()
 
@@ -469,7 +480,8 @@ def main():
         csv_file=args.csv_file,
         dicom_root=args.dicom_root,
         model_type=args.model_type,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        num_slices=args.num_slices  # Add this line
     )
     data_module.setup()
     
