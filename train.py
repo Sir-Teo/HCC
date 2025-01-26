@@ -3,9 +3,10 @@
 import argparse
 import os
 import random
-
+from collections import defaultdict
 import pandas as pd
 import numpy as np
+import pydicom
 
 import torch
 import torch.nn as nn
@@ -30,54 +31,125 @@ import lifelines
 ###############################################################################
 
 class HCCDicomDataset(Dataset):
-    """
-    A placeholder dataset that:
-      - Reads CSV with columns [patient_id, label, time, event].
-      - For classification: we use 'label' (0/1).
-      - For survival: we use 'time' (float) and 'event' (0 or 1).
-      - Loads an image stack per patient (placeholder random tensors).
-    """
     def __init__(self, csv_file, dicom_root, model_type="linear", transform=None):
-        """
-        Args:
-            csv_file (str): Path to CSV that has columns 
-                [patient_id, label, time, event].
-            dicom_root (str): Root folder with DICOM images (not used in this demo).
-            model_type (str): 'linear' or 'time_to_event'.
-        """
-        # Example: we assume CSV has columns: patient_id, label, time, event
-        df = pd.read_csv(csv_file)
-
-        # For simplicity, convert to list of dicts
-        # Each row has: {patient_id, label, time, event}
-        self.samples = df.to_dict("records")
-        
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
+        self.patient_data = []
+        
+        # Read CSV and prepare patient data
+        df = pd.read_csv(csv_file)
+        for _, row in df.iterrows():
+            patient_id = str(row['Patient_id'])
+            dicom_dir = os.path.join(dicom_root, patient_id)
+            
+            if os.path.exists(dicom_dir):
+                self.patient_data.append({
+                    'patient_id': patient_id,
+                    'label': row['Label'],
+                    'time': row.get('time', 0),  # Default values if not in CSV
+                    'event': row.get('event', 0),
+                    'dicom_dir': dicom_dir
+                })
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.patient_data)
 
     def __getitem__(self, idx):
-        row = self.samples[idx]
-        # "Load images" -> placeholder random stack of 5 images of shape (3,224,224)
-        stack_of_images = torch.randn(5, 3, 224, 224)
-
-        if self.transform:
-            stack_of_images = torch.stack([self.transform(img) for img in stack_of_images])
+        patient = self.patient_data[idx]
+        dicom_dir = patient['dicom_dir']
         
-        # For classification, we only need 'label'
-        # For survival, we need 'time' and 'event'
+        # Load and process DICOM images
+        image_stack = self.load_axial_series(dicom_dir)
+        
+        # Return appropriate targets based on model type
         if self.model_type == "linear":
-            label = torch.tensor(row["Label"], dtype=torch.float32)
-            return stack_of_images, label
+            return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
         else:
-            # time_to_event
-            time_ = torch.tensor(row["time"], dtype=torch.float32)
-            event_ = torch.tensor(row["event"], dtype=torch.float32)
-            return stack_of_images, time_, event_
+            return image_stack, torch.tensor(patient['time'], dtype=torch.float32), \
+                   torch.tensor(patient['event'], dtype=torch.float32)
 
+    def load_axial_series(self, dicom_dir):
+        """Load axial DICOM series with proper orientation"""
+        # 1. Group files by series time
+        series_dict = defaultdict(list)
+        
+        # List all DICOM files in directory
+        dcm_files = [f for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
+        
+        # Read basic metadata from all files
+        for fname in dcm_files:
+            try:
+                dcm = pydicom.dcmread(os.path.join(dicom_dir, fname), stop_before_pixels=True)
+                series_time = dcm.get('SeriesTime', '000000.000')
+                orientation = tuple(map(float, dcm.ImageOrientationPatient))
+                series_dict[(series_time, orientation)].append(dcm)
+            except Exception as e:
+                print(f"Error reading {fname}: {str(e)}")
+                continue
+
+        # 2. Select axial series with proper orientation
+        axial_series = []
+        for (stime, orient), dcms in series_dict.items():
+            # Check if orientation is axial (approximate check)
+            if self.is_axial(orient):
+                axial_series.extend(dcms)
+
+        if not axial_series:
+            raise ValueError(f"No axial series found in {dicom_dir}")
+
+        # 3. Sort slices by slice location (z-position)
+        axial_series.sort(key=lambda d: float(d.SliceLocation))
+
+        # 4. Load and preprocess images
+        image_stack = []
+        for dcm in axial_series:
+            # Load full DICOM now that we've filtered
+            dcm = pydicom.dcmread(dcm.filename)
+            img = self.dicom_to_tensor(dcm)
+            
+            # Apply transform to each individual slice
+            if self.transform:
+                img = self.transform(img)
+            
+            image_stack.append(img)
+
+        return torch.stack(image_stack)
+
+    def is_axial(self, orientation):
+        """Check if orientation is approximately axial (within tolerance)"""
+        # Expected axial orientation: (1, 0, 0, 0, 1, 0)
+        ref_orientation = (1, 0, 0, 0, 1, 0)
+        tolerance = 1e-3
+        
+        return all(abs(a - b) < tolerance 
+                   for a, b in zip(orientation, ref_orientation))
+
+    def dicom_to_tensor(self, dcm):
+        """Convert DICOM pixel data to normalized tensor"""
+        img = dcm.pixel_array.astype(np.float32)
+        
+        # Apply modality-specific preprocessing
+        if dcm.Modality == 'CT':
+            # Apply Hounsfield Units scaling
+            intercept = float(dcm.RescaleIntercept)
+            slope = float(dcm.RescaleSlope)
+            img = slope * img + intercept
+            
+            # Clip to typical soft tissue range
+            img = np.clip(img, -100, 400)
+            
+            # Normalize to [0, 1]
+            img = (img + 100) / 500.0
+        else:
+            # Handle other modalities (MR, etc)
+            img = (img - img.min()) / (img.max() - img.min())
+        
+        # Convert to RGB if needed (repeat grayscale to 3 channels)
+        if img.ndim == 2:
+            img = np.repeat(img[..., np.newaxis], 3, axis=-1)
+            
+        return torch.from_numpy(img).permute(2, 0, 1)  # CHW format
 
 ###############################################################################
 # 2) LIGHTNING MODULE
@@ -309,7 +381,7 @@ class HCCLightningModel(pl.LightningModule):
 class HCCDataModule(pl.LightningDataModule):
     """
     Data module that:
-     - Expects CSV with [patient_id, label, time, event]
+     - Expects CSV with [Patient_id, Label, Time, Event]
      - Splits data into train/val/test
     """
     def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2):
@@ -368,7 +440,7 @@ def parse_args():
                         help="Path to CSV with columns [patient_id, label, time, event].")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
-    parser.add_argument("--max_epochs", type=int, default=2, help="Max number of epochs.")
+    parser.add_argument("--max_epochs", type=int, default=50, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
