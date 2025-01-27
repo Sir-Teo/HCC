@@ -4,7 +4,9 @@ This is the repository for the Hepatocellular Carcinoma Recurrence Prediction pr
 
 ## Dataset
 
-### SSL 
+patient 13850412 might not have axial
+
+## SSL 
 
 - [**LLD-MMRI Dataset**](https://github.com/LMMMEng/LLD-MMRI-Dataset): An open-access dataset for liver lesion diagnosis on multi-phase MRI, comprising 498 cases with 7 different lesion types. (~220,000 images)
   
@@ -32,7 +34,7 @@ After training, each classifier's performance is evaluated, and the best one is 
 
 - NYU Internal HCC Dataset
 
-## How to Run SSL
+### How to Run SSL
 
 ```
 python dinov2/run/train/train.py \
@@ -45,22 +47,25 @@ python dinov2/run/train/train.py \
 train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images
 ```
 
-## How to Run Classification Benchmark
+### How to Run Classification Benchmark
 
-### For Untrained Model
+#### For Untrained Model
 
 ```
 sbatch gpu_train_untrained.sbatch
 ```
 
-### For Pretrained Model
+#### For Pretrained Model
 
 ```
 sbatch gpu_train_pretrained.sbatch
 ```
 
-### For our own SSL Model
+#### For our own SSL Model
 
 ```
 sbatch gpu_train.sbatch
 ```
+
+## Time to Event Model Training
+

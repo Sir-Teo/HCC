@@ -71,59 +71,52 @@ class HCCDicomDataset(Dataset):
                    torch.tensor(patient['event'], dtype=torch.float32)
 
     def load_axial_series(self, dicom_dir):
-        """Load axial DICOM series with proper orientation"""
-        # 1. Group files by series time
+        """Load axial DICOM series with proper orientation, then randomly sample num_slices."""
         series_dict = defaultdict(list)
-        
-        # List all DICOM files in directory
         dcm_files = [f for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
         
-        # Read basic metadata from all files
+        # 1. Read each DICOM and group by orientation
         for fname in dcm_files:
             try:
                 dcm = pydicom.dcmread(os.path.join(dicom_dir, fname), stop_before_pixels=True)
-                # Check for required attributes
                 if not hasattr(dcm, 'ImageOrientationPatient') or not hasattr(dcm, 'ImagePositionPatient'):
-                    print(f"Skipping {fname}: missing required DICOM attributes.")
-                    continue  # Skip DCMs missing required tags
-                series_time = dcm.get('SeriesTime', '000000.000')
-                orientation = tuple(map(float, dcm.ImageOrientationPatient))
-                series_dict[(series_time, orientation)].append(dcm)
+                    continue
+                
+                # Round orientation for grouping
+                orientation = np.array(dcm.ImageOrientationPatient, dtype=np.float32).round(4)
+                orientation_tuple = tuple(orientation.flatten())
+                series_dict[orientation_tuple].append(dcm)
             except Exception as e:
-                print(f"Error reading {fname}: {str(e)}")
-                continue  # Skip DCMs that can't be read
+                continue
 
-        # 2. Select axial series with proper orientation
+        # 2. Filter for axial series
         axial_series = []
-        for (stime, orient), dcms in series_dict.items():
-            # Check if orientation is axial (approximate check)
+        for orient, dcms in series_dict.items():
             if self.is_axial(orient):
                 axial_series.extend(dcms)
 
         if not axial_series:
             raise ValueError(f"No axial series found in {dicom_dir}")
 
-        # 3. Sort slices by slice location (z-position)
+        # 3. Sort slices by z-position
         axial_series.sort(key=lambda d: (
             float(d.SliceLocation) 
             if hasattr(d, 'SliceLocation') 
             else float(d.ImagePositionPatient[2])
         ))
 
-        # 4. Load and preprocess images
+        # 4. Load pixel data and apply transforms
         image_stack = []
         for dcm in axial_series:
             dcm = pydicom.dcmread(dcm.filename)
             img = self.dicom_to_tensor(dcm)
-            
             if self.transform:
                 img = self.transform(img)
-            
             image_stack.append(img)
 
-        # Handle variable slice counts
         current_slices = len(image_stack)
-        
+
+        # 5. Randomly sample or pad
         if current_slices < self.num_slices:
             # Pad with empty slices
             pad_size = self.num_slices - current_slices
@@ -131,11 +124,14 @@ class HCCDicomDataset(Dataset):
             for _ in range(pad_size):
                 image_stack.append(torch.zeros(slice_shape))
         else:
-            # Take center slices
-            start_idx = (current_slices - self.num_slices) // 2
-            image_stack = image_stack[start_idx:start_idx+self.num_slices]
+            # Randomly choose `self.num_slices` from the total slices
+            selected_indices = np.random.choice(current_slices, self.num_slices, replace=False)
+            # Sort them so the final stack preserves the natural top-to-bottom order
+            selected_indices.sort()
+            image_stack = [image_stack[i] for i in selected_indices]
 
         return torch.stack(image_stack)
+
 
     def is_axial(self, orientation):
         """Check if orientation is axial by verifying cross product aligns with z-axis."""
@@ -153,9 +149,9 @@ class HCCDicomDataset(Dataset):
         cross_normalized = cross / norm
         
         # Check if the cross product is aligned with the z-axis (positive or negative)
-        return (np.abs(cross_normalized[0]) < 1e-3 and 
-                np.abs(cross_normalized[1]) < 1e-3 and 
-                np.abs(np.abs(cross_normalized[2]) - 1.0) < 1e-3)
+        return (np.abs(cross_normalized[0]) < 5e-2 and 
+                np.abs(cross_normalized[1]) < 5e-2 and 
+                np.abs(np.abs(cross_normalized[2]) - 1.0) < 5e-2)
 
     def dicom_to_tensor(self, dcm):
         """Convert DICOM pixel data to normalized tensor"""
@@ -479,7 +475,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="linear",
                         choices=["linear", "time_to_event"],
                         help="Which type of head to use (binary classification vs survival).")
-    parser.add_argument("--num_slices", type=int, default=100,
+    parser.add_argument("--num_slices", type=int, default=20,
                         help="Fixed number of slices to use per patient (pad or crop)")
 
     return parser.parse_args()
