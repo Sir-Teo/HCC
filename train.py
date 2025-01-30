@@ -16,6 +16,7 @@ import torchvision.transforms as T
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything, Trainer
 from torch.utils.data import Dataset, DataLoader, default_collate
+from sklearn.model_selection import train_test_split
 
 import wandb
 from pytorch_lightning.loggers import WandbLogger
@@ -41,7 +42,10 @@ class HCCDicomDataset(Dataset):
         self.patient_data = []
         
         # Read CSV and prepare patient data
-        df = pd.read_csv(csv_file)
+        if isinstance(csv_file, str):
+            df = pd.read_csv(csv_file)
+        else:
+            df = csv_file.copy()  # Assume it's a DataFrame
         for _, row in df.iterrows():
             patient_id = str(row['Pre op MRI Accession number'])  # Update to match your CSV
             dicom_dir = os.path.join(dicom_root, patient_id)
@@ -587,7 +591,7 @@ def parse_args():
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
     parser.add_argument("--lr", type=float, default=1e-3, help="Fixed Learning rate.")  # Adjusted default
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
     parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
