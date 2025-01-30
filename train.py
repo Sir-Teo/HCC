@@ -247,6 +247,10 @@ class HCCLightningModel(pl.LightningModule):
 
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
+            
+        if pretrained:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False  # Disable gradients for pretrained weights
         
         # ---------------------------------------------------------------------
         # 2.2) Build Head
