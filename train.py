@@ -24,7 +24,7 @@ import torchvision.models as models
 
 # For survival metrics:
 from pycox.evaluation import EvalSurv
-import lifelines
+from pycox.models.loss import CoxPHLoss  # Import pycox's CoxPHLoss
 from lifelines.utils import concordance_index
 
 ###############################################################################
@@ -32,7 +32,7 @@ from lifelines.utils import concordance_index
 ###############################################################################
 
 class HCCDicomDataset(Dataset):
-    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None,num_slices=10):
+    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10):
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
@@ -42,17 +42,22 @@ class HCCDicomDataset(Dataset):
         # Read CSV and prepare patient data
         df = pd.read_csv(csv_file)
         for _, row in df.iterrows():
-            patient_id = str(row['Patient_id'])
+            patient_id = str(row['Pre op MRI Accession number'])  # Updated to match your CSV
             dicom_dir = os.path.join(dicom_root, patient_id)
             
             if os.path.exists(dicom_dir):
-                self.patient_data.append({
+                data_entry = {
                     'patient_id': patient_id,
-                    'label': row['Label'],
-                    'time': row.get('time', 0),  # Default values if not in CSV
-                    'event': row.get('event', 0),
-                    'dicom_dir': dicom_dir
-                })
+                }
+
+                if self.model_type == "linear":
+                    data_entry['label'] = row['recurrence post tx']  # Binary label
+                elif self.model_type == "time_to_event":
+                    data_entry['time'] = row['time']    # Duration
+                    data_entry['event'] = row['event']  # Event indicator
+
+                data_entry['dicom_dir'] = dicom_dir
+                self.patient_data.append(data_entry)
 
     def __len__(self):
         return len(self.patient_data)
@@ -67,10 +72,13 @@ class HCCDicomDataset(Dataset):
         # Return appropriate targets based on model type
         if self.model_type == "linear":
             return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
-        else:
-            return image_stack, torch.tensor(patient['time'], dtype=torch.float32), \
-                   torch.tensor(patient['event'], dtype=torch.float32)
-
+        elif self.model_type == "time_to_event":
+            return (
+                image_stack,
+                torch.tensor(patient['time'], dtype=torch.float32),
+                torch.tensor(patient['event'], dtype=torch.float32)
+            )
+        
     def load_axial_series(self, dicom_dir):
         """Load axial DICOM series with proper orientation, then randomly sample num_slices."""
         series_dict = defaultdict(list)
@@ -184,37 +192,6 @@ class HCCDicomDataset(Dataset):
 # 2) LIGHTNING MODULE
 ###############################################################################
 
-class CoxPHLoss(nn.Module):
-    """
-    Cox Proportional Hazards Loss Function.
-    """
-    def __init__(self):
-        super(CoxPHLoss, self).__init__()
-
-    def forward(self, preds, durations, events):
-        preds = preds.squeeze()
-        durations = durations.squeeze()
-        events = events.squeeze()
-
-        # Sort by descending durations
-        order = torch.argsort(-durations)
-        preds = preds[order]
-        durations = durations[order]
-        events = events[order]
-
-        # Calculate hazard ratios
-        hazard_ratio = torch.exp(preds)
-        log_cum_hazard = torch.log(torch.cumsum(hazard_ratio, dim=0))
-
-        # Partial log-likelihood
-        log_likelihood = preds - log_cum_hazard
-        partial_log_likelihood = log_likelihood * events
-
-        # CoxPH loss
-        loss = -torch.sum(partial_log_likelihood) / torch.sum(events)
-        return loss
-
-
 class HCCLightningModel(pl.LightningModule):
     def __init__(
         self,
@@ -261,7 +238,7 @@ class HCCLightningModel(pl.LightningModule):
             self.criterion = nn.BCEWithLogitsLoss()
         elif model_type == "time_to_event":
             self.head = nn.Linear(feature_dim, 1)
-            self.criterion = CoxPHLoss()
+            self.criterion = CoxPHLoss()  # Use pycox's CoxPHLoss
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -308,7 +285,7 @@ class HCCLightningModel(pl.LightningModule):
         elif self.model_type == "time_to_event":
             x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
-            loss = self.criterion(risk_score, t, e)
+            loss = self.criterion(risk_score, t, e)  # pycox's CoxPHLoss expects (risk_score, durations, events)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
@@ -398,7 +375,7 @@ class HCCLightningModel(pl.LightningModule):
             all_times = torch.cat(self.all_times).numpy()
             all_events = torch.cat(self.all_events).numpy()
 
-            # Compute Concordance Index (c-index)
+            # Compute Concordance Index (c-index) using lifelines
             c_index = concordance_index(
                 event_times=all_times,
                 predicted_scores=-all_risks,  # Negative because higher risk = shorter survival
@@ -406,9 +383,8 @@ class HCCLightningModel(pl.LightningModule):
             )
             self.log("test_c_index", c_index)
 
-            # Option 2) pycox (EvalSurv) typically expects survival predictions
-            # across multiple time points. For a pure risk score, you can do:
-            eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_seq="end")
+            # Compute Concordance Index using pycox's EvalSurv
+            eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_surv='km')
             c_index_pycox = eval_surv.concordance_td()
             self.log("test_c_index_pycox", c_index_pycox)
 
@@ -427,7 +403,7 @@ class HCCDataModule(pl.LightningDataModule):
         self.num_slices = num_slices  # Add num_slices parameter
 
         self.transform = T.Compose([
-            T.Resize((224, 224))
+            T.Resize((224, 224), antialias=True)
         ])
 
     def setup(self, stage=None):
@@ -473,7 +449,7 @@ def parse_args():
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Deidentified ID, recurrence post tx, time, event].")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
     parser.add_argument("--max_epochs", type=int, default=50, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
