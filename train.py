@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-
+import timm
 import argparse
 import os
 import random
@@ -184,15 +184,9 @@ class HCCDicomDataset(Dataset):
 ###############################################################################
 
 class HCCLightningModel(pl.LightningModule):
-    """
-    A LightningModule that can do:
-      - 'linear' (binary classification) or
-      - 'time_to_event' (survival).
-    It uses either a ResNet or Dino-like backbone (placeholder).
-    """
     def __init__(
         self,
-        backbone="resnet",       # "resnet" or "dinov2" (placeholder)
+        backbone="resnet",       # "resnet", "dinov1", or "dinov2"
         model_type="linear",     # "linear" or "time_to_event"
         lr=1e-4,
         num_classes=1
@@ -204,22 +198,34 @@ class HCCLightningModel(pl.LightningModule):
         self.lr = lr
 
         # ---------------------------------------------------------------------
-        # 2.1) Build Backbone
+        # 1) Build Backbone
         # ---------------------------------------------------------------------
         if backbone == "resnet":
+            # Example: ResNet18
             backbone_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
             feature_dim = 512
+            # Remove final classification layer
+            self.feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
+
+            # We'll need a flag to know how to forward data
+            self.is_vit = False
+
+        elif backbone == "dinov1":
+            # Example: DINO ViT-Small (timm model name: "vit_small_patch16_224_dino")
+            backbone_model = timm.create_model("vit_small_patch16_224_dino", pretrained=True)
+            feature_dim = backbone_model.embed_dim
+            self.feature_extractor = backbone_model
+            self.is_vit = True
+
         elif backbone == "dinov2":
-            # Placeholder: using resnet50 as a stand-in for "dinov2"
-            # In real code, you would load your DINOv2 model.
-            backbone_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-            feature_dim = 2048
+            # Example: DINOv2 ViT-Base (timm model name: "dinov2_vitb14")
+            backbone_model = timm.create_model("dinov2_vitb14", pretrained=True)
+            feature_dim = backbone_model.embed_dim
+            self.feature_extractor = backbone_model
+            self.is_vit = True
+
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
-
-        # Remove final classification layer of the chosen backbone
-        self.feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
-
         # ---------------------------------------------------------------------
         # 2.2) Build Head
         # ---------------------------------------------------------------------
@@ -246,25 +252,53 @@ class HCCLightningModel(pl.LightningModule):
 
     def forward(self, x):
         """
-        x shape: (batch_size, 5, 3, 224, 224)
+        x shape: (batch_size, n_slices, 3, H, W)
         Steps:
-         - Flatten slices
-         - Extract features
-         - Average pool across slices
-         - Pass through head
+        - Flatten slices (B * n_slices, 3, H, W)
+        - Extract features
+        - Regroup by (B, n_slices, feature_dim) and average
+        - Pass through head
         """
         b, n_slices, c, h, w = x.shape
-        x = x.view(b*n_slices, c, h, w)  # flatten slices
+        x = x.view(b*n_slices, c, h, w)  # flatten slices into a single batch
 
-        feats = self.feature_extractor(x)   # (b*n_slices, feat_dim, 1, 1)
-        feats = feats.view(feats.size(0), -1)  # (b*n_slices, feat_dim)
+        if not self.is_vit:
+            # ResNet-like forward
+            feats = self.feature_extractor(x)  # (B*n_slices, feature_dim, 1, 1)
+            feats = feats.view(feats.size(0), -1)  # Flatten to (B*n_slices, feature_dim)
+        else:
+            # ViT-based forward via timm. 
+            # For many timm ViT models:
+            #   feats = model.forward_features(x) returns shape [B, tokens, embed_dim]
+            # We'll take the CLS token feats[:, 0, :]
+            feats_vit = self.feature_extractor.forward_features(x)  # shape [B*n_slices, tokens, embed_dim]
+            
+            # Depending on the specific timm model, forward_features may return:
+            #   - a tensor
+            #   - a dict of multiple features
+            #
+            # For DINO models in timm, it typically returns a single tensor [B, tokens, embed_dim].
+            # We'll assume that's the case. Double-check via `print(feats_vit.shape)`.
+            
+            if isinstance(feats_vit, dict):
+                # Some timm models return a dict with multiple feature maps.
+                # You may need to pick the appropriate key. E.g. 'x_norm_clstoken'
+                feats_vit = feats_vit["x_norm_clstoken"]  # adjust as needed
 
-        # regroup by batch, average over slices
-        feats = feats.view(b, n_slices, -1)
-        feats_mean = feats.mean(dim=1)
+            # If it's a tensor: feats_vit.shape = [B*n_slices, tokens, embed_dim]
+            # The [CLS] token is typically index 0: feats_vit[:, 0, :]
+            feats = feats_vit[:, 0, :]
 
-        logits = self.head(feats_mean)  # (b, out_dim)
+        # Now feats is (B*n_slices, feature_dim)
+
+        # Group back by patient and average across slices
+        feats = feats.view(b, n_slices, -1)  # (B, n_slices, feature_dim)
+        feats_mean = feats.mean(dim=1)       # average over slices => (B, feature_dim)
+
+        # Final linear head
+        logits = self.head(feats_mean)       # (B, out_dim)
         return logits
+
 
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.lr)
@@ -470,7 +504,7 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
     
     parser.add_argument("--backbone", type=str, default="resnet",
-                        choices=["resnet", "dinov2"],
+                        choices=["resnet", "dinov2", "dinov1"],
                         help="Which model backbone to use.")
     parser.add_argument("--model_type", type=str, default="linear",
                         choices=["linear", "time_to_event"],
