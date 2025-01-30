@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import timm
 import argparse
 import os
@@ -28,7 +27,6 @@ from pycox.evaluation import EvalSurv
 from pycox.models.loss import CoxPHLoss  # Import PyCox's CoxPHLoss
 from lifelines.utils import concordance_index
 
-
 torch.hub.set_dir("weights/")
 os.environ["TORCH_HOME"] = "weights/"
 
@@ -37,11 +35,12 @@ os.environ["TORCH_HOME"] = "weights/"
 ###############################################################################
 
 class HCCDicomDataset(Dataset):
-    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10):
+    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10, preprocessed_root=None):
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
         self.num_slices = num_slices
+        self.preprocessed_root = preprocessed_root
         self.patient_data = []
         
         # Read CSV and prepare patient data
@@ -77,6 +76,14 @@ class HCCDicomDataset(Dataset):
         # Load and process DICOM images
         image_stack = self.load_axial_series(dicom_dir)
         
+        # Apply runtime transforms (e.g., augmentations)
+        if self.transform:
+            transformed_images = []
+            for img in image_stack:
+                img = self.transform(img)
+                transformed_images.append(img)
+            image_stack = torch.stack(transformed_images)
+        
         # Return appropriate targets based on model type
         if self.model_type == "linear":
             return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
@@ -89,6 +96,14 @@ class HCCDicomDataset(Dataset):
         
     def load_axial_series(self, dicom_dir):
         """Load axial DICOM series with proper orientation, then randomly sample num_slices."""
+        patient_id = os.path.basename(dicom_dir)
+        if self.preprocessed_root:
+            preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
+            if os.path.exists(preprocessed_path):
+                image_stack = torch.load(preprocessed_path)
+                return self.process_loaded_stack(image_stack)
+        
+        # If preprocessed not found or not enabled, process DICOMs
         series_dict = defaultdict(list)
         dcm_files = [f for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
         
@@ -140,23 +155,28 @@ class HCCDicomDataset(Dataset):
                 print(f"Error processing DICOM file {dcm_path}: {e}")
                 continue
 
-        current_slices = len(image_stack)
+        image_stack = torch.stack(image_stack) if image_stack else torch.zeros((0, 3, 224, 224))
+        
+        # Save preprocessed data if enabled
+        if self.preprocessed_root:
+            os.makedirs(self.preprocessed_root, exist_ok=True)
+            preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
+            torch.save(image_stack, preprocessed_path)
+        
+        return self.process_loaded_stack(image_stack)
 
-        # 5. Randomly sample or pad
+    def process_loaded_stack(self, image_stack):
+        """Sample or pad the loaded image stack to num_slices."""
+        current_slices = image_stack.size(0)
         if current_slices < self.num_slices:
-            # Pad with empty slices
             pad_size = self.num_slices - current_slices
-            slice_shape = image_stack[0].shape if image_stack else (3, 224, 224)
-            for _ in range(pad_size):
-                image_stack.append(torch.zeros(slice_shape))
+            padding = torch.zeros((pad_size, *image_stack.shape[1:]), dtype=image_stack.dtype)
+            image_stack = torch.cat([image_stack, padding], dim=0)
         else:
-            # Randomly choose `self.num_slices` from the total slices
-            selected_indices = np.random.choice(current_slices, self.num_slices, replace=False)
-            # Sort them so the final stack preserves the natural top-to-bottom order
-            selected_indices.sort()
-            image_stack = [image_stack[i] for i in selected_indices]
-
-        return torch.stack(image_stack)
+            selected_indices = torch.randperm(current_slices)[:self.num_slices]
+            selected_indices, _ = torch.sort(selected_indices)  # Maintain order
+            image_stack = image_stack[selected_indices]
+        return image_stack
 
 
     def is_axial(self, orientation):
@@ -247,7 +267,7 @@ class HCCLightningModel(pl.LightningModule):
 
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
-            
+
         if pretrained:
             for param in self.feature_extractor.parameters():
                 param.requires_grad = False  # Disable gradients for pretrained weights
@@ -566,70 +586,75 @@ class HCCLightningModel(pl.LightningModule):
         self.baseline_hazards.index.name = 'time'
 
     def predict_surv_func(self, risks, durations, events):
-        """Predict survival functions using precomputed baseline hazards."""
+        """Predict survival functions using precomputed baseline hazards, ensuring coverage of test times."""
         if self.baseline_hazards is None:
             raise ValueError("Baseline hazards not computed. Call compute_baseline_hazards with training data first.")
         
-        # Compute cumulative hazard for each risk
-        H = np.outer(np.exp(risks), self.baseline_hazards.values.cpu().numpy())
+        # Get unique event times from test data
+        test_event_times = np.unique(durations[events.astype(bool)])
+        
+        # Combine with training baseline times and sort
+        all_times = np.union1d(self.baseline_hazards.index.values, test_event_times)
+        all_times.sort()
+
+        # Extend baseline hazards to cover all times using forward fill
+        baseline_cumulative = self.baseline_hazards.reindex(all_times, method='ffill').fillna(0)
+
+        # Compute hazard matrix and survival functions
+        H = np.outer(np.exp(risks), baseline_cumulative.values)
         S = np.exp(-H)
         
-        # Create DataFrame with baseline hazard's index (time points)
-        surv_df = pd.DataFrame(S, columns=self.baseline_hazards.index)
-        return surv_df
+        return pd.DataFrame(S, columns=all_times, dtype=np.float32)
 
 ###############################################################################
 # 3) DATA MODULE
 ###############################################################################
 
 class HCCDataModule(pl.LightningDataModule):
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2):
+    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2, preprocessed_root=None):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
-        self.num_slices = num_slices  # Number of slices per patient
+        self.num_slices = num_slices
         self.num_workers = num_workers
+        self.preprocessed_root = preprocessed_root
 
-        self.transform = T.Compose([
+        # Use basic transforms for preprocessing (resize)
+        self.preprocess_transform = T.Compose([
             T.Resize((224, 224), antialias=True)
         ])
+        # Runtime transforms (augmentations) can be added here
+        self.transform = self.preprocess_transform  # Default to preprocessing transform
 
     def setup(self, stage=None):
         df = pd.read_csv(self.csv_file)
-
-        # Ensure labels are balanced in train/val/test
         stratify_col = df['recurrence post tx'] if self.model_type == "linear" else df['event']
 
-        # First, split into train (70%) and temp (30%)
-        train_df, temp_df = train_test_split(
-            df, test_size=0.3, random_state=42, stratify=stratify_col
-        )
-
-        # Then, split temp into validation (15%) and test (15%)
-        stratify_temp = temp_df['recurrence post tx'] if self.model_type == "linear" else temp_df['event']
-        val_df, test_df = train_test_split(
-            temp_df, test_size=0.5, random_state=42, stratify=stratify_temp
-        )
+        train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42, stratify=stratify_col)
+        val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df['event'])
 
         print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
         print(f"Label distribution in Train:\n{train_df['recurrence post tx'].value_counts()}")
         print(f"Label distribution in Val:\n{val_df['recurrence post tx'].value_counts()}")
         print(f"Label distribution in Test:\n{test_df['recurrence post tx'].value_counts()}")
 
-        # Create datasets
+        # Create datasets with preprocessed_root
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.transform, num_slices=self.num_slices
+            transform=self.preprocess_transform, num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root
         )
         self.val_dataset = HCCDicomDataset(
             csv_file=val_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.transform, num_slices=self.num_slices
+            transform=self.preprocess_transform, num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root
         )
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.transform, num_slices=self.num_slices
+            transform=self.preprocess_transform, num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root
         )
 
     def train_dataloader(self):
@@ -685,7 +710,7 @@ def parse_args():
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Fixed Learning rate.")  # Adjusted default
+    parser.add_argument("--lr", type=float, default=1e-5, help="Fixed Learning rate.")  # Adjusted default
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
     parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -702,7 +727,8 @@ def parse_args():
                         help="Fixed number of slices to use per patient (pad or crop)")
     parser.add_argument("--num_workers", type=int, default=2)
     
-    # <-- New Argument for Pretrained Weights -->
+    parser.add_argument("--preprocessed_root", type=str, default=None,
+                        help="Directory to save/load preprocessed DICOM tensors for faster loading.")
     parser.add_argument("--pretrained", action='store_true', default=True,
                         help="Use pretrained weights for the backbone model. Default is True.")
     
@@ -725,7 +751,8 @@ def main():
         model_type=args.model_type,
         batch_size=args.batch_size,
         num_slices=args.num_slices,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        preprocessed_root=args.preprocessed_root
     )
     data_module.setup()
     
