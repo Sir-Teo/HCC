@@ -15,7 +15,7 @@ import torchmetrics
 import torchvision.transforms as T
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything, Trainer
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, default_collate
 
 import wandb
 from pytorch_lightning.loggers import WandbLogger
@@ -24,7 +24,7 @@ import torchvision.models as models
 
 # For survival metrics:
 from pycox.evaluation import EvalSurv
-from pycox.models.loss import CoxPHLoss  # Import pycox's CoxPHLoss
+from pycox.models.loss import CoxPHLoss  # Import PyCox's CoxPHLoss
 from lifelines.utils import concordance_index
 
 ###############################################################################
@@ -42,7 +42,7 @@ class HCCDicomDataset(Dataset):
         # Read CSV and prepare patient data
         df = pd.read_csv(csv_file)
         for _, row in df.iterrows():
-            patient_id = str(row['Pre op MRI Accession number'])  # Updated to match your CSV
+            patient_id = str(row['Pre op MRI Accession number'])  # Update to match your CSV
             dicom_dir = os.path.join(dicom_root, patient_id)
             
             if os.path.exists(dicom_dir):
@@ -87,41 +87,50 @@ class HCCDicomDataset(Dataset):
         # 1. Read each DICOM and group by orientation
         for fname in dcm_files:
             try:
-                dcm = pydicom.dcmread(os.path.join(dicom_dir, fname), stop_before_pixels=True)
+                dcm_path = os.path.join(dicom_dir, fname)
+                dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
                 if not hasattr(dcm, 'ImageOrientationPatient') or not hasattr(dcm, 'ImagePositionPatient'):
                     continue
                 
                 # Round orientation for grouping
                 orientation = np.array(dcm.ImageOrientationPatient, dtype=np.float32).round(4)
                 orientation_tuple = tuple(orientation.flatten())
-                series_dict[orientation_tuple].append(dcm)
+                series_dict[orientation_tuple].append(dcm_path)
             except Exception as e:
+                print(f"Error reading DICOM file {fname}: {e}")
                 continue
 
         # 2. Filter for axial series
         axial_series = []
-        for orient, dcms in series_dict.items():
+        for orient, dcm_paths in series_dict.items():
             if self.is_axial(orient):
-                axial_series.extend(dcms)
+                axial_series.extend(dcm_paths)
 
         if not axial_series:
             raise ValueError(f"No axial series found in {dicom_dir}")
 
         # 3. Sort slices by z-position
-        axial_series.sort(key=lambda d: (
-            float(d.SliceLocation) 
-            if hasattr(d, 'SliceLocation') 
-            else float(d.ImagePositionPatient[2])
-        ))
+        def get_slice_position(dcm_path):
+            try:
+                dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+                return float(dcm.SliceLocation) if hasattr(dcm, 'SliceLocation') else float(dcm.ImagePositionPatient[2])
+            except Exception:
+                return 0.0  # Default position if unavailable
+
+        axial_series.sort(key=get_slice_position)
 
         # 4. Load pixel data and apply transforms
         image_stack = []
-        for dcm in axial_series:
-            dcm = pydicom.dcmread(dcm.filename)
-            img = self.dicom_to_tensor(dcm)
-            if self.transform:
-                img = self.transform(img)
-            image_stack.append(img)
+        for dcm_path in axial_series:
+            try:
+                dcm = pydicom.dcmread(dcm_path)
+                img = self.dicom_to_tensor(dcm)
+                if self.transform:
+                    img = self.transform(img)
+                image_stack.append(img)
+            except Exception as e:
+                print(f"Error processing DICOM file {dcm_path}: {e}")
+                continue
 
         current_slices = len(image_stack)
 
@@ -197,7 +206,7 @@ class HCCLightningModel(pl.LightningModule):
         self,
         backbone="resnet",       # "resnet", "dinov1", or "dinov2"
         model_type="linear",     # "linear" or "time_to_event"
-        lr=1e-4,
+        lr=1e-6,                 # Reduced learning rate
         num_classes=1
     ):
         super(HCCLightningModel, self).__init__()
@@ -235,10 +244,14 @@ class HCCLightningModel(pl.LightningModule):
         # ---------------------------------------------------------------------
         if model_type == "linear":
             self.head = nn.Linear(feature_dim, num_classes)
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)  # Initialize with small std
+            nn.init.constant_(self.head.bias, 0.0)
             self.criterion = nn.BCEWithLogitsLoss()
         elif model_type == "time_to_event":
             self.head = nn.Linear(feature_dim, 1)
-            self.criterion = CoxPHLoss()  # Use pycox's CoxPHLoss
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)  # Initialize with small std
+            nn.init.constant_(self.head.bias, 0.0)
+            self.criterion = CoxPHLoss()  
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -284,8 +297,30 @@ class HCCLightningModel(pl.LightningModule):
             loss = self.criterion(logits, y)
         elif self.model_type == "time_to_event":
             x, t, e = batch
+            
+            # Data validation
+            if (t <= 0).any():
+                raise ValueError("All durations must be positive.")
+            if not torch.all((e == 0) | (e == 1)):
+                raise ValueError("Event indicators must be binary (0 or 1).")
+            
             risk_score = self.forward(x).squeeze(-1)
-            loss = self.criterion(risk_score, t, e)  # pycox's CoxPHLoss expects (risk_score, durations, events)
+            loss = self.criterion(risk_score, t, e)  # PyCox's CoxPHLoss expects (risk_score, durations, events)
+            
+            # Check for NaNs and Infs in loss
+            if torch.isnan(loss):
+                self.log("NaN_loss", True)
+                raise ValueError("Loss is NaN")
+            else:
+                self.log("NaN_loss", False)
+            
+            # Log risk score statistics
+            self.log("risk_score_mean", torch.mean(risk_score), prog_bar=True)
+            self.log("risk_score_std", torch.std(risk_score), prog_bar=True)
+            self.log("risk_score_min", torch.min(risk_score), prog_bar=True)
+            self.log("risk_score_max", torch.max(risk_score), prog_bar=True)
+            self.log("risk_score_nan", torch.isnan(risk_score).any(), prog_bar=True)
+            self.log("risk_score_inf", torch.isinf(risk_score).any(), prog_bar=True)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
@@ -376,43 +411,61 @@ class HCCLightningModel(pl.LightningModule):
             all_events = torch.cat(self.all_events).numpy()
 
             # Compute Concordance Index (c-index) using lifelines
-            c_index = concordance_index(
-                event_times=all_times,
-                predicted_scores=-all_risks,  # Negative because higher risk = shorter survival
-                event_observed=all_events
-            )
-            self.log("test_c_index", c_index)
+            try:
+                c_index = concordance_index(
+                    event_times=all_times,
+                    predicted_scores=-all_risks,  # Negative because higher risk = shorter survival
+                    event_observed=all_events
+                )
+                self.log("test_c_index_lifelines", c_index)
+            except Exception as e:
+                print(f"Error computing c-index with lifelines: {e}")
+                self.log("test_c_index_lifelines", float('nan'))
 
-            # Compute Concordance Index using pycox's EvalSurv
-            eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_surv='km')
-            c_index_pycox = eval_surv.concordance_td()
-            self.log("test_c_index_pycox", c_index_pycox)
-
+            # Compute Concordance Index using PyCox's EvalSurv
+            try:
+                eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_surv='km')
+                c_index_pycox = eval_surv.concordance_td()
+                self.log("test_c_index_pycox", c_index_pycox)
+            except Exception as e:
+                print(f"Error computing c-index with PyCox: {e}")
+                self.log("test_c_index_pycox", float('nan'))
 
 ###############################################################################
 # 3) DATA MODULE
 ###############################################################################
 
 class HCCDataModule(pl.LightningDataModule):
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=100):
+    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
-        self.num_slices = num_slices  # Add num_slices parameter
+        self.num_slices = num_slices  # Number of slices per patient
 
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True)
         ])
 
     def setup(self, stage=None):
+        # Read CSV for data validation
+        df = pd.read_csv(self.csv_file)
+        
+        if self.model_type == "time_to_event":
+            # Ensure durations are positive
+            if not (df['time'] > 0).all():
+                raise ValueError("All durations must be positive.")
+            # Ensure events are binary
+            if not df['event'].isin([0, 1]).all():
+                raise ValueError("Event indicators must be binary (0 or 1).")
+        
         full_dataset = HCCDicomDataset(
             csv_file=self.csv_file,
             dicom_root=self.dicom_root,
             model_type=self.model_type,
             transform=self.transform,
-            num_slices=self.num_slices  # Pass parameter here
+            num_slices=self.num_slices
         )
         
         n_total = len(full_dataset)
@@ -427,14 +480,49 @@ class HCCDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
+        return DataLoader(
+            self.train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            num_workers=4,
+            collate_fn=self.collate_fn
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+        return DataLoader(
+            self.val_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=4,
+            collate_fn=self.collate_fn
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
-
+        return DataLoader(
+            self.test_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=4,
+            collate_fn=self.collate_fn
+        )
+    
+    def collate_fn(self, batch):
+        """
+        Custom collate function to ensure that each batch has at least one event.
+        If not, adjust the batch accordingly.
+        """
+        if self.model_type == "time_to_event":
+            # Separate events and censored
+            events = [sample[2].item() for sample in batch]
+            if not any(events):
+                # If no events in the batch, randomly select one to have an event
+                if len(batch) > 0:
+                    idx = random.randint(0, len(batch)-1)
+                    x, t, e = batch[idx]
+                    batch[idx] = (x, t, torch.tensor(1.0))
+            return default_collate(batch)
+        else:
+            return default_collate(batch)
 
 ###############################################################################
 # 4) TRAIN SCRIPT
@@ -448,10 +536,10 @@ def parse_args():
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
-                        help="Path to processed CSV with columns [Deidentified ID, recurrence post tx, time, event].")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
+                        help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
+    parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate.")  # Reduced learning rate
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
-    parser.add_argument("--max_epochs", type=int, default=50, help="Max number of epochs.")
+    parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="time_to_event-run", help="WandB run name.")
@@ -462,7 +550,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="time_to_event",
                         choices=["linear", "time_to_event"],
                         help="Which type of head to use (binary classification vs survival).")
-    parser.add_argument("--num_slices", type=int, default=20,
+    parser.add_argument("--num_slices", type=int, default=30,
                         help="Fixed number of slices to use per patient (pad or crop)")
 
     return parser.parse_args()
@@ -472,7 +560,7 @@ def main():
     args = parse_args()
     
     # Set random seed
-    pl.seed_everything(args.seed, workers=True)
+    seed_everything(args.seed, workers=True)
     
     # Initialize Weights & Biases logger
     wandb_logger = WandbLogger(project=args.project_name, name=args.run_name)
@@ -494,18 +582,22 @@ def main():
         lr=args.lr
     )
     
-    # Create trainer
+    # Create trainer with gradient clipping and mixed precision
     trainer = Trainer(
         logger=wandb_logger,
         max_epochs=args.max_epochs,
         accelerator="auto",
-        devices="auto"
+        devices="auto",
+        gradient_clip_val=1.0,  # Clip gradients with norm > 1.0
+        gradient_clip_algorithm='norm',
+        precision=16,  # Enable mixed precision
+        log_every_n_steps=10  # Adjust as needed
     )
     
-    # Fit
+    # Fit the model
     trainer.fit(model, datamodule=data_module)
 
-    # Test
+    # Test the model
     trainer.test(model, datamodule=data_module)
 
 if __name__ == "__main__":
