@@ -29,6 +29,9 @@ from pycox.models.loss import CoxPHLoss  # Import PyCox's CoxPHLoss
 from lifelines.utils import concordance_index
 
 
+torch.hub.set_dir("weights/")
+os.environ["TORCH_HOME"] = "weights/"
+
 ###############################################################################
 # 1) DATASET
 ###############################################################################
@@ -212,7 +215,8 @@ class HCCLightningModel(pl.LightningModule):
         backbone="resnet",       # "resnet", "dinov1", or "dinov2"
         model_type="linear",     # "linear" or "time_to_event"
         lr=1e-6,                 # Reduced learning rate
-        num_classes=1
+        num_classes=1,
+        pretrained=True          # <-- New parameter for pretrained weights
     ):
         super(HCCLightningModel, self).__init__()
         self.save_hyperparameters()
@@ -224,19 +228,19 @@ class HCCLightningModel(pl.LightningModule):
         # 1) Build Backbone
         # ---------------------------------------------------------------------
         if backbone == "resnet":
-            backbone_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            backbone_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT) if pretrained else models.resnet18(weights=None)
             feature_dim = backbone_model.fc.in_features
             self.feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
             self.is_vit = False
 
         elif backbone == "dinov1":
-            backbone_model = timm.create_model("vit_small_patch16_224_dino", pretrained=True)
+            backbone_model = timm.create_model("vit_small_patch16_224_dino", pretrained=pretrained)
             feature_dim = backbone_model.embed_dim
             self.feature_extractor = backbone_model
             self.is_vit = True
 
         elif backbone == "dinov2":
-            backbone_model = timm.create_model("dinov2_vitb14", pretrained=True)
+            backbone_model = timm.create_model("dinov2_vitb14", pretrained=pretrained)
             feature_dim = backbone_model.embed_dim
             self.feature_extractor = backbone_model
             self.is_vit = True
@@ -693,7 +697,11 @@ def parse_args():
     parser.add_argument("--num_slices", type=int, default=20,
                         help="Fixed number of slices to use per patient (pad or crop)")
     parser.add_argument("--num_workers", type=int, default=2)
-
+    
+    # <-- New Argument for Pretrained Weights -->
+    parser.add_argument("--pretrained", action='store_true', default=True,
+                        help="Use pretrained weights for the backbone model. Default is True.")
+    
     return parser.parse_args()
 
 
@@ -721,7 +729,8 @@ def main():
     model = HCCLightningModel(
         backbone=args.backbone,
         model_type=args.model_type,
-        lr=args.lr
+        lr=args.lr,
+        pretrained=args.pretrained  # <-- Pass the pretrained argument
     )
     
     # -------------------------------------------------------------------------
