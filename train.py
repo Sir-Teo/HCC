@@ -25,6 +25,7 @@ import torchvision.models as models
 # For survival metrics:
 from pycox.evaluation import EvalSurv
 import lifelines
+from lifelines.utils import concordance_index
 
 ###############################################################################
 # 1) DATASET
@@ -183,6 +184,37 @@ class HCCDicomDataset(Dataset):
 # 2) LIGHTNING MODULE
 ###############################################################################
 
+class CoxPHLoss(nn.Module):
+    """
+    Cox Proportional Hazards Loss Function.
+    """
+    def __init__(self):
+        super(CoxPHLoss, self).__init__()
+
+    def forward(self, preds, durations, events):
+        preds = preds.squeeze()
+        durations = durations.squeeze()
+        events = events.squeeze()
+
+        # Sort by descending durations
+        order = torch.argsort(-durations)
+        preds = preds[order]
+        durations = durations[order]
+        events = events[order]
+
+        # Calculate hazard ratios
+        hazard_ratio = torch.exp(preds)
+        log_cum_hazard = torch.log(torch.cumsum(hazard_ratio, dim=0))
+
+        # Partial log-likelihood
+        log_likelihood = preds - log_cum_hazard
+        partial_log_likelihood = log_likelihood * events
+
+        # CoxPH loss
+        loss = -torch.sum(partial_log_likelihood) / torch.sum(events)
+        return loss
+
+
 class HCCLightningModel(pl.LightningModule):
     def __init__(
         self,
@@ -191,7 +223,7 @@ class HCCLightningModel(pl.LightningModule):
         lr=1e-4,
         num_classes=1
     ):
-        super().__init__()
+        super(HCCLightningModel, self).__init__()
         self.save_hyperparameters()
 
         self.model_type = model_type
@@ -201,24 +233,18 @@ class HCCLightningModel(pl.LightningModule):
         # 1) Build Backbone
         # ---------------------------------------------------------------------
         if backbone == "resnet":
-            # Example: ResNet18
             backbone_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-            feature_dim = 512
-            # Remove final classification layer
+            feature_dim = backbone_model.fc.in_features
             self.feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
-
-            # We'll need a flag to know how to forward data
             self.is_vit = False
 
         elif backbone == "dinov1":
-            # Example: DINO ViT-Small (timm model name: "vit_small_patch16_224_dino")
             backbone_model = timm.create_model("vit_small_patch16_224_dino", pretrained=True)
             feature_dim = backbone_model.embed_dim
             self.feature_extractor = backbone_model
             self.is_vit = True
 
         elif backbone == "dinov2":
-            # Example: DINOv2 ViT-Base (timm model name: "dinov2_vitb14")
             backbone_model = timm.create_model("dinov2_vitb14", pretrained=True)
             feature_dim = backbone_model.embed_dim
             self.feature_extractor = backbone_model
@@ -226,98 +252,65 @@ class HCCLightningModel(pl.LightningModule):
 
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
+        
         # ---------------------------------------------------------------------
         # 2.2) Build Head
         # ---------------------------------------------------------------------
         if model_type == "linear":
-            # Simple binary classifier
             self.head = nn.Linear(feature_dim, num_classes)
-        else:
-            # Placeholder for time-to-event
-            # In a real model, you might do multiple outputs or something
+            self.criterion = nn.BCEWithLogitsLoss()
+        elif model_type == "time_to_event":
             self.head = nn.Linear(feature_dim, 1)
+            self.criterion = CoxPHLoss()
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
 
         # ---------------------------------------------------------------------
-        # 2.3) Define metrics for classification
+        # 2.3) Define Metrics
         # ---------------------------------------------------------------------
         if self.model_type == "linear":
-            # We'll track these metrics over test set
             self.test_acc = torchmetrics.Accuracy(task="binary")
             self.test_prec = torchmetrics.Precision(task="binary")
             self.test_rec = torchmetrics.Recall(task="binary")
             self.test_f1 = torchmetrics.F1Score(task="binary")
             self.test_auroc = torchmetrics.AUROC(task="binary")
-
-        # For time-to-event, we will rely on storing predictions and computing c-index externally.
+        elif self.model_type == "time_to_event":
+            pass  # Metrics handled separately
 
     def forward(self, x):
-        """
-        x shape: (batch_size, n_slices, 3, H, W)
-        Steps:
-        - Flatten slices (B * n_slices, 3, H, W)
-        - Extract features
-        - Regroup by (B, n_slices, feature_dim) and average
-        - Pass through head
-        """
         b, n_slices, c, h, w = x.shape
-        x = x.view(b*n_slices, c, h, w)  # flatten slices into a single batch
+        x = x.view(b * n_slices, c, h, w)  # Flatten slices into a single batch
 
         if not self.is_vit:
-            # ResNet-like forward
             feats = self.feature_extractor(x)  # (B*n_slices, feature_dim, 1, 1)
             feats = feats.view(feats.size(0), -1)  # Flatten to (B*n_slices, feature_dim)
         else:
-            # ViT-based forward via timm. 
-            # For many timm ViT models:
-            #   feats = model.forward_features(x) returns shape [B, tokens, embed_dim]
-            # We'll take the CLS token feats[:, 0, :]
-            feats_vit = self.feature_extractor.forward_features(x)  # shape [B*n_slices, tokens, embed_dim]
-            
-            # Depending on the specific timm model, forward_features may return:
-            #   - a tensor
-            #   - a dict of multiple features
-            #
-            # For DINO models in timm, it typically returns a single tensor [B, tokens, embed_dim].
-            # We'll assume that's the case. Double-check via `print(feats_vit.shape)`.
-            
+            feats_vit = self.feature_extractor.forward_features(x)
             if isinstance(feats_vit, dict):
-                # Some timm models return a dict with multiple feature maps.
-                # You may need to pick the appropriate key. E.g. 'x_norm_clstoken'
-                feats_vit = feats_vit["x_norm_clstoken"]  # adjust as needed
+                feats_vit = feats_vit["x_norm_clstoken"]  # Adjust based on model
+            feats = feats_vit[:, 0, :]  # CLS token
 
-            # If it's a tensor: feats_vit.shape = [B*n_slices, tokens, embed_dim]
-            # The [CLS] token is typically index 0: feats_vit[:, 0, :]
-            feats = feats_vit[:, 0, :]
-
-        # Now feats is (B*n_slices, feature_dim)
-
-        # Group back by patient and average across slices
         feats = feats.view(b, n_slices, -1)  # (B, n_slices, feature_dim)
-        feats_mean = feats.mean(dim=1)       # average over slices => (B, feature_dim)
+        feats_mean = feats.mean(dim=1)       # Average over slices => (B, feature_dim)
 
-        # Final linear head
-        logits = self.head(feats_mean)       # (B, out_dim)
+        logits = self.head(feats_mean)        # (B, out_dim)
         return logits
 
-
     def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
 
-    # -------------------------------------------------------------------------
-    # 2.4) Training / Validation Steps
-    # -------------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         if self.model_type == "linear":
             x, y = batch
             logits = self.forward(x).squeeze(-1)
-            loss = nn.BCEWithLogitsLoss()(logits, y)
-        else:
-            x, t, e = batch  # time, event
-            # Placeholder risk score
+            loss = self.criterion(logits, y)
+        elif self.model_type == "time_to_event":
+            x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
-            # Example "dummy" survival loss: MSE with time (NOT a real survival loss!)
-            # Real code might do partial log-likelihood with pycox etc.
-            loss = ((risk_score - t)**2).mean()
+            loss = self.criterion(risk_score, t, e)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -326,22 +319,18 @@ class HCCLightningModel(pl.LightningModule):
         if self.model_type == "linear":
             x, y = batch
             logits = self.forward(x).squeeze(-1)
-            loss = nn.BCEWithLogitsLoss()(logits, y)
-        else:
+            loss = self.criterion(logits, y)
+        elif self.model_type == "time_to_event":
             x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
-            # same dummy survival "loss"
-            loss = ((risk_score - t)**2).mean()
+            loss = self.criterion(risk_score, t, e)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
         self.log("val_loss", loss, prog_bar=True)
         return loss
 
-    # -------------------------------------------------------------------------
-    # 2.5) Testing Steps
-    # -------------------------------------------------------------------------
     def on_test_epoch_start(self):
-        # We'll store predictions so we can compute metrics for classification
-        # (like AUROC), and also c-index for survival
         if self.model_type == "linear":
             self.test_acc.reset()
             self.test_prec.reset()
@@ -351,7 +340,7 @@ class HCCLightningModel(pl.LightningModule):
 
             self.all_probs = []
             self.all_labels = []
-        else:
+        elif self.model_type == "time_to_event":
             self.all_risks = []
             self.all_times = []
             self.all_events = []
@@ -360,12 +349,10 @@ class HCCLightningModel(pl.LightningModule):
         if self.model_type == "linear":
             x, y = batch
             logits = self.forward(x).squeeze(-1)
-            loss = nn.BCEWithLogitsLoss()(logits, y)
+            loss = self.criterion(logits, y)
 
-            # Compute probabilities
             probs = torch.sigmoid(logits)
 
-            # Update metrics incrementally
             self.test_acc.update(probs, y.long())
             self.test_prec.update(probs, y.long())
             self.test_rec.update(probs, y.long())
@@ -378,24 +365,22 @@ class HCCLightningModel(pl.LightningModule):
             self.log("test_loss", loss)
             return {"test_loss": loss}
 
-        else:
-            # time to event
+        elif self.model_type == "time_to_event":
             x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
-            # A dummy survival "loss" just to log
-            loss = ((risk_score - t)**2).mean()
+            loss = self.criterion(risk_score, t, e)
 
-            # We'll store risk_score, time, event for c-index
             self.all_risks.append(risk_score.detach().cpu())
             self.all_times.append(t.detach().cpu())
             self.all_events.append(e.detach().cpu())
 
             self.log("test_loss", loss)
             return {"test_loss": loss}
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
     def on_test_epoch_end(self):
         if self.model_type == "linear":
-            # Compute final aggregated metrics from torchmetrics
             acc = self.test_acc.compute()
             prec = self.test_prec.compute()
             rec = self.test_rec.compute()
@@ -408,32 +393,24 @@ class HCCLightningModel(pl.LightningModule):
             self.log("test_f1", f1)
             self.log("test_auroc", auroc)
 
-        else:
-            # -------------------------------------------------
-            # Compute c-index for survival
-            # -------------------------------------------------
-            # Concatenate everything
+        elif self.model_type == "time_to_event":
             all_risks = torch.cat(self.all_risks).numpy()
             all_times = torch.cat(self.all_times).numpy()
             all_events = torch.cat(self.all_events).numpy()
 
-            # "all_risks" is your predicted risk (higher => earlier event).
-            # We'll use lifelines or pycox to compute c-index.
-
-            # Option 1) lifelines:
-            # from lifelines.utils import concordance_index
-            c_index = lifelines.utils.concordance_index(
+            # Compute Concordance Index (c-index)
+            c_index = concordance_index(
                 event_times=all_times,
-                predicted_scores=all_risks,  # risk scores
+                predicted_scores=-all_risks,  # Negative because higher risk = shorter survival
                 event_observed=all_events
             )
             self.log("test_c_index", c_index)
 
             # Option 2) pycox (EvalSurv) typically expects survival predictions
             # across multiple time points. For a pure risk score, you can do:
-            # eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_seq="end")
-            # c_index_pycox = eval_surv.concordance_td()
-            # self.log("test_c_index_pycox", c_index_pycox)
+            eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_seq="end")
+            c_index_pycox = eval_surv.concordance_td()
+            self.log("test_c_index_pycox", c_index_pycox)
 
 
 ###############################################################################
@@ -494,19 +471,19 @@ def parse_args():
     )
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the root DICOM directory.")
-    parser.add_argument("--csv_file", type=str, default="patient_labels.csv",
-                        help="Path to CSV with columns [patient_id, label, time, event].")
+    parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
+                        help="Path to processed CSV with columns [Deidentified ID, recurrence post tx, time, event].")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
-    parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
+    parser.add_argument("--max_epochs", type=int, default=50, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
-    parser.add_argument("--run_name", type=str, default="test-run", help="WandB run name.")
+    parser.add_argument("--run_name", type=str, default="time_to_event-run", help="WandB run name.")
     
     parser.add_argument("--backbone", type=str, default="resnet",
                         choices=["resnet", "dinov2", "dinov1"],
                         help="Which model backbone to use.")
-    parser.add_argument("--model_type", type=str, default="linear",
+    parser.add_argument("--model_type", type=str, default="time_to_event",
                         choices=["linear", "time_to_event"],
                         help="Which type of head to use (binary classification vs survival).")
     parser.add_argument("--num_slices", type=int, default=20,
@@ -519,7 +496,7 @@ def main():
     args = parse_args()
     
     # Set random seed
-    seed_everything(args.seed, workers=True)
+    pl.seed_everything(args.seed, workers=True)
     
     # Initialize Weights & Biases logger
     wandb_logger = WandbLogger(project=args.project_name, name=args.run_name)
@@ -530,7 +507,7 @@ def main():
         dicom_root=args.dicom_root,
         model_type=args.model_type,
         batch_size=args.batch_size,
-        num_slices=args.num_slices  # Add this line
+        num_slices=args.num_slices
     )
     data_module.setup()
     
@@ -554,7 +531,6 @@ def main():
 
     # Test
     trainer.test(model, datamodule=data_module)
-
 
 if __name__ == "__main__":
     main()

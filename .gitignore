@@ -8,3 +8,5 @@ dinov2/experiments/
 .ipynb_checkpoints/
 HCC-Recurrence/
 wandb/
+
+*.xlsx  
