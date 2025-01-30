@@ -264,13 +264,17 @@ class HCCLightningModel(pl.LightningModule):
         # 2.3) Define Metrics
         # ---------------------------------------------------------------------
         if self.model_type == "linear":
-            self.test_acc = torchmetrics.Accuracy(task="binary")
-            self.test_prec = torchmetrics.Precision(task="binary")
-            self.test_rec = torchmetrics.Recall(task="binary")
-            self.test_f1 = torchmetrics.F1Score(task="binary")
-            self.test_auroc = torchmetrics.AUROC(task="binary")
+            self.val_acc = torchmetrics.Accuracy(task="binary")
+            self.val_prec = torchmetrics.Precision(task="binary")
+            self.val_rec = torchmetrics.Recall(task="binary")
+            self.val_f1 = torchmetrics.F1Score(task="binary")
+            self.val_auroc = torchmetrics.AUROC(task="binary")
+            self.val_probs = []
+            self.val_labels = []
         elif self.model_type == "time_to_event":
-            pass  # Metrics handled separately
+            self.val_risks = []
+            self.val_times = []
+            self.val_events = []
 
         # ---------------------------------------------------------------------
         # 2.4) Initialize Baseline Hazards
@@ -344,15 +348,81 @@ class HCCLightningModel(pl.LightningModule):
             x, y = batch
             logits = self.forward(x).squeeze(-1)
             loss = self.criterion(logits, y)
+            
+            probs = torch.sigmoid(logits)
+            self.val_acc.update(probs, y)
+            self.val_prec.update(probs, y)
+            self.val_rec.update(probs, y)
+            self.val_f1.update(probs, y)
+            self.val_auroc.update(probs, y)
+            self.val_probs.append(probs.detach().cpu())
+            self.val_labels.append(y.detach().cpu())
+            
+            self.log("val_loss", loss, prog_bar=True)
+            return loss
+            
         elif self.model_type == "time_to_event":
             x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
             loss = self.criterion(risk_score, t, e)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+            
+            self.val_risks.append(risk_score.detach().cpu())
+            self.val_times.append(t.detach().cpu())
+            self.val_events.append(e.detach().cpu())
+            self.log("val_loss", loss, prog_bar=True)
+            return loss
 
-        self.log("val_loss", loss, prog_bar=True)
-        return loss
+    def on_validation_epoch_start(self):
+        """Reset validation metrics at the start of each epoch."""
+        if self.model_type == "linear":
+            self.val_acc.reset()
+            self.val_prec.reset()
+            self.val_rec.reset()
+            self.val_f1.reset()
+            self.val_auroc.reset()
+            self.val_probs.clear()
+            self.val_labels.clear()
+        elif self.model_type == "time_to_event":
+            self.val_risks.clear()
+            self.val_times.clear()
+            self.val_events.clear()
+
+    def on_validation_epoch_end(self):
+        """Compute and log validation metrics."""
+        if self.model_type == "linear":
+            # Log classification metrics
+            self.log("val_acc", self.val_acc.compute(), prog_bar=True)
+            self.log("val_precision", self.val_prec.compute())
+            self.log("val_recall", self.val_rec.compute())
+            self.log("val_f1", self.val_f1.compute())
+            self.log("val_auroc", self.val_auroc.compute())
+            
+            # Log class distribution
+            if self.val_labels:
+                all_labels = torch.cat(self.val_labels)
+                num_pos = all_labels.sum().item()
+                total = len(all_labels)
+                self.log("val_ratio_pos", num_pos / total)
+                self.log("val_num_pos", num_pos)
+                self.log("val_num_neg", total - num_pos)
+                
+        elif self.model_type == "time_to_event":
+            # Compute C-index for survival
+            if self.val_risks and self.val_times and self.val_events:
+                risks = torch.cat(self.val_risks).numpy()
+                times = torch.cat(self.val_times).numpy()
+                events = torch.cat(self.val_events).numpy().astype(bool)
+                
+                try:
+                    c_index = concordance_index(times, -risks, events)
+                    self.log("val_c_index", c_index, prog_bar=True)
+                except Exception as e:
+                    print(f"Validation C-index error: {e}")
+                
+                # Log event distribution
+                num_events = events.sum()
+                self.log("val_num_events", num_events)
+                self.log("val_num_censored", len(events) - num_events)
 
     def on_test_epoch_start(self):
         if self.model_type == "linear":
@@ -442,7 +512,7 @@ class HCCLightningModel(pl.LightningModule):
                 self.log("test_c_index_pycox", float('nan'))
 
     def compute_baseline_hazards(self, dataloader):
-        """Compute baseline hazards using training data."""
+        """Compute baseline hazards using Breslow estimator."""
         self.eval()
         all_risks = []
         all_durations = []
@@ -456,19 +526,36 @@ class HCCLightningModel(pl.LightningModule):
                 all_durations.append(t.cpu().numpy())
                 all_events.append(e.cpu().numpy())
         
-        all_risks = np.concatenate(all_risks)
-        all_durations = np.concatenate(all_durations)
-        all_events = np.concatenate(all_events)
+        risks = np.concatenate(all_risks)
+        durations = np.concatenate(all_durations)
+        events = np.concatenate(all_events).astype(bool)
         
-        # Use PyCox's CoxPH to compute baseline hazards
-        from pycox.models import CoxPH
-        coxph = CoxPH()
-        self.baseline_hazards = coxph.compute_baseline_hazards(
-            torch.tensor(all_durations),
-            torch.tensor(all_events.astype('float32')),
-            torch.tensor(all_risks),
-            eps=1e-6
-        )
+        # Sort data by descending duration
+        sort_idx = np.argsort(-durations)
+        durations = durations[sort_idx]
+        events = events[sort_idx]
+        risks = risks[sort_idx]
+        
+        # Compute baseline hazards using Breslow estimator
+        unique_times = np.unique(durations[events])
+        baseline_hazards = []
+        time_points = []
+        
+        for t in unique_times:
+            at_risk = durations >= t
+            sum_risk = np.exp(risks[at_risk]).sum()
+            if sum_risk == 0:
+                hazard = 0.0
+            else:
+                n_events = np.sum((durations == t) & events)
+                hazard = n_events / sum_risk
+            baseline_hazards.append(hazard)
+            time_points.append(t)
+        
+        # Compute cumulative baseline hazard
+        cumulative_hazard = np.cumsum(baseline_hazards)
+        self.baseline_hazards = pd.Series(cumulative_hazard, index=unique_times)
+        self.baseline_hazards.index.name = 'time'
 
     def predict_surv_func(self, risks, durations, events):
         """Predict survival functions using precomputed baseline hazards."""
