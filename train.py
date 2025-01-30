@@ -27,6 +27,7 @@ from pycox.evaluation import EvalSurv
 from pycox.models.loss import CoxPHLoss  # Import PyCox's CoxPHLoss
 from lifelines.utils import concordance_index
 
+
 ###############################################################################
 # 1) DATASET
 ###############################################################################
@@ -251,7 +252,7 @@ class HCCLightningModel(pl.LightningModule):
             self.head = nn.Linear(feature_dim, 1)
             nn.init.normal_(self.head.weight, mean=0.0, std=0.01)  # Initialize with small std
             nn.init.constant_(self.head.bias, 0.0)
-            self.criterion = CoxPHLoss()  
+            self.criterion = CoxPHLoss()  # Use PyCox's CoxPHLoss with 'breslow' ties
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -266,6 +267,13 @@ class HCCLightningModel(pl.LightningModule):
             self.test_auroc = torchmetrics.AUROC(task="binary")
         elif self.model_type == "time_to_event":
             pass  # Metrics handled separately
+
+        # ---------------------------------------------------------------------
+        # 2.4) Initialize Baseline Hazards
+        # ---------------------------------------------------------------------
+        if self.model_type == "time_to_event":
+            self.baseline_hazards = None
+            self.surv_funcs = None
 
     def forward(self, x):
         b, n_slices, c, h, w = x.shape
@@ -356,6 +364,7 @@ class HCCLightningModel(pl.LightningModule):
             self.all_risks = []
             self.all_times = []
             self.all_events = []
+            self.surv_funcs = None  # To store survival functions
 
     def test_step(self, batch, batch_idx):
         if self.model_type == "linear":
@@ -411,72 +420,117 @@ class HCCLightningModel(pl.LightningModule):
             all_events = torch.cat(self.all_events).numpy()
 
             # Compute Concordance Index (c-index) using lifelines
+            # Lifelines C-index
             try:
-                c_index = concordance_index(
-                    event_times=all_times,
-                    predicted_scores=-all_risks,  # Negative because higher risk = shorter survival
-                    event_observed=all_events
-                )
+                c_index = concordance_index(all_times, -all_risks, all_events)
                 self.log("test_c_index_lifelines", c_index)
             except Exception as e:
-                print(f"Error computing c-index with lifelines: {e}")
+                print(f"Lifelines C-index error: {e}")
                 self.log("test_c_index_lifelines", float('nan'))
 
-            # Compute Concordance Index using PyCox's EvalSurv
+            # PyCox C-index
             try:
-                eval_surv = EvalSurv(pd.Series(-all_risks), all_times, all_events, censor_surv='km')
-                c_index_pycox = eval_surv.concordance_td()
-                self.log("test_c_index_pycox", c_index_pycox)
+                surv = self.predict_surv_func(all_risks, all_times, all_events)
+                eval_surv = EvalSurv(surv, all_times, all_events, censor_surv='km')
+                self.log("test_c_index_pycox", eval_surv.concordance_td())
             except Exception as e:
-                print(f"Error computing c-index with PyCox: {e}")
+                print(f"PyCox C-index error: {e}")
                 self.log("test_c_index_pycox", float('nan'))
+
+    def compute_baseline_hazards(self, dataloader):
+        """Compute baseline hazards using training data."""
+        self.eval()
+        all_risks = []
+        all_durations = []
+        all_events = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                x, t, e = batch
+                risk_score = self.forward(x).squeeze(-1)
+                all_risks.append(risk_score.cpu().numpy())
+                all_durations.append(t.cpu().numpy())
+                all_events.append(e.cpu().numpy())
+        
+        all_risks = np.concatenate(all_risks)
+        all_durations = np.concatenate(all_durations)
+        all_events = np.concatenate(all_events)
+        
+        # Use PyCox's CoxPH to compute baseline hazards
+        from pycox.models import CoxPH
+        coxph = CoxPH()
+        self.baseline_hazards = coxph.compute_baseline_hazards(
+            torch.tensor(all_durations),
+            torch.tensor(all_events.astype('float32')),
+            torch.tensor(all_risks),
+            eps=1e-6
+        )
+
+    def predict_surv_func(self, risks, durations, events):
+        """Predict survival functions using precomputed baseline hazards."""
+        if self.baseline_hazards is None:
+            raise ValueError("Baseline hazards not computed. Call compute_baseline_hazards with training data first.")
+        
+        # Compute cumulative hazard for each risk
+        H = np.outer(np.exp(risks), self.baseline_hazards.values.cpu().numpy())
+        S = np.exp(-H)
+        
+        # Create DataFrame with baseline hazard's index (time points)
+        surv_df = pd.DataFrame(S, columns=self.baseline_hazards.index)
+        return surv_df
 
 ###############################################################################
 # 3) DATA MODULE
 ###############################################################################
 
 class HCCDataModule(pl.LightningDataModule):
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20):
+    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
         self.num_slices = num_slices  # Number of slices per patient
+        self.num_workers = num_workers
 
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True)
         ])
 
     def setup(self, stage=None):
-        # Read CSV for data validation
         df = pd.read_csv(self.csv_file)
-        
-        if self.model_type == "time_to_event":
-            # Ensure durations are positive
-            if not (df['time'] > 0).all():
-                raise ValueError("All durations must be positive.")
-            # Ensure events are binary
-            if not df['event'].isin([0, 1]).all():
-                raise ValueError("Event indicators must be binary (0 or 1).")
-        
-        full_dataset = HCCDicomDataset(
-            csv_file=self.csv_file,
-            dicom_root=self.dicom_root,
-            model_type=self.model_type,
-            transform=self.transform,
-            num_slices=self.num_slices
+
+        # Ensure labels are balanced in train/val/test
+        stratify_col = df['recurrence post tx'] if self.model_type == "linear" else df['event']
+
+        # First, split into train (70%) and temp (30%)
+        train_df, temp_df = train_test_split(
+            df, test_size=0.3, random_state=42, stratify=stratify_col
         )
-        
-        n_total = len(full_dataset)
-        n_train = int(n_total * 0.7)
-        n_val = int(n_total * 0.15)
-        n_test = n_total - n_train - n_val
-        
-        self.train_dataset, self.val_dataset, self.test_dataset = torch.utils.data.random_split(
-            full_dataset,
-            [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(42)
+
+        # Then, split temp into validation (15%) and test (15%)
+        stratify_temp = temp_df['recurrence post tx'] if self.model_type == "linear" else temp_df['event']
+        val_df, test_df = train_test_split(
+            temp_df, test_size=0.5, random_state=42, stratify=stratify_temp
+        )
+
+        print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
+        print(f"Label distribution in Train:\n{train_df['recurrence post tx'].value_counts()}")
+        print(f"Label distribution in Val:\n{val_df['recurrence post tx'].value_counts()}")
+        print(f"Label distribution in Test:\n{test_df['recurrence post tx'].value_counts()}")
+
+        # Create datasets
+        self.train_dataset = HCCDicomDataset(
+            csv_file=train_df, dicom_root=self.dicom_root, model_type=self.model_type,
+            transform=self.transform, num_slices=self.num_slices
+        )
+        self.val_dataset = HCCDicomDataset(
+            csv_file=val_df, dicom_root=self.dicom_root, model_type=self.model_type,
+            transform=self.transform, num_slices=self.num_slices
+        )
+        self.test_dataset = HCCDicomDataset(
+            csv_file=test_df, dicom_root=self.dicom_root, model_type=self.model_type,
+            transform=self.transform, num_slices=self.num_slices
         )
 
     def train_dataloader(self):
@@ -484,7 +538,7 @@ class HCCDataModule(pl.LightningDataModule):
             self.train_dataset, 
             batch_size=self.batch_size, 
             shuffle=True, 
-            num_workers=4,
+            num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
 
@@ -493,7 +547,7 @@ class HCCDataModule(pl.LightningDataModule):
             self.val_dataset, 
             batch_size=self.batch_size, 
             shuffle=False, 
-            num_workers=4,
+            num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
 
@@ -502,24 +556,19 @@ class HCCDataModule(pl.LightningDataModule):
             self.test_dataset, 
             batch_size=self.batch_size, 
             shuffle=False, 
-            num_workers=4,
+            num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
     
     def collate_fn(self, batch):
-        """
-        Custom collate function to ensure that each batch has at least one event.
-        If not, adjust the batch accordingly.
-        """
         if self.model_type == "time_to_event":
-            # Separate events and censored
+            # Ensure at least one event per batch
             events = [sample[2].item() for sample in batch]
-            if not any(events):
-                # If no events in the batch, randomly select one to have an event
-                if len(batch) > 0:
-                    idx = random.randint(0, len(batch)-1)
-                    x, t, e = batch[idx]
-                    batch[idx] = (x, t, torch.tensor(1.0))
+            if sum(events) == 0 and len(batch) > 0:
+                # Randomly select one to have event (adjust label if necessary)
+                idx = random.randint(0, len(batch)-1)
+                x, t, e = batch[idx]
+                batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
             return default_collate(batch)
         else:
             return default_collate(batch)
@@ -537,7 +586,7 @@ def parse_args():
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
-    parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate.")  # Reduced learning rate
+    parser.add_argument("--lr", type=float, default=1e-3, help="Fixed Learning rate.")  # Adjusted default
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
     parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -550,8 +599,9 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="time_to_event",
                         choices=["linear", "time_to_event"],
                         help="Which type of head to use (binary classification vs survival).")
-    parser.add_argument("--num_slices", type=int, default=30,
+    parser.add_argument("--num_slices", type=int, default=20,
                         help="Fixed number of slices to use per patient (pad or crop)")
+    parser.add_argument("--num_workers", type=int, default=2)
 
     return parser.parse_args()
 
@@ -571,7 +621,8 @@ def main():
         dicom_root=args.dicom_root,
         model_type=args.model_type,
         batch_size=args.batch_size,
-        num_slices=args.num_slices
+        num_slices=args.num_slices,
+        num_workers=args.num_workers
     )
     data_module.setup()
     
@@ -582,7 +633,30 @@ def main():
         lr=args.lr
     )
     
-    # Create trainer with gradient clipping and mixed precision
+    # -------------------------------------------------------------------------
+    # 5) Callbacks: Early Stopping and Model Checkpointing
+    # -------------------------------------------------------------------------
+    from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+
+    early_stop_callback = EarlyStopping(
+        monitor="val_loss",
+        min_delta=0.00,
+        patience=10,
+        verbose=True,
+        mode="min"
+    )
+
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        dirpath="checkpoints",
+        filename="best-checkpoint",
+        save_top_k=1,
+        mode="min"
+    )
+
+    # -------------------------------------------------------------------------
+    # 6) Create Trainer without Learning Rate Finder
+    # -------------------------------------------------------------------------
     trainer = Trainer(
         logger=wandb_logger,
         max_epochs=args.max_epochs,
@@ -591,14 +665,48 @@ def main():
         gradient_clip_val=1.0,  # Clip gradients with norm > 1.0
         gradient_clip_algorithm='norm',
         precision=16,  # Enable mixed precision
-        log_every_n_steps=10  # Adjust as needed
+        log_every_n_steps=10,  # Adjust as needed
+        callbacks=[early_stop_callback, checkpoint_callback],
+        enable_progress_bar=True
     )
-    
-    # Fit the model
-    trainer.fit(model, datamodule=data_module)
 
-    # Test the model
+    # -------------------------------------------------------------------------
+    # 7) Fit the model
+    # -------------------------------------------------------------------------
+    trainer.fit(model, datamodule=data_module)
+    trainer.model.compute_baseline_hazards(data_module.train_dataloader())
+
+    # -------------------------------------------------------------------------
+    # 8) Test the model
+    # -------------------------------------------------------------------------
     trainer.test(model, datamodule=data_module)
+
+    # -------------------------------------------------------------------------
+    # 9) Save the Model (Optional)
+    # -------------------------------------------------------------------------
+    # Save the best checkpoint
+    best_model_path = checkpoint_callback.best_model_path
+    print(f"Best model saved at: {best_model_path}")
+    wandb.save(best_model_path)
+
+    # -------------------------------------------------------------------------
+    # 10) Plot Survival Functions (Only for time_to_event)
+    # -------------------------------------------------------------------------
+    if args.model_type == "time_to_event":
+        import matplotlib.pyplot as plt
+
+        # Access the survival functions from the model
+        surv = model.surv_funcs
+        if surv is not None:
+            # Plot the first 5 survival functions
+            surv.iloc[:5].plot()
+            plt.ylabel('S(t | x)')
+            plt.xlabel('Time')
+            plt.title('Survival Functions for First 5 Test Samples')
+            plt.savefig("survival_functions.png")
+            plt.close()
+        else:
+            print("Survival functions were not computed.")
 
 if __name__ == "__main__":
     main()
