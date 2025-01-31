@@ -25,6 +25,7 @@ from lifelines.utils import concordance_index
 from data.dataset import *
 import copy  # For cloning the network
 
+
 class HCCLightningModel(pl.LightningModule):
     def __init__(
         self,
@@ -82,8 +83,9 @@ class HCCLightningModel(pl.LightningModule):
             nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
             nn.init.constant_(self.head.bias, 0.0)
             self.criterion = CoxPHLoss()
-            # Initialize coxph as None; it will be created in compute_baseline_hazards
-            self.coxph = None
+            # Initialize CoxPH model
+            self.coxph = PyCoxCoxPH(self.head, optimizer=optim.Adam)
+            self.coxph_optimizer = optim.Adam(self.head.parameters(), lr=self.lr)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -107,15 +109,13 @@ class HCCLightningModel(pl.LightningModule):
             self.test_auroc = torchmetrics.AUROC(task="binary")
             self.all_probs = []
             self.all_labels = []
-        # ---------------------------------------------------------------------
-        # 2.4) Initialize Baseline Hazards
-        # ---------------------------------------------------------------------
-        if self.model_type == "time_to_event":
+        elif self.model_type == "time_to_event":
+            # Time-to-event metrics will be handled separately
             self.val_risks = []
             self.val_times = []
             self.val_events = []
             
-            # Test tracking (ADDED if needed)
+            # Test tracking
             self.all_risks = []
             self.all_times = []
             self.all_events = []
@@ -142,7 +142,10 @@ class HCCLightningModel(pl.LightningModule):
         return logits
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        if self.model_type == "linear":
+            optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        elif self.model_type == "time_to_event":
+            optimizer = self.coxph_optimizer
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -150,6 +153,9 @@ class HCCLightningModel(pl.LightningModule):
             x, y = batch
             logits = self.forward(x).squeeze(-1)
             loss = self.criterion(logits, y)
+            self.log("train_loss", loss, prog_bar=True)
+            return loss
+
         elif self.model_type == "time_to_event":
             x, t, e = batch
 
@@ -176,11 +182,12 @@ class HCCLightningModel(pl.LightningModule):
             self.log("risk_score_max", torch.max(risk_score), prog_bar=True)
             self.log("risk_score_nan", torch.isnan(risk_score).any(), prog_bar=True)
             self.log("risk_score_inf", torch.isinf(risk_score).any(), prog_bar=True)
+
+            self.log("train_loss", loss, prog_bar=True)
+            return loss
+
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
-
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
 
     def validation_step(self, batch, batch_idx):
         if self.model_type == "linear":
@@ -248,7 +255,7 @@ class HCCLightningModel(pl.LightningModule):
                 self.log("val_num_neg", total - num_pos)
 
         elif self.model_type == "time_to_event":
-            # Compute C-index for survival
+            # Compute Concordance Index (c-index) using lifelines
             if self.val_risks and self.val_times and self.val_events:
                 risks = torch.cat(self.val_risks).numpy()
                 times = torch.cat(self.val_times).numpy()
@@ -372,23 +379,17 @@ class HCCLightningModel(pl.LightningModule):
         durations = np.concatenate(durations)
         events = np.concatenate(events).astype(bool)
 
-        # Clone the head network and move to CPU
-        cloned_head = copy.deepcopy(self.head).cpu()
-
-        # Initialize a new CoxPH model with the cloned head
-        coxph = PyCoxCoxPH(cloned_head, optimizer=optim.Adam)
-
-        # Fit the CoxPH model on CPU
-        # **IMPORTANT CHANGE HERE**
-        # Pass 'target' as a tuple containing durations and events
-        coxph.fit(risks, (durations, events))
+        # Fit the CoxPH model (without cloning the head)
+        self.coxph.fit(durations, events, batch_size=len(durations), verbose=False)
 
         # Store baseline hazards
-        self.baseline_hazards = pd.Series(coxph.baseline_hazard_, index=coxph.unique_times_)
+        self.baseline_hazards = pd.Series(self.coxph.baseline_hazard_, index=self.coxph.unique_times_)
         self.baseline_hazards.index.name = 'time'
 
         # Store the coxph model's survival functions if needed
-        self.coxph = coxph  # Assign the fitted CoxPH model
+        self.coxph.compute_baseline_hazards()
+        self.coxph.compute_baseline_survival()
+        self.surv_funcs = self.coxph.predict_surv_df(risks, durations)
 
     def predict_surv_func(self, risks, durations, events):
         if self.coxph is None:
@@ -506,7 +507,8 @@ def main():
     # -------------------------------------------------------------------------
     trainer.fit(model, datamodule=data_module)
     if args.model_type == "time_to_event":
-        trainer.model.compute_baseline_hazards(data_module.train_dataloader())
+        # Compute baseline hazards after training
+        model.compute_baseline_hazards(data_module.train_dataloader())
 
     # -------------------------------------------------------------------------
     # 8) Test the model
