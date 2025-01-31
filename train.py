@@ -6,7 +6,6 @@ from collections import defaultdict
 import pandas as pd
 import numpy as np
 import pydicom
-from pycox.models import CoxPH as PyCoxCoxPH
 from pycox.evaluation import EvalSurv
 from pycox.models.loss import CoxPHLoss
 import torch
@@ -22,8 +21,9 @@ import wandb
 from pytorch_lightning.loggers import WandbLogger
 import torchvision.models as models
 from lifelines.utils import concordance_index
-from data.dataset import *
+from data.dataset import *  # Ensure this is correctly defined in your project
 import copy  # For cloning the network
+import matplotlib.pyplot as plt
 
 
 class HCCLightningModel(pl.LightningModule):
@@ -70,7 +70,7 @@ class HCCLightningModel(pl.LightningModule):
                 param.requires_grad = False  # Freeze pretrained weights
 
         # ---------------------------------------------------------------------
-        # 2.2) Build Head
+        # 2.2) Build Head or Custom Net for Time-to-Event
         # ---------------------------------------------------------------------
         if model_type == "linear":
             self.head = nn.Linear(feature_dim, num_classes)
@@ -78,14 +78,17 @@ class HCCLightningModel(pl.LightningModule):
             nn.init.constant_(self.head.bias, 0.0)
             self.criterion = nn.BCEWithLogitsLoss()
         elif model_type == "time_to_event":
-            # Use a linear layer for risk scores
-            self.head = nn.Linear(feature_dim, 1)
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
-            nn.init.constant_(self.head.bias, 0.0)
+            # Define a custom MLP as net
+            self.net = nn.Sequential(
+                nn.Linear(feature_dim, 128),  # First hidden layer with 128 units
+                nn.ReLU(),
+                nn.Linear(128, 1)              # Output layer
+            )
+            # Initialize weights of the first linear layer
+            nn.init.normal_(self.net[0].weight, mean=0.0, std=0.01)
+            nn.init.constant_(self.net[0].bias, 0.0)
+
             self.criterion = CoxPHLoss()
-            # Initialize CoxPH model
-            self.coxph = PyCoxCoxPH(self.head, optimizer=optim.Adam)
-            self.coxph_optimizer = optim.Adam(self.head.parameters(), lr=self.lr)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -101,7 +104,7 @@ class HCCLightningModel(pl.LightningModule):
             self.val_auroc = torchmetrics.AUROC(task="binary")
             self.val_probs = []
             self.val_labels = []
-            
+
             self.test_acc = torchmetrics.Accuracy(task="binary")
             self.test_prec = torchmetrics.Precision(task="binary")
             self.test_rec = torchmetrics.Recall(task="binary")
@@ -114,7 +117,7 @@ class HCCLightningModel(pl.LightningModule):
             self.val_risks = []
             self.val_times = []
             self.val_events = []
-            
+
             # Test tracking
             self.all_risks = []
             self.all_times = []
@@ -138,14 +141,17 @@ class HCCLightningModel(pl.LightningModule):
         feats = feats.view(b, n_slices, -1)  # (B, n_slices, feature_dim)
         feats_mean = feats.mean(dim=1)       # Average over slices => (B, feature_dim)
 
-        logits = self.head(feats_mean)        # (B, out_dim)
+        if self.model_type == "linear":
+            logits = self.head(feats_mean)        # (B, out_dim)
+        elif self.model_type == "time_to_event":
+            logits = self.net(feats_mean)         # (B, 1)
         return logits
 
     def configure_optimizers(self):
         if self.model_type == "linear":
             optimizer = optim.Adam(self.parameters(), lr=self.lr)
         elif self.model_type == "time_to_event":
-            optimizer = self.coxph_optimizer
+            optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -166,7 +172,7 @@ class HCCLightningModel(pl.LightningModule):
                 raise ValueError("Event indicators must be binary (0 or 1).")
 
             risk_score = self.forward(x).squeeze(-1)
-            loss = self.criterion(risk_score, t, e)  # PyCox's CoxPHLoss expects (risk_score, durations, events)
+            loss = self.criterion(risk_score, t, e)  # CoxPHLoss expects (risk_score, durations, events)
 
             # Check for NaNs and Infs in loss
             if torch.isnan(loss):
@@ -360,7 +366,7 @@ class HCCLightningModel(pl.LightningModule):
                 self.log("test_c_index_pycox", float('nan'))
 
     def compute_baseline_hazards(self, dataloader):
-        """Compute baseline hazards using PyCox's CoxPH model."""
+        """Compute baseline hazards using lifelines."""
         # Collect all risks, durations, and events
         risks = []
         durations = []
@@ -375,29 +381,37 @@ class HCCLightningModel(pl.LightningModule):
                 events.append(e.cpu().numpy())
 
         risks = np.concatenate(risks)
-        print(risks)  # Corrected from print(risk) to print(risks)
         durations = np.concatenate(durations)
         events = np.concatenate(events).astype(bool)
 
-        # Fit the CoxPH model (without cloning the head)
-        self.coxph.fit(durations, events, batch_size=len(durations), verbose=False)
+        # Fit the CoxPH model using lifelines for baseline hazards
+        from lifelines import CoxPHFitter
 
-        # Store baseline hazards
-        self.baseline_hazards = pd.Series(self.coxph.baseline_hazard_, index=self.coxph.unique_times_)
-        self.baseline_hazards.index.name = 'time'
+        df = pd.DataFrame({
+            'duration': durations,
+            'event': events,
+            'risk': risks
+        })
 
-        # Store the coxph model's survival functions if needed
-        self.coxph.compute_baseline_hazards()
-        self.coxph.compute_baseline_survival()
-        self.surv_funcs = self.coxph.predict_surv_df(risks, durations)
+        self.coxph_lifelines = CoxPHFitter()
+        self.coxph_lifelines.fit(df, duration_col='duration', event_col='event', formula="risk")
+
+        # Store survival functions
+        self.surv_funcs = self.coxph_lifelines.predict_survival_function(df)
 
     def predict_surv_func(self, risks, durations, events):
-        if self.coxph is None:
+        if not hasattr(self, 'coxph_lifelines'):
             raise ValueError("CoxPH model not fitted. Call compute_baseline_hazards first.")
 
-        # Use PyCox's predict_surv_df method
-        surv_df = self.coxph.predict_surv_df(risks, durations)
+        df = pd.DataFrame({
+            'duration': durations,
+            'event': events,
+            'risk': risks
+        })
+
+        surv_df = self.coxph_lifelines.predict_survival_function(df)
         return surv_df
+
 
 ###############################################################################
 # 4) TRAIN SCRIPT
@@ -414,7 +428,7 @@ def parse_args():
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
     parser.add_argument("--lr", type=float, default=1e-4, help="Fixed Learning rate.")  # Adjusted default
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
-    parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
+    parser.add_argument("--max_epochs", type=int, default=100, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--project_name", type=str, default="HCC-Recurrence", help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="time_to_event-run", help="WandB run name.")
@@ -527,13 +541,11 @@ def main():
     # 10) Plot Survival Functions (Only for time_to_event)
     # -------------------------------------------------------------------------
     if args.model_type == "time_to_event":
-        import matplotlib.pyplot as plt
-
         # Access the survival functions from the model
         surv = model.surv_funcs
         if surv is not None:
             # Plot the first 5 survival functions
-            surv.iloc[:5].plot()
+            surv.iloc[:, :5].plot()
             plt.ylabel('S(t | x)')
             plt.xlabel('Time')
             plt.title('Survival Functions for First 5 Test Samples')
