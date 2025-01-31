@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -p a100_short,a100_dev,a100_long
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -21,11 +21,6 @@ conda activate dinov2
 
 srun python train.py \
     --batch_size 8 \
-    --max_epochs 1 \
-    --seed 42 \
-    --project_name "HCC-Recurrence-Time" \
-    --backbone dinov1 \
     --num_slices 20 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --pretrained
 
