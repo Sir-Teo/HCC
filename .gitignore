@@ -12,3 +12,4 @@ wandb/
 *.xlsx  
 checkpoints/
 weights/
+*.pt
