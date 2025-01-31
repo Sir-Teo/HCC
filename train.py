@@ -6,7 +6,9 @@ from collections import defaultdict
 import pandas as pd
 import numpy as np
 import pydicom
-
+from pycox.models import CoxPH as PyCoxCoxPH
+from pycox.evaluation import EvalSurv
+from pycox.models.loss import CoxPHLoss
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,13 +24,8 @@ from pytorch_lightning.loggers import WandbLogger
 
 import torchvision.models as models
 
-# For survival metrics:
-from pycox.evaluation import EvalSurv
-from pycox.models.loss import CoxPHLoss  # Import PyCox's CoxPHLoss
 from lifelines.utils import concordance_index
 
-torch.hub.set_dir("weights/")
-os.environ["TORCH_HOME"] = "weights/"
 
 ###############################################################################
 # 1) DATASET
@@ -234,9 +231,9 @@ class HCCLightningModel(pl.LightningModule):
         self,
         backbone="resnet",       # "resnet", "dinov1", or "dinov2"
         model_type="linear",     # "linear" or "time_to_event"
-        lr=1e-6,                 # Reduced learning rate
+        lr=1e-6,                 # Learning rate
         num_classes=1,
-        pretrained=True          # <-- New parameter for pretrained weights
+        pretrained=True          # Use pretrained weights
     ):
         super(HCCLightningModel, self).__init__()
         self.save_hyperparameters()
@@ -270,23 +267,19 @@ class HCCLightningModel(pl.LightningModule):
 
         if pretrained:
             for param in self.feature_extractor.parameters():
-                param.requires_grad = False  # Disable gradients for pretrained weights
-        
+                param.requires_grad = False  # Freeze pretrained weights
+
         # ---------------------------------------------------------------------
         # 2.2) Build Head
         # ---------------------------------------------------------------------
         if model_type == "linear":
             self.head = nn.Linear(feature_dim, num_classes)
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)  # Initialize with small std
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
             nn.init.constant_(self.head.bias, 0.0)
             self.criterion = nn.BCEWithLogitsLoss()
         elif model_type == "time_to_event":
-            self.head = nn.Linear(feature_dim, 1)
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)  # Initialize with small std
-            nn.init.constant_(self.head.bias, 0.0)
-            self.criterion = CoxPHLoss()  # Use PyCox's CoxPHLoss with 'breslow' ties
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
+            self.head = None  # Remove linear layer
+            self.criterion = CoxPHLoss()
 
         # ---------------------------------------------------------------------
         # 2.3) Define Metrics
@@ -327,7 +320,13 @@ class HCCLightningModel(pl.LightningModule):
         feats = feats.view(b, n_slices, -1)  # (B, n_slices, feature_dim)
         feats_mean = feats.mean(dim=1)       # Average over slices => (B, feature_dim)
 
-        logits = self.head(feats_mean)        # (B, out_dim)
+        if self.model_type == "linear":
+            logits = self.head(feats_mean)
+            return logits
+        elif self.model_type == "time_to_event":
+            # Directly use mean of features as risk score
+            risk_score = feats_mean.mean(dim=1)  # (B,)
+            return risk_score
         return logits
 
     def configure_optimizers(self):
@@ -341,23 +340,23 @@ class HCCLightningModel(pl.LightningModule):
             loss = self.criterion(logits, y)
         elif self.model_type == "time_to_event":
             x, t, e = batch
-            
+
             # Data validation
             if (t <= 0).any():
                 raise ValueError("All durations must be positive.")
             if not torch.all((e == 0) | (e == 1)):
                 raise ValueError("Event indicators must be binary (0 or 1).")
-            
+
             risk_score = self.forward(x).squeeze(-1)
             loss = self.criterion(risk_score, t, e)  # PyCox's CoxPHLoss expects (risk_score, durations, events)
-            
+
             # Check for NaNs and Infs in loss
             if torch.isnan(loss):
                 self.log("NaN_loss", True)
                 raise ValueError("Loss is NaN")
             else:
                 self.log("NaN_loss", False)
-            
+
             # Log risk score statistics
             self.log("risk_score_mean", torch.mean(risk_score), prog_bar=True)
             self.log("risk_score_std", torch.std(risk_score), prog_bar=True)
@@ -376,7 +375,7 @@ class HCCLightningModel(pl.LightningModule):
             x, y = batch
             logits = self.forward(x).squeeze(-1)
             loss = self.criterion(logits, y)
-            
+
             probs = torch.sigmoid(logits)
             self.val_acc.update(probs, y)
             self.val_prec.update(probs, y)
@@ -385,20 +384,22 @@ class HCCLightningModel(pl.LightningModule):
             self.val_auroc.update(probs, y)
             self.val_probs.append(probs.detach().cpu())
             self.val_labels.append(y.detach().cpu())
-            
+
             self.log("val_loss", loss, prog_bar=True)
             return loss
-            
+
         elif self.model_type == "time_to_event":
             x, t, e = batch
             risk_score = self.forward(x).squeeze(-1)
             loss = self.criterion(risk_score, t, e)
-            
+
             self.val_risks.append(risk_score.detach().cpu())
             self.val_times.append(t.detach().cpu())
             self.val_events.append(e.detach().cpu())
             self.log("val_loss", loss, prog_bar=True)
             return loss
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
     def on_validation_epoch_start(self):
         """Reset validation metrics at the start of each epoch."""
@@ -424,7 +425,7 @@ class HCCLightningModel(pl.LightningModule):
             self.log("val_recall", self.val_rec.compute())
             self.log("val_f1", self.val_f1.compute())
             self.log("val_auroc", self.val_auroc.compute())
-            
+
             # Log class distribution
             if self.val_labels:
                 all_labels = torch.cat(self.val_labels)
@@ -433,20 +434,20 @@ class HCCLightningModel(pl.LightningModule):
                 self.log("val_ratio_pos", num_pos / total)
                 self.log("val_num_pos", num_pos)
                 self.log("val_num_neg", total - num_pos)
-                
+
         elif self.model_type == "time_to_event":
             # Compute C-index for survival
             if self.val_risks and self.val_times and self.val_events:
                 risks = torch.cat(self.val_risks).numpy()
                 times = torch.cat(self.val_times).numpy()
                 events = torch.cat(self.val_events).numpy().astype(bool)
-                
+
                 try:
                     c_index = concordance_index(times, -risks, events)
                     self.log("val_c_index", c_index, prog_bar=True)
                 except Exception as e:
                     print(f"Validation C-index error: {e}")
-                
+
                 # Log event distribution
                 num_events = events.sum()
                 self.log("val_num_events", num_events)
@@ -522,7 +523,6 @@ class HCCLightningModel(pl.LightningModule):
             all_events = torch.cat(self.all_events).numpy()
 
             # Compute Concordance Index (c-index) using lifelines
-            # Lifelines C-index
             try:
                 c_index = concordance_index(all_times, -all_risks, all_events)
                 self.log("test_c_index_lifelines", c_index)
@@ -530,7 +530,7 @@ class HCCLightningModel(pl.LightningModule):
                 print(f"Lifelines C-index error: {e}")
                 self.log("test_c_index_lifelines", float('nan'))
 
-            # PyCox C-index
+            # Compute C-index using PyCox's EvalSurv
             try:
                 surv = self.predict_surv_func(all_risks, all_times, all_events)
                 eval_surv = EvalSurv(surv, all_times, all_events, censor_surv='km')
@@ -540,71 +540,50 @@ class HCCLightningModel(pl.LightningModule):
                 self.log("test_c_index_pycox", float('nan'))
 
     def compute_baseline_hazards(self, dataloader):
-        """Compute baseline hazards using Breslow estimator."""
+        """Compute baseline hazards using PyCox's CoxPH model."""
+        # Collect all risks, durations, and events
+        risks = []
+        durations = []
+        events = []
         self.eval()
-        all_risks = []
-        all_durations = []
-        all_events = []
-        
         with torch.no_grad():
             for batch in dataloader:
                 x, t, e = batch
                 risk_score = self.forward(x).squeeze(-1)
-                all_risks.append(risk_score.cpu().numpy())
-                all_durations.append(t.cpu().numpy())
-                all_events.append(e.cpu().numpy())
-        
-        risks = np.concatenate(all_risks)
-        durations = np.concatenate(all_durations)
-        events = np.concatenate(all_events).astype(bool)
-        
-        # Sort data by descending duration
-        sort_idx = np.argsort(-durations)
-        durations = durations[sort_idx]
-        events = events[sort_idx]
-        risks = risks[sort_idx]
-        
-        # Compute baseline hazards using Breslow estimator
-        unique_times = np.unique(durations[events])
-        baseline_hazards = []
-        time_points = []
-        
-        for t in unique_times:
-            at_risk = durations >= t
-            sum_risk = np.exp(risks[at_risk]).sum()
-            if sum_risk == 0:
-                hazard = 0.0
-            else:
-                n_events = np.sum((durations == t) & events)
-                hazard = n_events / sum_risk
-            baseline_hazards.append(hazard)
-            time_points.append(t)
-        
-        # Compute cumulative baseline hazard
-        cumulative_hazard = np.cumsum(baseline_hazards)
-        self.baseline_hazards = pd.Series(cumulative_hazard, index=unique_times)
+                risks.append(risk_score.cpu().numpy())
+                durations.append(t.cpu().numpy())
+                events.append(e.cpu().numpy())
+
+        risks = np.concatenate(risks)
+        durations = np.concatenate(durations)
+        events = np.concatenate(events).astype(bool)
+
+        # Initialize PyCox CoxPH model
+        cph = PyCoxCoxPH()
+        cph.fit(risks, durations, events)
+
+        # Store baseline hazards
+        self.baseline_hazards = pd.Series(cph.baseline_hazard_, index=cph.unique_times_)
         self.baseline_hazards.index.name = 'time'
 
+
     def predict_surv_func(self, risks, durations, events):
-        """Predict survival functions using precomputed baseline hazards, ensuring coverage of test times."""
         if self.baseline_hazards is None:
-            raise ValueError("Baseline hazards not computed. Call compute_baseline_hazards with training data first.")
-        
-        # Get unique event times from test data
-        test_event_times = np.unique(durations[events.astype(bool)])
-        
-        # Combine with training baseline times and sort
-        all_times = np.union1d(self.baseline_hazards.index.values, test_event_times)
-        all_times.sort()
+            raise ValueError("Baseline hazards not computed. Call compute_baseline_hazards first.")
 
-        # Extend baseline hazards to cover all times using forward fill
-        baseline_cumulative = self.baseline_hazards.reindex(all_times, method='ffill').fillna(0)
+        # Sort the baseline hazards
+        sorted_times = np.sort(self.baseline_hazards.index.values)
+        cum_baseline = self.baseline_hazards.values
 
-        # Compute hazard matrix and survival functions
-        H = np.outer(np.exp(risks), baseline_cumulative.values)
-        S = np.exp(-H)
-        
-        return pd.DataFrame(S, columns=all_times, dtype=np.float32)
+        # Compute cumulative hazard
+        cumulative_hazard = np.cumsum(cum_baseline)
+
+        # Compute survival functions
+        S = np.exp(-np.outer(risks, cumulative_hazard))
+
+        return pd.DataFrame(S, columns=sorted_times, dtype=np.float32)
+
+
 
 ###############################################################################
 # 3) DATA MODULE
@@ -663,7 +642,7 @@ class HCCDataModule(pl.LightningDataModule):
             batch_size=self.batch_size, 
             shuffle=True, 
             num_workers=self.num_workers,
-            collate_fn=self.collate_fn
+            collate_fn=self.train_collate_fn
         )
 
     def val_dataloader(self):
@@ -683,7 +662,19 @@ class HCCDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
-    
+
+    def train_collate_fn(self, batch):
+        """Ensures at least one event per batch ONLY during training."""
+        if self.model_type == "time_to_event":
+            events = [sample[2].item() for sample in batch]
+            if sum(events) == 0 and len(batch) > 0:
+                idx = random.randint(0, len(batch)-1)
+                x, t, e = batch[idx]
+                batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
+            return default_collate(batch)
+        else:
+            return default_collate(batch)
+
     def collate_fn(self, batch):
         if self.model_type == "time_to_event":
             # Ensure at least one event per batch
@@ -710,7 +701,7 @@ def parse_args():
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Fixed Learning rate.")  # Adjusted default
+    parser.add_argument("--lr", type=float, default=1e-4, help="Fixed Learning rate.")  # Adjusted default
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
     parser.add_argument("--max_epochs", type=int, default=1, help="Max number of epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -734,16 +725,15 @@ def parse_args():
     
     return parser.parse_args()
 
-
 def main():
     args = parse_args()
-    
+
     # Set random seed
     seed_everything(args.seed, workers=True)
-    
+
     # Initialize Weights & Biases logger
     wandb_logger = WandbLogger(project=args.project_name, name=args.run_name)
-    
+
     # Create DataModule
     data_module = HCCDataModule(
         csv_file=args.csv_file,
@@ -755,15 +745,15 @@ def main():
         preprocessed_root=args.preprocessed_root
     )
     data_module.setup()
-    
+
     # Create model
     model = HCCLightningModel(
         backbone=args.backbone,
         model_type=args.model_type,
         lr=args.lr,
-        pretrained=args.pretrained  # <-- Pass the pretrained argument
+        pretrained=args.pretrained  # Pass the pretrained argument
     )
-    
+
     # -------------------------------------------------------------------------
     # 5) Callbacks: Early Stopping and Model Checkpointing
     # -------------------------------------------------------------------------
