@@ -21,12 +21,11 @@ conda activate dinov2
 
 srun python train.py \
     --batch_size 8 \
-    --max_epochs 10 \
+    --max_epochs 1 \
     --seed 42 \
     --project_name "HCC-Recurrence-Time" \
     --backbone dinov1 \
-    --model_type linear \
-    --num_slices 64 \
+    --num_slices 20 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --pretrained
 
