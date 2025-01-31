@@ -278,13 +278,19 @@ class HCCLightningModel(pl.LightningModule):
             nn.init.constant_(self.head.bias, 0.0)
             self.criterion = nn.BCEWithLogitsLoss()
         elif model_type == "time_to_event":
-            self.head = None  # Remove linear layer
+            # Use a linear layer for risk scores
+            self.head = nn.Linear(feature_dim, 1)
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
+            nn.init.constant_(self.head.bias, 0.0)
             self.criterion = CoxPHLoss()
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
 
         # ---------------------------------------------------------------------
         # 2.3) Define Metrics
         # ---------------------------------------------------------------------
         if self.model_type == "linear":
+            # Validation metrics
             self.val_acc = torchmetrics.Accuracy(task="binary")
             self.val_prec = torchmetrics.Precision(task="binary")
             self.val_rec = torchmetrics.Recall(task="binary")
@@ -292,15 +298,26 @@ class HCCLightningModel(pl.LightningModule):
             self.val_auroc = torchmetrics.AUROC(task="binary")
             self.val_probs = []
             self.val_labels = []
-        elif self.model_type == "time_to_event":
-            self.val_risks = []
-            self.val_times = []
-            self.val_events = []
-
+            
+            self.test_acc = torchmetrics.Accuracy(task="binary")
+            self.test_prec = torchmetrics.Precision(task="binary")
+            self.test_rec = torchmetrics.Recall(task="binary")
+            self.test_f1 = torchmetrics.F1Score(task="binary")
+            self.test_auroc = torchmetrics.AUROC(task="binary")
+            self.all_probs = []
+            self.all_labels = []
         # ---------------------------------------------------------------------
         # 2.4) Initialize Baseline Hazards
         # ---------------------------------------------------------------------
         if self.model_type == "time_to_event":
+            self.val_risks = []
+            self.val_times = []
+            self.val_events = []
+            
+            # Test tracking (ADDED if needed)
+            self.all_risks = []
+            self.all_times = []
+            self.all_events = []
             self.baseline_hazards = None
             self.surv_funcs = None
 
@@ -320,13 +337,7 @@ class HCCLightningModel(pl.LightningModule):
         feats = feats.view(b, n_slices, -1)  # (B, n_slices, feature_dim)
         feats_mean = feats.mean(dim=1)       # Average over slices => (B, feature_dim)
 
-        if self.model_type == "linear":
-            logits = self.head(feats_mean)
-            return logits
-        elif self.model_type == "time_to_event":
-            # Directly use mean of features as risk score
-            risk_score = feats_mean.mean(dim=1)  # (B,)
-            return risk_score
+        logits = self.head(feats_mean)        # (B, out_dim)
         return logits
 
     def configure_optimizers(self):
@@ -795,7 +806,8 @@ def main():
     # 7) Fit the model
     # -------------------------------------------------------------------------
     trainer.fit(model, datamodule=data_module)
-    trainer.model.compute_baseline_hazards(data_module.train_dataloader())
+    if args.model_type == "time_to_event":
+        trainer.model.compute_baseline_hazards(data_module.train_dataloader())
 
     # -------------------------------------------------------------------------
     # 8) Test the model
