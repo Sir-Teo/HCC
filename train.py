@@ -23,6 +23,7 @@ from pytorch_lightning.loggers import WandbLogger
 import torchvision.models as models
 from lifelines.utils import concordance_index
 from data.dataset import *
+import copy  # For cloning the network
 
 class HCCLightningModel(pl.LightningModule):
     def __init__(
@@ -81,6 +82,8 @@ class HCCLightningModel(pl.LightningModule):
             nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
             nn.init.constant_(self.head.bias, 0.0)
             self.criterion = CoxPHLoss()
+            # Initialize coxph as None; it will be created in compute_baseline_hazards
+            self.coxph = None
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -256,6 +259,7 @@ class HCCLightningModel(pl.LightningModule):
                     self.log("val_c_index", c_index, prog_bar=True)
                 except Exception as e:
                     print(f"Validation C-index error: {e}")
+                    self.log("val_c_index", float('nan'))
 
                 # Log event distribution
                 num_events = events.sum()
@@ -364,37 +368,35 @@ class HCCLightningModel(pl.LightningModule):
                 events.append(e.cpu().numpy())
 
         risks = np.concatenate(risks)
-        print(risk)
+        print(risks)  # Corrected from print(risk) to print(risks)
         durations = np.concatenate(durations)
         events = np.concatenate(events).astype(bool)
 
-        # Initialize PyCox CoxPH model
-        cph = PyCoxCoxPH()
-        cph.fit(risks, durations, events)
+        # Clone the head network and move to CPU
+        cloned_head = copy.deepcopy(self.head).cpu()
+
+        # Initialize a new CoxPH model with the cloned head
+        coxph = PyCoxCoxPH(cloned_head, optimizer=optim.Adam)
+
+        # Fit the CoxPH model on CPU
+        # **IMPORTANT CHANGE HERE**
+        # Pass 'target' as a tuple containing durations and events
+        coxph.fit(risks, (durations, events))
 
         # Store baseline hazards
-        self.baseline_hazards = pd.Series(cph.baseline_hazard_, index=cph.unique_times_)
+        self.baseline_hazards = pd.Series(coxph.baseline_hazard_, index=coxph.unique_times_)
         self.baseline_hazards.index.name = 'time'
 
+        # Store the coxph model's survival functions if needed
+        self.coxph = coxph  # Assign the fitted CoxPH model
 
     def predict_surv_func(self, risks, durations, events):
-        if self.baseline_hazards is None:
-            raise ValueError("Baseline hazards not computed. Call compute_baseline_hazards first.")
+        if self.coxph is None:
+            raise ValueError("CoxPH model not fitted. Call compute_baseline_hazards first.")
 
-        # Sort the baseline hazards
-        sorted_times = np.sort(self.baseline_hazards.index.values)
-        cum_baseline = self.baseline_hazards.values
-
-        # Compute cumulative hazard
-        cumulative_hazard = np.cumsum(cum_baseline)
-
-        # Compute survival functions
-        S = np.exp(-np.outer(risks, cumulative_hazard))
-
-        return pd.DataFrame(S, columns=sorted_times, dtype=np.float32)
-
-
-
+        # Use PyCox's predict_surv_df method
+        surv_df = self.coxph.predict_surv_df(risks, durations)
+        return surv_df
 
 ###############################################################################
 # 4) TRAIN SCRIPT
