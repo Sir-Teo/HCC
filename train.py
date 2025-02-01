@@ -173,7 +173,6 @@ class HCCDicomDataset(Dataset):
     def __getitem__(self, idx):
         # Determine which patient to sample from and which sample number (unused here)
         patient_idx = idx // self.num_samples_per_patient
-        # sample_idx = idx % self.num_samples_per_patient   # if needed later
         patient = self.patient_data[patient_idx]
         dicom_dir = patient['dicom_dir']
         image_stack = self.load_axial_series(dicom_dir)
@@ -532,24 +531,76 @@ def main(args):
         print("Found non-positive durations. Correcting...")
         y_train_durations[y_train_durations <= 0] = 1e-6
 
-    get_target = lambda durations, events: (durations, events)
-    y_train_target = get_target(y_train_durations, y_train_events)
-    y_val_target = get_target(y_val_durations, y_val_events)
-    y_test_target = get_target(y_test_durations, y_test_events)
+    # -----------------------------
+    # If traditional regression is requested, use lifelines.
+    # -----------------------------
+    if args.coxph_method == 'traditional':
+        from lifelines import CoxPHFitter
+        from lifelines.utils import concordance_index
+
+        feature_names = [f'feat_{i}' for i in range(x_train_std.shape[1])]
+        train_df = pd.DataFrame(x_train_std, columns=feature_names)
+        train_df['time'] = y_train_durations
+        train_df['event'] = y_train_events
+
+        cph = CoxPHFitter()
+        cph.fit(train_df, duration_col='time', event_col='event')
+        print(cph.summary)
+
+        # Evaluate on validation set
+        val_df = pd.DataFrame(x_val_std, columns=feature_names)
+        val_df['time'] = y_val_durations
+        val_df['event'] = y_val_events
+        val_pred = cph.predict_partial_hazard(val_df)
+        c_index_val = concordance_index(val_df['time'], -val_pred, val_df['event'])
+        print(f"Validation Concordance Index: {c_index_val}")
+
+        # Evaluate on test set
+        test_df = pd.DataFrame(x_test_std, columns=feature_names)
+        test_df['time'] = y_test_durations
+        test_df['event'] = y_test_events
+        test_pred = cph.predict_partial_hazard(test_df)
+        c_index_test = concordance_index(test_df['time'], -test_pred, test_df['event'])
+        print(f"Test Concordance Index: {c_index_test}")
+
+        # Plot baseline survival function
+        surv_func = cph.baseline_survival_
+        plt.figure()
+        surv_func.plot()
+        plt.title("Baseline Survival Function")
+        plt.savefig(os.path.join(args.output_dir, "baseline_survival.png"))
+        plt.close()
+
+        # Plot survival functions for a few test samples
+        plt.figure()
+        for i in range(min(5, test_df.shape[0])):
+            sample = test_df.iloc[[i]]
+            surv_pred = cph.predict_survival_function(sample)
+            plt.step(surv_pred.index, surv_pred.values.flatten(), where='post', label=f"Sample {i}")
+        plt.xlabel("Time")
+        plt.ylabel("Survival probability")
+        plt.legend()
+        plt.title("Survival Functions for Test Samples")
+        plt.savefig(os.path.join(args.output_dir, "test_survival_functions.png"))
+        plt.close()
+
+        return
 
     # -----------------------------
-    # Define the neural network for CoxPH
+    # Else, use the pycox (neural network) based CoxPH model.
     # -----------------------------
+    # Define the neural network for CoxPH (optionally, you can still choose 'mlp' vs. 'linear')
     in_features = x_train_std.shape[1]
     print("Input feature dimension:", in_features)
     out_features = 1
 
-    # New option: choose between an MLP-based network or a simple linear model.
     if args.coxph_net == 'mlp':
         num_nodes = [256, 128]
         net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=False,
                                       dropout=args.dropout, output_bias=False)
     elif args.coxph_net == 'linear':
+        # Although nn.Linear is used here, the model is trained via the pycox framework.
+        # (This branch is provided if you want to experiment with a one-layer network.)
         net = nn.Linear(in_features, out_features, bias=False)
     else:
         raise ValueError("Unknown coxph_net option. Choose either 'mlp' or 'linear'.")
@@ -576,8 +627,8 @@ def main(args):
     batch_size = args.batch_size
 
     print("Training the CoxPH model...")
-    log = model.fit(x_train_std, y_train_target, batch_size, args.epochs, callbacks, verbose,
-                    val_data=(x_val_std, y_val_target), val_batch_size=batch_size)
+    log = model.fit(x_train_std, (y_train_durations, y_train_events), batch_size, args.epochs, callbacks, verbose,
+                    val_data=(x_val_std, (y_val_durations, y_val_events)), val_batch_size=batch_size)
     
     plt.figure()
     log.plot()
@@ -585,12 +636,7 @@ def main(args):
     plt.savefig(os.path.join(args.output_dir, "training_log.png"))
     plt.close()
 
-    print(f"y_val_target type: {type(y_val_target)}")
-    print(f"y_val_target length: {len(y_val_target) if isinstance(y_val_target, tuple) else 'Not a tuple'}")
-    print(f"y_val_target first element type: {type(y_val_target[0]) if isinstance(y_val_target, tuple) else 'N/A'}")
-    print(f"y_val_target second element type: {type(y_val_target[1]) if isinstance(y_val_target, tuple) else 'N/A'}")
-
-    partial_ll = model.partial_log_likelihood(x_val_std, y_val_target).mean()
+    partial_ll = model.partial_log_likelihood(x_val_std, (y_val_durations, y_val_events)).mean()
     print(f"Partial Log-Likelihood on Validation Set: {partial_ll}")
 
     model.compute_baseline_hazards()
@@ -603,11 +649,11 @@ def main(args):
     plt.savefig(os.path.join(args.output_dir, "survival_functions.png"))
     plt.close()
 
-    ev = EvalSurv(surv, y_test_target[0], y_test_target[1], censor_surv='km')
+    ev = EvalSurv(surv, y_test_durations, y_test_events, censor_surv='km')
     concordance = ev.concordance_td()
     print(f"Concordance Index: {concordance}")
 
-    time_grid = np.linspace(y_test_target[0].min(), y_test_target[0].max(), 100)
+    time_grid = np.linspace(y_test_durations.min(), y_test_durations.max(), 100)
     brier_score = ev.brier_score(time_grid)
     plt.figure()
     brier_score.plot()
@@ -640,9 +686,10 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate for the CoxPH network')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample from each patient per epoch')
-    # New argument to choose the type of network for CoxPH survival regression.
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'],
-                        help='Type of network for CoxPH survival regression: "mlp" uses a multilayer perceptron, "linear" uses a single linear layer.')
+                        help='Type of network for pycox survival regression: "mlp" uses a multilayer perceptron, "linear" uses a single linear layer.')
+    parser.add_argument('--coxph_method', type=str, default='pycox', choices=['pycox', 'traditional'],
+                        help='Regression method: "pycox" uses a neural network approach, "traditional" uses lifelines for standard CoxPH regression.')
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

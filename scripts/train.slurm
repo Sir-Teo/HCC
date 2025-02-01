@@ -26,6 +26,7 @@ srun python train.py \
     --learning_rate 1e-5 \
     --center_risk \
     --num_samples_per_patient 10 \
-    --coxph_net linear \
+    --coxph_net mlp \
+    --coxph_method tradional
 
 
