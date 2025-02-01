@@ -20,11 +20,12 @@ source ~/.bashrc
 conda activate dinov2
 
 srun python train.py \
-    --batch_size 16 \
+    --batch_size 10 \
     --num_slices 30 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --learning_rate 1e-6 \
-    --gradient_clip 1.0 \
+    --learning_rate 1e-5 \
     --center_risk \
-    --dropout 0.0 \
+    --num_samples_per_patient 10 \
+    --coxph_net linear \
+
 

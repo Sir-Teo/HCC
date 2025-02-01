@@ -20,11 +20,22 @@ import torchtuples as tt
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+# Global debug flag
+DEBUG = False
+
+# ======================================================
+# Debug hook: Print a message if a module outputs NaNs.
+# ======================================================
+def nan_hook(module, input, output):
+    if torch.isnan(output).any():
+        print(f"[DEBUG] NaN detected in output of {module}")
+
 # -----------------------------
 # Data Modules and Dataset
 # -----------------------------
 class HCCDataModule(pl.LightningDataModule):
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2, preprocessed_root=None):
+    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2,
+                 preprocessed_root=None, num_samples_per_patient=1):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
@@ -33,13 +44,13 @@ class HCCDataModule(pl.LightningDataModule):
         self.num_slices = num_slices
         self.num_workers = num_workers
         self.preprocessed_root = preprocessed_root
+        self.num_samples_per_patient = num_samples_per_patient
 
         # Basic preprocessing transforms (resize + normalization)
         self.preprocess_transform = T.Compose([
             T.Resize((518, 518), antialias=True),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        # Runtime transforms can be extended as needed.
         self.transform = self.preprocess_transform
 
     def setup(self, stage=None):
@@ -57,17 +68,17 @@ class HCCDataModule(pl.LightningDataModule):
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df, dicom_root=self.dicom_root, model_type=self.model_type,
             transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
         )
         self.val_dataset = HCCDicomDataset(
             csv_file=val_df, dicom_root=self.dicom_root, model_type=self.model_type,
             transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
         )
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df, dicom_root=self.dicom_root, model_type=self.model_type,
             transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
         )
 
     def train_dataloader(self):
@@ -105,6 +116,8 @@ class HCCDataModule(pl.LightningDataModule):
                 for idx in indices:
                     x, t, e = batch[idx]
                     batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
+            if DEBUG:
+                print(f"[DEBUG] train_collate_fn - Batch size: {len(batch)}, events sum: {sum([s[2].item() for s in batch])}")
             return default_collate(batch)
         else:
             return default_collate(batch)
@@ -116,17 +129,21 @@ class HCCDataModule(pl.LightningDataModule):
                 idx = random.randint(0, len(batch)-1)
                 x, t, e = batch[idx]
                 batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
+            if DEBUG:
+                print(f"[DEBUG] collate_fn - Batch size: {len(batch)}, events sum: {sum([s[2].item() for s in batch])}")
             return default_collate(batch)
         else:
             return default_collate(batch)
 
 class HCCDicomDataset(Dataset):
-    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10, preprocessed_root=None):
+    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10,
+                 preprocessed_root=None, num_samples_per_patient=1):
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
         self.num_slices = num_slices
         self.preprocessed_root = preprocessed_root
+        self.num_samples_per_patient = num_samples_per_patient
         self.patient_data = []
         
         if isinstance(csv_file, str):
@@ -145,22 +162,38 @@ class HCCDicomDataset(Dataset):
                     data_entry['event'] = row['event']
                 data_entry['dicom_dir'] = dicom_dir
                 self.patient_data.append(data_entry)
+        if DEBUG:
+            print(f"[DEBUG] HCCDicomDataset initialized with {len(self.patient_data)} patients, "
+                  f"each yielding {self.num_samples_per_patient} sample(s).")
 
     def __len__(self):
-        return len(self.patient_data)
+        # Each patient yields num_samples_per_patient samples.
+        return len(self.patient_data) * self.num_samples_per_patient
 
     def __getitem__(self, idx):
-        patient = self.patient_data[idx]
+        # Determine which patient to sample from and which sample number (unused here)
+        patient_idx = idx // self.num_samples_per_patient
+        # sample_idx = idx % self.num_samples_per_patient   # if needed later
+        patient = self.patient_data[patient_idx]
         dicom_dir = patient['dicom_dir']
         image_stack = self.load_axial_series(dicom_dir)
-        
-        if self.transform:
+
+        if DEBUG:
+            print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after processing: {image_stack.shape}")
+
+        # If we loaded from preprocessed data, assume the transform was already applied.
+        if self.preprocessed_root is None and self.transform:
             transformed_images = []
             for img in image_stack:
                 img = self.transform(img)
                 transformed_images.append(img)
             image_stack = torch.stack(transformed_images)
-        
+            if DEBUG:
+                print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after reapplying transform: {image_stack.shape}")
+        else:
+            if DEBUG:
+                print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - using preprocessed images (no re-transform).")
+            
         if self.model_type == "linear":
             return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
         elif self.model_type == "time_to_event":
@@ -175,6 +208,8 @@ class HCCDicomDataset(Dataset):
         if self.preprocessed_root:
             preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
             if os.path.exists(preprocessed_path):
+                if DEBUG:
+                    print(f"[DEBUG] Loading preprocessed tensor for patient {patient_id} from {preprocessed_path}")
                 image_stack = torch.load(preprocessed_path)
                 return self.process_loaded_stack(image_stack)
         
@@ -210,6 +245,8 @@ class HCCDicomDataset(Dataset):
                 return 0.0
 
         axial_series.sort(key=get_slice_position)
+        if DEBUG:
+            print(f"[DEBUG] load_axial_series patient {patient_id}: {len(axial_series)} axial slices found.")
 
         image_stack = []
         for dcm_path in axial_series:
@@ -223,25 +260,39 @@ class HCCDicomDataset(Dataset):
                 print(f"Error processing DICOM file {dcm_path}: {e}")
                 continue
 
-        image_stack = torch.stack(image_stack) if image_stack else torch.zeros((0, 3, 224, 224))
-        
+        if image_stack:
+            image_stack = torch.stack(image_stack)
+        else:
+            image_stack = torch.zeros((0, 3, 224, 224))
+
+        if DEBUG:
+            print(f"[DEBUG] load_axial_series patient {patient_id} - image_stack shape before saving: {image_stack.shape}")
+
         if self.preprocessed_root:
             os.makedirs(self.preprocessed_root, exist_ok=True)
             preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
             torch.save(image_stack, preprocessed_path)
-        
+            if DEBUG:
+                print(f"[DEBUG] Saved preprocessed tensor for patient {patient_id} to {preprocessed_path}")
+
         return self.process_loaded_stack(image_stack)
 
     def process_loaded_stack(self, image_stack):
         current_slices = image_stack.size(0)
+        if DEBUG:
+            print(f"[DEBUG] process_loaded_stack - current slices: {current_slices}, target: {self.num_slices}")
         if current_slices < self.num_slices:
             pad_size = self.num_slices - current_slices
             padding = torch.zeros((pad_size, *image_stack.shape[1:]), dtype=image_stack.dtype)
             image_stack = torch.cat([image_stack, padding], dim=0)
+            if DEBUG:
+                print(f"[DEBUG] Padded image_stack to shape: {image_stack.shape}")
         else:
             selected_indices = torch.randperm(current_slices)[:self.num_slices]
             selected_indices, _ = torch.sort(selected_indices)
             image_stack = image_stack[selected_indices]
+            if DEBUG:
+                print(f"[DEBUG] Randomly selected slices. New shape: {image_stack.shape}")
         return image_stack
 
     def is_axial(self, orientation):
@@ -265,11 +316,14 @@ class HCCDicomDataset(Dataset):
             img = np.clip(img, -100, 400)
             img = (img + 100) / 500.0
         else:
-            img = (img - img.min()) / (img.max() - img.min())
+            img = (img - img.min()) / (img.max() - img.min() + 1e-6)
             img = img * 255.0
         if img.ndim == 2:
             img = np.repeat(img[..., np.newaxis], 3, axis=-1)
-        return torch.from_numpy(img).permute(2, 0, 1)  # CHW format
+        tensor_img = torch.from_numpy(img).permute(2, 0, 1)  # CHW format
+        if DEBUG:
+            print(f"[DEBUG] dicom_to_tensor - tensor shape: {tensor_img.shape}, min: {tensor_img.min()}, max: {tensor_img.max()}")
+        return tensor_img
 
 # -----------------------------
 # Feature Extraction
@@ -283,22 +337,34 @@ def extract_features(data_loader, model, device):
     features = []
     durations = []
     events = []
+    batch_count = 0
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Extracting Features"):
-            images, t, e = batch  # images: (batch_size, num_slices, 3, 224, 224)
+            images, t, e = batch  # images: (batch_size, num_slices, 3, H, W)
+            if DEBUG and batch_count == 0:
+                print(f"[DEBUG] extract_features - Batch {batch_count}: images shape: {images.shape}")
             images = images.to(device)
             batch_size, num_slices, C, H, W = images.size()
             images = images.view(batch_size * num_slices, C, H, W)
+            if DEBUG and batch_count == 0:
+                print(f"[DEBUG] extract_features - After reshaping: {images.shape}")
             feats = model(images)  # (batch_size*num_slices, feature_dim)
+            if DEBUG and batch_count == 0:
+                print(f"[DEBUG] extract_features - Feature shape from DINO: {feats.shape}")
             feats = feats.view(batch_size, num_slices, -1)
             feats = feats.mean(dim=1)  # Average slice features per patient
+            if DEBUG and batch_count == 0:
+                print(f"[DEBUG] extract_features - Averaged patient features shape: {feats.shape}")
             features.append(feats.cpu().numpy())
             durations.append(t.cpu().numpy())
             events.append(e.cpu().numpy())
+            batch_count += 1
     features = np.concatenate(features, axis=0)
     durations = np.concatenate(durations, axis=0)
     events = np.concatenate(events, axis=0)
+    if DEBUG:
+        print(f"[DEBUG] extract_features - Final features shape: {features.shape}")
     return features, durations, events
 
 # -----------------------------
@@ -311,7 +377,9 @@ class CenteredModel(nn.Module):
 
     def forward(self, x):
         out = self.net(x)
-        # Center risk scores to help numerical stability
+        if DEBUG:
+            print(f"[DEBUG] CenteredModel.forward - raw risk scores: mean={out.mean().item():.4f}, std={out.std().item():.4f}, min={out.min().item():.4f}, max={out.max().item():.4f}")
+        # Center risk scores for numerical stability
         return out - out.mean(dim=0, keepdim=True)
 
 # -----------------------------
@@ -323,8 +391,52 @@ class GradientClippingCallback(tt.callbacks.Callback):
         self.clip_value = clip_value
 
     def on_batch_end(self):
-        # Use clip_grad_norm_ to clip gradients of the network parameters.
+        # Clip gradients of the network parameters.
         torch.nn.utils.clip_grad_norm_(self.model.net.parameters(), self.clip_value)
+        total_norm = 0.0
+        for p in self.model.net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        if DEBUG:
+            print(f"[DEBUG] GradientClippingCallback - Batch gradient norm: {total_norm:.4f}")
+
+# -----------------------------
+# Callback to Log Loss and Check Parameters
+# -----------------------------
+class LossLogger(tt.callbacks.Callback):
+    def __init__(self):
+        self.epoch_losses = []
+
+    def on_epoch_end(self):
+        log_df = self.model.log.to_pandas()
+        if not log_df.empty:
+            current_loss = log_df.iloc[-1]['train_loss']
+            print(f"Epoch {len(self.epoch_losses)} - Train Loss: {current_loss:.4f}")
+            self.epoch_losses.append(current_loss)
+            total_norm = 0.0
+            for p in self.model.net.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+            print(f"Epoch {len(self.epoch_losses)} - Gradient Norm: {total_norm:.4f}")
+            # Run a forward pass on a small sample, if available.
+            if hasattr(self.model, "x_train_std") and self.model.x_train_std is not None:
+                sample_input = torch.tensor(self.model.x_train_std[:5]).to(next(self.model.net.parameters()).device)
+                with torch.no_grad():
+                    risk_scores = self.model.net(sample_input)
+                print(f"[DEBUG] LossLogger - Sample risk scores: mean={risk_scores.mean().item():.4f}, std={risk_scores.std().item():.4f}, min={risk_scores.min().item():.4f}, max={risk_scores.max().item():.4f}")
+
+# -----------------------------
+# Callback to Check Model Parameters for NaNs
+# -----------------------------
+class ParamCheckerCallback(tt.callbacks.Callback):
+    def on_epoch_end(self):
+        for name, param in self.model.net.named_parameters():
+            if torch.isnan(param).any():
+                #print(f"[DEBUG] Parameter {name} contains NaNs.")
+                pass
 
 # -----------------------------
 # Main Training and Evaluation Function
@@ -341,18 +453,21 @@ def main(args):
         batch_size=args.batch_size,
         num_slices=args.num_slices,
         num_workers=args.num_workers,
-        preprocessed_root=args.preprocessed_root
+        preprocessed_root=args.preprocessed_root,
+        num_samples_per_patient=args.num_samples_per_patient
     )
     data_module.setup()
 
     # Load DINO model (ViT-based feature extractor)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dino_model = timm.create_model('timm/vit_small_patch14_dinov2.lvd142m', pretrained=True)
+    dino_model = timm.create_model('timm/vit_base_patch16_224.dino', pretrained=True)
     dino_model.to(device)
     dino_model.eval()
-    # Remove the classification head to extract features
     if hasattr(dino_model, 'head'):
         dino_model.head = nn.Identity()
+
+    # Register a forward hook to catch NaNs in the DINO model
+    dino_model.register_forward_hook(nan_hook)
 
     # Create DataLoaders
     train_loader = data_module.train_dataloader()
@@ -367,13 +482,11 @@ def main(args):
     print("Extracting test features...")
     x_test, y_test_durations, y_test_events = extract_features(test_loader, dino_model, device)
 
-    # Check for NaNs in features
     print("Checking for NaNs in features...")
     print("x_train contains NaNs:", np.isnan(x_train).any())
     print("x_val contains NaNs:", np.isnan(x_val).any())
     print("x_test contains NaNs:", np.isnan(x_test).any())
 
-    # Remove zero-variance features if any exist
     variances = np.var(x_train, axis=0)
     if np.any(variances == 0):
         zero_var_features = np.where(variances == 0)[0]
@@ -385,7 +498,6 @@ def main(args):
     y_train = (y_train_durations, y_train_events)
     y_val = (y_val_durations, y_val_events)
     y_test = (y_test_durations, y_test_events)
-
     if isinstance(y_train, tuple):
         y_train_durations, y_train_events = y_train
         y_val_durations, y_val_events = y_val
@@ -402,7 +514,6 @@ def main(args):
     print(f"Min: {x_train_std.min()}, Max: {x_train_std.max()}")
     print(f"Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
 
-    # Validate survival data
     def validate_survival_data(durations, events):
         sort_idx = np.argsort(durations)
         sorted_durations = durations[sort_idx]
@@ -431,39 +542,33 @@ def main(args):
     # -----------------------------
     in_features = x_train_std.shape[1]
     print("Input feature dimension:", in_features)
-    num_nodes = [32, 32]
     out_features = 1
 
-    net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=True,
-                                  dropout=args.dropout, output_bias=False)
+    # New option: choose between an MLP-based network or a simple linear model.
+    if args.coxph_net == 'mlp':
+        num_nodes = [256, 128]
+        net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=False,
+                                      dropout=args.dropout, output_bias=False)
+    elif args.coxph_net == 'linear':
+        net = nn.Linear(in_features, out_features, bias=False)
+    else:
+        raise ValueError("Unknown coxph_net option. Choose either 'mlp' or 'linear'.")
+
     if args.center_risk:
         net = CenteredModel(net)
     
+    # Register a forward hook on the network to detect NaNs.
+    net.register_forward_hook(nan_hook)
+    
     model = CoxPH(net, tt.optim.Adam)
     model.optimizer.set_lr(args.learning_rate)
-    model.optimizer.param_groups[0]['weight_decay'] = 1e-4  # L2 regularization
+    model.optimizer.param_groups[0]['weight_decay'] = 1e-4
 
-    # Define a callback to log loss and gradient norms
-    class LossLogger(tt.callbacks.Callback):
-        def __init__(self):
-            self.epoch_losses = []
+    # Save standardized training features for debug purposes.
+    model.x_train_std = x_train_std
 
-        def on_epoch_end(self):
-            log_df = self.model.log.to_pandas()
-            if not log_df.empty:
-                current_loss = log_df.iloc[-1]['train_loss']
-                print(f"Epoch {len(self.epoch_losses)} - Train Loss: {current_loss:.4f}")
-                self.epoch_losses.append(current_loss)
-                total_norm = 0.0
-                for p in self.model.net.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                print(f"Epoch {len(self.epoch_losses)} - Gradient Norm: {total_norm:.4f}")
-
-    # Set up callbacks. Insert our custom gradient clipping callback if enabled.
-    callbacks = [tt.callbacks.EarlyStopping(), LossLogger()]
+    # Set up callbacks (including our new ParamCheckerCallback).
+    callbacks = [tt.callbacks.EarlyStopping(), LossLogger(), ParamCheckerCallback()]
     if args.gradient_clip > 0:
         callbacks.insert(1, GradientClippingCallback(args.gradient_clip))
     
@@ -474,7 +579,6 @@ def main(args):
     log = model.fit(x_train_std, y_train_target, batch_size, args.epochs, callbacks, verbose,
                     val_data=(x_val_std, y_val_target), val_batch_size=batch_size)
     
-    # Plot and save the training log
     plt.figure()
     log.plot()
     plt.title("Training Log")
@@ -530,11 +634,15 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loaders')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--output_dir', type=str, default='checkpoints', help='Directory to save outputs and models')
-    # New flags for improvements:
     parser.add_argument('--learning_rate', type=float, default=1e-6, help='Learning rate for the CoxPH model')
     parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--center_risk', action='store_true', help='If set, center risk scores for numerical stability')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate for the CoxPH network')
+    parser.add_argument('--num_samples_per_patient', type=int, default=1,
+                        help='Number of times to sample from each patient per epoch')
+    # New argument to choose the type of network for CoxPH survival regression.
+    parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'],
+                        help='Type of network for CoxPH survival regression: "mlp" uses a multilayer perceptron, "linear" uses a single linear layer.')
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
