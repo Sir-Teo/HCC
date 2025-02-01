@@ -329,8 +329,10 @@ class HCCDicomDataset(Dataset):
 # -----------------------------
 def extract_features(data_loader, model, device):
     """
-    Extract features using the DINO model and aggregate slice-level features 
-    into a patient-level representation.
+    Extract features using the DINO model by utilizing patch embeddings.
+    For each image, we call forward_features() to obtain the token embeddings,
+    remove the class token (if present), and average the remaining patch embeddings.
+    Then, slice-level features are averaged to produce a patient-level feature.
     """
     model.eval()
     features = []
@@ -345,26 +347,44 @@ def extract_features(data_loader, model, device):
                 print(f"[DEBUG] extract_features - Batch {batch_count}: images shape: {images.shape}")
             images = images.to(device)
             batch_size, num_slices, C, H, W = images.size()
+            # Reshape to process each slice as an individual image.
             images = images.view(batch_size * num_slices, C, H, W)
             if DEBUG and batch_count == 0:
                 print(f"[DEBUG] extract_features - After reshaping: {images.shape}")
-            feats = model(images)  # (batch_size*num_slices, feature_dim)
+            # Use forward_features to get the patch embeddings
+            if hasattr(model, "forward_features"):
+                # For ViTs, forward_features returns a tensor of shape (B, num_tokens, feature_dim)
+                token_embeddings = model.forward_features(images)
+                # Some DINO models output a [CLS] token as the first token.
+                # Remove the first token (if present) and average the patch tokens.
+                if token_embeddings.ndim == 3 and token_embeddings.size(1) > 1:
+                    patch_tokens = token_embeddings[:, 1:, :]  # exclude the class token
+                    feats = patch_tokens.mean(dim=1)  # average over patch tokens
+                else:
+                    # Fallback: simply average all tokens if no clear class token is available.
+                    feats = token_embeddings.mean(dim=1)
+            else:
+                # Fallback: use the model's __call__ (if forward_features is not available)
+                feats = model(images)
             if DEBUG and batch_count == 0:
-                print(f"[DEBUG] extract_features - Feature shape from DINO: {feats.shape}")
+                print(f"[DEBUG] extract_features - Feature shape from DINO (patch embeddings): {feats.shape}")
+            # Reshape back to (batch_size, num_slices, feature_dim) and average across slices.
             feats = feats.view(batch_size, num_slices, -1)
-            feats = feats.mean(dim=1)  # Average slice features per patient
+            feats = feats.mean(dim=1)  # Aggregate slice-level features into patient-level features
             if DEBUG and batch_count == 0:
                 print(f"[DEBUG] extract_features - Averaged patient features shape: {feats.shape}")
             features.append(feats.cpu().numpy())
             durations.append(t.cpu().numpy())
             events.append(e.cpu().numpy())
             batch_count += 1
+
     features = np.concatenate(features, axis=0)
     durations = np.concatenate(durations, axis=0)
     events = np.concatenate(events, axis=0)
     if DEBUG:
         print(f"[DEBUG] extract_features - Final features shape: {features.shape}")
     return features, durations, events
+
 
 # -----------------------------
 # Optional Risk Score Centering Wrapper
@@ -512,6 +532,8 @@ def main(args):
     print("Feature value ranges (train):")
     print(f"Min: {x_train_std.min()}, Max: {x_train_std.max()}")
     print(f"Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
+    corr_matrix = pd.DataFrame(x_train_std).corr()
+    print(corr_matrix.abs().unstack().sort_values(ascending=False))
 
     def validate_survival_data(durations, events):
         sort_idx = np.argsort(durations)
@@ -543,7 +565,7 @@ def main(args):
         train_df['time'] = y_train_durations
         train_df['event'] = y_train_events
 
-        cph = CoxPHFitter()
+        cph = CoxPHFitter(penalizer=0.1)
         cph.fit(train_df, duration_col='time', event_col='event')
         print(cph.summary)
 
