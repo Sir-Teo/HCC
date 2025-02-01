@@ -27,7 +27,7 @@ DEBUG = False
 # Debug hook: Print a message if a module outputs NaNs.
 # ======================================================
 def nan_hook(module, input, output):
-    if torch.isnan(output).any():
+    if torch.isnan(output).any() and DEBUG:
         print(f"[DEBUG] NaN detected in output of {module}")
 
 # -----------------------------
@@ -595,8 +595,8 @@ def main(args):
     out_features = 1
 
     if args.coxph_net == 'mlp':
-        num_nodes = [256, 128]
-        net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=False,
+        num_nodes = [2048, 2048]
+        net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=True,
                                       dropout=args.dropout, output_bias=False)
     elif args.coxph_net == 'linear':
         # Although nn.Linear is used here, the model is trained via the pycox framework.
