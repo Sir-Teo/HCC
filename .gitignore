@@ -13,3 +13,4 @@ wandb/
 checkpoints/
 weights/
 *.pt
+__pycache__/
