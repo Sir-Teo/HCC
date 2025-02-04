@@ -34,7 +34,7 @@ except ImportError:
     HAS_LIFELINES = False
 
 # Global debug flag
-DEBUG = False
+DEBUG = True
 
 # ======================================================
 # Debug hook: Print a message if a module outputs NaNs.
@@ -431,43 +431,45 @@ def load_dinov2_model(local_weights_path):
     return DinoV2Wrapper(base_model)
 
 # -----------------------------
-# Feature Extraction
+# Custom MLP with L1 Regularization
 # -----------------------------
-def extract_features(data_loader, model, device):
-    """
-    Extract features using the DINOv2 model which now returns one feature vector per image.
-    Patient-level features are computed by averaging the per-slice features.
-    """
-    model.eval()
-    features = []
-    durations = []
-    events = []
+class CustomMLP(nn.Module):
+    def __init__(self, in_features, num_nodes, out_features, dropout=0.0, l1_lambda=0.0):
+        """
+        Args:
+            in_features (int): Number of input features.
+            num_nodes (list of int): List with the number of nodes in each hidden layer.
+            out_features (int): Number of output features.
+            dropout (float): Dropout rate.
+            l1_lambda (float): Coefficient for L1 regularization.
+        """
+        super().__init__()
+        self.l1_lambda = l1_lambda
 
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Extracting Features"):
-            # For time-to-event, batch is (images, t, e)
-            images, t, e = batch
-            images = images.to(device)
-            batch_size, num_slices, C, H, W = images.size()
-            # Reshape so that each slice is an independent image.
-            images = images.view(batch_size * num_slices, C, H, W)
-            
-            # Get one feature vector per image.
-            feats = model.forward_features(images)  # Expected shape: (batch_size*num_slices, embed_dim)
-            feature_dim = feats.size(-1)
-            # Reshape back to (batch_size, num_slices, embed_dim)
-            feats = feats.view(batch_size, num_slices, feature_dim)
-            # Average the features across slices to get a patient-level feature.
-            feats = feats.mean(dim=1)
-            
-            features.append(feats.cpu().numpy())
-            durations.append(t.cpu().numpy())
-            events.append(e.cpu().numpy())
+        layers = []
+        prev_features = in_features
+        for nodes in num_nodes:
+            layers.append(nn.Linear(prev_features, nodes))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev_features = nodes
 
-    features = np.concatenate(features, axis=0)
-    durations = np.concatenate(durations, axis=0)
-    events = np.concatenate(events, axis=0)
-    return features, durations, events
+        layers.append(nn.Linear(prev_features, out_features))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+    def l1_regularization(self):
+        """
+        Computes the L1 regularization term for all linear layers.
+        """
+        l1_loss = 0.0
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                l1_loss += torch.sum(torch.abs(module.weight))
+        return self.l1_lambda * l1_loss
 
 # -----------------------------
 # Optional Risk Score Centering Wrapper
@@ -545,6 +547,55 @@ class ParamCheckerCallback(tt.callbacks.Callback):
                 print(f"[DEBUG] Parameter {name} contains NaNs.")
 
 # -----------------------------
+# Subclassed CoxPH Model to Include L1 Regularization in Loss
+# -----------------------------
+class CoxPHWithL1(CoxPH):
+    def loss(self, preds, durations, events):
+        base_loss = super().loss(preds, durations, events)
+        # If the network has the l1_regularization method, add its value to the loss
+        reg_loss = self.net.l1_regularization() if hasattr(self.net, 'l1_regularization') else 0.0
+        return base_loss + reg_loss
+
+# -----------------------------
+# Feature Extraction
+# -----------------------------
+def extract_features(data_loader, model, device):
+    """
+    Extract features using the DINOv2 model which now returns one feature vector per image.
+    Patient-level features are computed by averaging the per-slice features.
+    """
+    model.eval()
+    features = []
+    durations = []
+    events = []
+
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Extracting Features"):
+            # For time-to-event, batch is (images, t, e)
+            images, t, e = batch
+            images = images.to(device)
+            batch_size, num_slices, C, H, W = images.size()
+            # Reshape so that each slice is an independent image.
+            images = images.view(batch_size * num_slices, C, H, W)
+            
+            # Get one feature vector per image.
+            feats = model.forward_features(images)  # Expected shape: (batch_size*num_slices, embed_dim)
+            feature_dim = feats.size(-1)
+            # Reshape back to (batch_size, num_slices, embed_dim)
+            feats = feats.view(batch_size, num_slices, feature_dim)
+            # Average the features across slices to get a patient-level feature.
+            feats = feats.mean(dim=1)
+            
+            features.append(feats.cpu().numpy())
+            durations.append(t.cpu().numpy())
+            events.append(e.cpu().numpy())
+
+    features = np.concatenate(features, axis=0)
+    durations = np.concatenate(durations, axis=0)
+    events = np.concatenate(events, axis=0)
+    return features, durations, events
+
+# -----------------------------
 # Main Training and Evaluation Function
 # -----------------------------
 def main(args):
@@ -618,7 +669,7 @@ def main(args):
     # Quick correlation check
     corr_matrix = pd.DataFrame(x_train_std).corr()
     print("Max absolute correlation pairs (top 10):")
-    print(corr_matrix.abs().unstack().sort_values(ascending=False).head(10))
+    print(corr_matrix.abs().unstack().sort_values(ascending=False).head(100))
 
     # Basic validity check on survival data
     def validate_survival_data(durations, events):
@@ -640,6 +691,7 @@ def main(args):
         if not HAS_LIFELINES:
             raise ImportError("lifelines is not installed; cannot run traditional CoxPH.")
         feature_names = [f'feat_{i}' for i in range(x_train_std.shape[1])]
+
         train_df = pd.DataFrame(x_train_std, columns=feature_names)
         train_df['time'] = y_train_durations
         train_df['event'] = y_train_events
@@ -687,7 +739,7 @@ def main(args):
         return
 
     # -----------------------------
-    # pycox-based neural CoxPH
+    # pycox-based neural CoxPH with L1 Regularization
     # -----------------------------
     in_features = x_train_std.shape[1]
     print("Input feature dimension:", in_features)
@@ -695,14 +747,14 @@ def main(args):
 
     # Build the net (either MLP or single linear layer)
     if args.coxph_net == 'mlp':
+        # Use the custom MLP with L1 regularization.
         num_nodes = [2048, 2048]
-        net = tt.practical.MLPVanilla(
+        net = CustomMLP(
             in_features,
             num_nodes,
             out_features,
-            batch_norm=True,
             dropout=args.dropout,
-            output_bias=False
+            l1_lambda=args.l1_lambda  # regularization strength provided via command line
         )
     elif args.coxph_net == 'linear':
         net = nn.Linear(in_features, out_features, bias=False)
@@ -714,7 +766,8 @@ def main(args):
 
     net.register_forward_hook(nan_hook)
 
-    model = CoxPH(net, tt.optim.Adam)
+    # Use our subclassed CoxPH model that adds L1 regularization
+    model = CoxPHWithL1(net, tt.optim.Adam)
     model.optimizer.set_lr(args.learning_rate)
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
 
@@ -780,7 +833,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CoxPH model with DINOv2 features (local weights)")
+    parser = argparse.ArgumentParser(description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1 regularization")
 
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the root DICOM directory.")
@@ -788,7 +841,7 @@ if __name__ == "__main__":
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                         help='Directory to store/load preprocessed image tensors')
-    parser.add_argument('--batch_size', type=int, default=8, 
+    parser.add_argument('--batch_size', type=int, default=32, 
                         help='Batch size for data loaders')
     parser.add_argument('--num_slices', type=int, default=2, 
                         help='Number of slices per patient')
@@ -800,7 +853,7 @@ if __name__ == "__main__":
                         help='Directory to save outputs and models')
     parser.add_argument('--learning_rate', type=float, default=1e-6, 
                         help='Learning rate for the CoxPH model')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, 
+    parser.add_argument('--gradient_clip', type=float, default=0, 
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--center_risk', action='store_true', 
                         help='If set, center risk scores for numerical stability')
@@ -814,6 +867,8 @@ if __name__ == "__main__":
                         help='Regression method: "pycox" or "traditional" (lifelines) for CoxPH.')
     parser.add_argument('--dinov2_weights', type=str, required=True,
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
+    parser.add_argument('--l1_lambda', type=float, default=1e-5,
+                        help="L1 regularization strength for the custom MLP.")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
