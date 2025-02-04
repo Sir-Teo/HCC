@@ -27,6 +27,7 @@ srun python train.py \
     --center_risk \
     --num_samples_per_patient 10 \
     --coxph_net mlp \
+    --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_124999/teacher_checkpoint.pth
 
 
 

@@ -2,23 +2,36 @@ import argparse
 import os
 import random
 from collections import defaultdict
+
 import pandas as pd
 import numpy as np
+
 import pydicom
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
+
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
 from torch.utils.data import Dataset, DataLoader, default_collate
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import timm
+
+import torchtuples as tt
 from pycox.models import CoxPH
 from pycox.evaluation import EvalSurv
-import torchtuples as tt
+
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+# If you plan to compare with lifelines (traditional CoxPH):
+try:
+    from lifelines import CoxPHFitter
+    from lifelines.utils import concordance_index
+    HAS_LIFELINES = True
+except ImportError:
+    HAS_LIFELINES = False
 
 # Global debug flag
 DEBUG = False
@@ -34,8 +47,17 @@ def nan_hook(module, input, output):
 # Data Modules and Dataset
 # -----------------------------
 class HCCDataModule(pl.LightningDataModule):
-    def __init__(self, csv_file, dicom_root, model_type="linear", batch_size=2, num_slices=20, num_workers=2,
-                 preprocessed_root=None, num_samples_per_patient=1):
+    def __init__(
+        self,
+        csv_file,
+        dicom_root,
+        model_type="linear",
+        batch_size=2,
+        num_slices=20,
+        num_workers=2,
+        preprocessed_root=None,
+        num_samples_per_patient=1
+    ):
         super().__init__()
         self.csv_file = csv_file
         self.dicom_root = dicom_root
@@ -46,9 +68,9 @@ class HCCDataModule(pl.LightningDataModule):
         self.preprocessed_root = preprocessed_root
         self.num_samples_per_patient = num_samples_per_patient
 
-        # Basic preprocessing transforms (resize + normalization)
+        # Basic preprocessing transforms (resize + normalization) for 224x224
         self.preprocess_transform = T.Compose([
-            T.Resize((518, 518), antialias=True),
+            T.Resize((224, 224), antialias=True),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         self.transform = self.preprocess_transform
@@ -66,19 +88,31 @@ class HCCDataModule(pl.LightningDataModule):
         print(f"Label distribution in Test:\n{test_df['recurrence post tx'].value_counts()}")
 
         self.train_dataset = HCCDicomDataset(
-            csv_file=train_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
+            csv_file=train_df,
+            dicom_root=self.dicom_root,
+            model_type=self.model_type,
+            transform=self.preprocess_transform,
+            num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root,
+            num_samples_per_patient=self.num_samples_per_patient
         )
         self.val_dataset = HCCDicomDataset(
-            csv_file=val_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
+            csv_file=val_df,
+            dicom_root=self.dicom_root,
+            model_type=self.model_type,
+            transform=self.preprocess_transform,
+            num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root,
+            num_samples_per_patient=self.num_samples_per_patient
         )
         self.test_dataset = HCCDicomDataset(
-            csv_file=test_df, dicom_root=self.dicom_root, model_type=self.model_type,
-            transform=self.preprocess_transform, num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root, num_samples_per_patient=self.num_samples_per_patient
+            csv_file=test_df,
+            dicom_root=self.dicom_root,
+            model_type=self.model_type,
+            transform=self.preprocess_transform,
+            num_slices=self.num_slices,
+            preprocessed_root=self.preprocessed_root,
+            num_samples_per_patient=self.num_samples_per_patient
         )
 
     def train_dataloader(self):
@@ -109,9 +143,11 @@ class HCCDataModule(pl.LightningDataModule):
         )
 
     def train_collate_fn(self, batch):
+        # This ensures some events exist in each training batch (for time_to_event).
         if self.model_type == "time_to_event":
             events = [sample[2].item() for sample in batch]
-            if sum(events) < 2:  # Ensure at least 2 events per batch
+            # Force at least 2 events in the batch if possible.
+            if sum(events) < 2:
                 indices = random.sample(range(len(batch)), k=2)
                 for idx in indices:
                     x, t, e = batch[idx]
@@ -123,6 +159,7 @@ class HCCDataModule(pl.LightningDataModule):
             return default_collate(batch)
 
     def collate_fn(self, batch):
+        # Similar to train_collate_fn but for val/test sets
         if self.model_type == "time_to_event":
             events = [sample[2].item() for sample in batch]
             if sum(events) == 0 and len(batch) > 0:
@@ -136,8 +173,16 @@ class HCCDataModule(pl.LightningDataModule):
             return default_collate(batch)
 
 class HCCDicomDataset(Dataset):
-    def __init__(self, csv_file, dicom_root, model_type="linear", transform=None, num_slices=10,
-                 preprocessed_root=None, num_samples_per_patient=1):
+    def __init__(
+        self,
+        csv_file,
+        dicom_root,
+        model_type="linear",
+        transform=None,
+        num_slices=10,
+        preprocessed_root=None,
+        num_samples_per_patient=1
+    ):
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
@@ -167,32 +212,28 @@ class HCCDicomDataset(Dataset):
                   f"each yielding {self.num_samples_per_patient} sample(s).")
 
     def __len__(self):
-        # Each patient yields num_samples_per_patient samples.
         return len(self.patient_data) * self.num_samples_per_patient
 
     def __getitem__(self, idx):
-        # Determine which patient to sample from and which sample number (unused here)
         patient_idx = idx // self.num_samples_per_patient
         patient = self.patient_data[patient_idx]
         dicom_dir = patient['dicom_dir']
         image_stack = self.load_axial_series(dicom_dir)
 
         if DEBUG:
-            print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after processing: {image_stack.shape}")
+            print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after loading: {image_stack.shape}")
 
-        # If we loaded from preprocessed data, assume the transform was already applied.
+        # If we do not have preprocessed images, apply transformation slice by slice.
         if self.preprocessed_root is None and self.transform:
             transformed_images = []
             for img in image_stack:
                 img = self.transform(img)
                 transformed_images.append(img)
             image_stack = torch.stack(transformed_images)
-            if DEBUG:
-                print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after reapplying transform: {image_stack.shape}")
         else:
             if DEBUG:
                 print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - using preprocessed images (no re-transform).")
-            
+
         if self.model_type == "linear":
             return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
         elif self.model_type == "time_to_event":
@@ -228,6 +269,7 @@ class HCCDicomDataset(Dataset):
                 print(f"Error reading DICOM file {fname}: {e}")
                 continue
 
+        # Select the axial series
         axial_series = []
         for orient, dcm_paths in series_dict.items():
             if self.is_axial(orient):
@@ -243,7 +285,9 @@ class HCCDicomDataset(Dataset):
             except Exception:
                 return 0.0
 
+        # Sort by slice position
         axial_series.sort(key=get_slice_position)
+
         if DEBUG:
             print(f"[DEBUG] load_axial_series patient {patient_id}: {len(axial_series)} axial slices found.")
 
@@ -252,8 +296,7 @@ class HCCDicomDataset(Dataset):
             try:
                 dcm = pydicom.dcmread(dcm_path)
                 img = self.dicom_to_tensor(dcm)
-                if self.transform:
-                    img = self.transform(img)
+                # If we do NOT have a preprocessed root, we might do transform later in __getitem__.
                 image_stack.append(img)
             except Exception as e:
                 print(f"Error processing DICOM file {dcm_path}: {e}")
@@ -281,12 +324,14 @@ class HCCDicomDataset(Dataset):
         if DEBUG:
             print(f"[DEBUG] process_loaded_stack - current slices: {current_slices}, target: {self.num_slices}")
         if current_slices < self.num_slices:
+            # Pad with zeros
             pad_size = self.num_slices - current_slices
             padding = torch.zeros((pad_size, *image_stack.shape[1:]), dtype=image_stack.dtype)
             image_stack = torch.cat([image_stack, padding], dim=0)
             if DEBUG:
                 print(f"[DEBUG] Padded image_stack to shape: {image_stack.shape}")
         else:
+            # Randomly select self.num_slices slices
             selected_indices = torch.randperm(current_slices)[:self.num_slices]
             selected_indices, _ = torch.sort(selected_indices)
             image_stack = image_stack[selected_indices]
@@ -302,9 +347,12 @@ class HCCDicomDataset(Dataset):
         if norm < 1e-6:
             return False
         cross_normalized = cross / norm
-        return (np.abs(cross_normalized[0]) < 5e-2 and 
-                np.abs(cross_normalized[1]) < 5e-2 and 
-                np.abs(np.abs(cross_normalized[2]) - 1.0) < 5e-2)
+        # Check if the cross product is close to the Z-axis
+        return (
+            (abs(cross_normalized[0]) < 5e-2) and
+            (abs(cross_normalized[1]) < 5e-2) and
+            (abs(abs(cross_normalized[2]) - 1.0) < 5e-2)
+        )
 
     def dicom_to_tensor(self, dcm):
         img = dcm.pixel_array.astype(np.float32)
@@ -315,76 +363,111 @@ class HCCDicomDataset(Dataset):
             img = np.clip(img, -100, 400)
             img = (img + 100) / 500.0
         else:
+            # Simple min-max normalization for MRI (for example)
             img = (img - img.min()) / (img.max() - img.min() + 1e-6)
             img = img * 255.0
+        # Convert to 3-channel
         if img.ndim == 2:
             img = np.repeat(img[..., np.newaxis], 3, axis=-1)
         tensor_img = torch.from_numpy(img).permute(2, 0, 1)  # CHW format
         if DEBUG:
-            print(f"[DEBUG] dicom_to_tensor - tensor shape: {tensor_img.shape}, min: {tensor_img.min()}, max: {tensor_img.max()}")
+            print(f"[DEBUG] dicom_to_tensor - tensor shape: {tensor_img.shape}, min={tensor_img.min()}, max={tensor_img.max()}")
         return tensor_img
+
+# -----------------------------
+# DINOv2 Model Loader & Wrapper
+# -----------------------------
+class DinoV2Wrapper(nn.Module):
+    """
+    A wrapper around the DINOv2 model that returns one feature vector per image.
+    Here we average the patch tokens (excluding the [CLS] token) to obtain the image feature.
+    """
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+
+    def forward(self, x):
+        return self.base_model(x)
+
+    def forward_features(self, x):
+        token_embeddings = self.forward(x)
+        if token_embeddings.ndim == 3 and token_embeddings.size(1) > 1:
+            # Exclude the [CLS] token and average the remaining patch tokens.
+            patch_tokens = token_embeddings[:, 1:, :]
+            features = patch_tokens.mean(dim=1)  # shape: (B, embed_dim)
+            return features
+        elif token_embeddings.ndim == 2:
+            return token_embeddings
+        else:
+            raise ValueError(f"Unexpected token_embeddings shape: {token_embeddings.shape}")
+
+
+def load_dinov2_model(local_weights_path):
+    """
+    Loads DINOv2 with a local state dict. 
+    You must have a local copy of the DINOv2 repo so that the torch.hub call 
+    can load the architecture from 'facebookresearch/dinov2' with source='local'.
+    If you have the entire .pth or .pt file as a state_dict, load it with the model.
+    """
+    # Example: loading the ViT-Base/14 architecture from local hub
+    model_arch = "dinov2_vitb14"  # or whichever variant you have weights for
+    print(f"Loading {model_arch} from local hub...")
+
+    # 1. Create the model structure
+    base_model = torch.hub.load(
+        './dinov2',
+        model_arch,
+        source='local'  # or 'github' if you have a local GitHub clone
+    )
+
+    # 2. Load the local weights
+    checkpoint = torch.load(local_weights_path, map_location='cpu')
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        # Some weights are saved in a dict with 'model' key
+        base_model.load_state_dict(checkpoint['teacher']['model'])
+
+    print("Local DINOv2 weights loaded successfully.")
+    # Wrap it so we have .forward_features method
+    return DinoV2Wrapper(base_model)
 
 # -----------------------------
 # Feature Extraction
 # -----------------------------
 def extract_features(data_loader, model, device):
     """
-    Extract features using the DINO model by utilizing patch embeddings.
-    For each image, we call forward_features() to obtain the token embeddings,
-    remove the class token (if present), and average the remaining patch embeddings.
-    Then, slice-level features are averaged to produce a patient-level feature.
+    Extract features using the DINOv2 model which now returns one feature vector per image.
+    Patient-level features are computed by averaging the per-slice features.
     """
     model.eval()
     features = []
     durations = []
     events = []
-    batch_count = 0
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Extracting Features"):
-            images, t, e = batch  # images: (batch_size, num_slices, 3, H, W)
-            if DEBUG and batch_count == 0:
-                print(f"[DEBUG] extract_features - Batch {batch_count}: images shape: {images.shape}")
+            # For time-to-event, batch is (images, t, e)
+            images, t, e = batch
             images = images.to(device)
             batch_size, num_slices, C, H, W = images.size()
-            # Reshape to process each slice as an individual image.
+            # Reshape so that each slice is an independent image.
             images = images.view(batch_size * num_slices, C, H, W)
-            if DEBUG and batch_count == 0:
-                print(f"[DEBUG] extract_features - After reshaping: {images.shape}")
-            # Use forward_features to get the patch embeddings
-            if hasattr(model, "forward_features"):
-                # For ViTs, forward_features returns a tensor of shape (B, num_tokens, feature_dim)
-                token_embeddings = model.forward_features(images)
-                # Some DINO models output a [CLS] token as the first token.
-                # Remove the first token (if present) and average the patch tokens.
-                if token_embeddings.ndim == 3 and token_embeddings.size(1) > 1:
-                    patch_tokens = token_embeddings[:, 1:, :]  # exclude the class token
-                    feats = patch_tokens.mean(dim=1)  # average over patch tokens
-                else:
-                    # Fallback: simply average all tokens if no clear class token is available.
-                    feats = token_embeddings.mean(dim=1)
-            else:
-                # Fallback: use the model's __call__ (if forward_features is not available)
-                feats = model(images)
-            if DEBUG and batch_count == 0:
-                print(f"[DEBUG] extract_features - Feature shape from DINO (patch embeddings): {feats.shape}")
-            # Reshape back to (batch_size, num_slices, feature_dim) and average across slices.
-            feats = feats.view(batch_size, num_slices, -1)
-            feats = feats.mean(dim=1)  # Aggregate slice-level features into patient-level features
-            if DEBUG and batch_count == 0:
-                print(f"[DEBUG] extract_features - Averaged patient features shape: {feats.shape}")
+            
+            # Get one feature vector per image.
+            feats = model.forward_features(images)  # Expected shape: (batch_size*num_slices, embed_dim)
+            feature_dim = feats.size(-1)
+            # Reshape back to (batch_size, num_slices, embed_dim)
+            feats = feats.view(batch_size, num_slices, feature_dim)
+            # Average the features across slices to get a patient-level feature.
+            feats = feats.mean(dim=1)
+            
             features.append(feats.cpu().numpy())
             durations.append(t.cpu().numpy())
             events.append(e.cpu().numpy())
-            batch_count += 1
 
     features = np.concatenate(features, axis=0)
     durations = np.concatenate(durations, axis=0)
     events = np.concatenate(events, axis=0)
-    if DEBUG:
-        print(f"[DEBUG] extract_features - Final features shape: {features.shape}")
     return features, durations, events
-
 
 # -----------------------------
 # Optional Risk Score Centering Wrapper
@@ -397,7 +480,9 @@ class CenteredModel(nn.Module):
     def forward(self, x):
         out = self.net(x)
         if DEBUG:
-            print(f"[DEBUG] CenteredModel.forward - raw risk scores: mean={out.mean().item():.4f}, std={out.std().item():.4f}, min={out.min().item():.4f}, max={out.max().item():.4f}")
+            print(f"[DEBUG] CenteredModel.forward - raw risk scores: "
+                  f"mean={out.mean().item():.4f}, std={out.std().item():.4f}, "
+                  f"min={out.min().item():.4f}, max={out.max().item():.4f}")
         # Center risk scores for numerical stability
         return out - out.mean(dim=0, keepdim=True)
 
@@ -410,7 +495,6 @@ class GradientClippingCallback(tt.callbacks.Callback):
         self.clip_value = clip_value
 
     def on_batch_end(self):
-        # Clip gradients of the network parameters.
         torch.nn.utils.clip_grad_norm_(self.model.net.parameters(), self.clip_value)
         total_norm = 0.0
         for p in self.model.net.parameters():
@@ -434,18 +518,22 @@ class LossLogger(tt.callbacks.Callback):
             current_loss = log_df.iloc[-1]['train_loss']
             print(f"Epoch {len(self.epoch_losses)} - Train Loss: {current_loss:.4f}")
             self.epoch_losses.append(current_loss)
+            # Compute gradient norm
             total_norm = 0.0
             for p in self.model.net.parameters():
                 if p.grad is not None:
                     total_norm += p.grad.data.norm(2).item() ** 2
             total_norm = total_norm ** 0.5
             print(f"Epoch {len(self.epoch_losses)} - Gradient Norm: {total_norm:.4f}")
-            # Run a forward pass on a small sample, if available.
+
+            # Forward pass on a small sample if available
             if hasattr(self.model, "x_train_std") and self.model.x_train_std is not None:
                 sample_input = torch.tensor(self.model.x_train_std[:5]).to(next(self.model.net.parameters()).device)
                 with torch.no_grad():
                     risk_scores = self.model.net(sample_input)
-                print(f"[DEBUG] LossLogger - Sample risk scores: mean={risk_scores.mean().item():.4f}, std={risk_scores.std().item():.4f}, min={risk_scores.min().item():.4f}, max={risk_scores.max().item():.4f}")
+                print(f"[DEBUG] Sample risk scores: "
+                      f"mean={risk_scores.mean().item():.4f}, std={risk_scores.std().item():.4f}, "
+                      f"min={risk_scores.min().item():.4f}, max={risk_scores.max().item():.4f}")
 
 # -----------------------------
 # Callback to Check Model Parameters for NaNs
@@ -454,16 +542,14 @@ class ParamCheckerCallback(tt.callbacks.Callback):
     def on_epoch_end(self):
         for name, param in self.model.net.named_parameters():
             if torch.isnan(param).any():
-                #print(f"[DEBUG] Parameter {name} contains NaNs.")
-                pass
+                print(f"[DEBUG] Parameter {name} contains NaNs.")
 
 # -----------------------------
 # Main Training and Evaluation Function
 # -----------------------------
 def main(args):
-    # Set seeds for reproducibility
     seed_everything(42, workers=True)
-    
+
     # Initialize DataModule
     data_module = HCCDataModule(
         csv_file=args.csv_file,
@@ -477,15 +563,13 @@ def main(args):
     )
     data_module.setup()
 
-    # Load DINO model (ViT-based feature extractor)
+    # 1) Load DINOv2 from local weights
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dino_model = timm.create_model('timm/vit_base_patch16_224.dino', pretrained=True)
-    dino_model.to(device)
+    dino_model = load_dinov2_model(args.dinov2_weights)
+    dino_model = dino_model.to(device)
     dino_model.eval()
-    if hasattr(dino_model, 'head'):
-        dino_model.head = nn.Identity()
 
-    # Register a forward hook to catch NaNs in the DINO model
+    # Register a forward hook to catch NaNs in the DINOv2 model
     dino_model.register_forward_hook(nan_hook)
 
     # Create DataLoaders
@@ -493,7 +577,7 @@ def main(args):
     val_loader = data_module.val_dataloader()
     test_loader = data_module.test_dataloader()
 
-    # Extract features
+    # Extract features from DINOv2
     print("Extracting train features...")
     x_train, y_train_durations, y_train_events = extract_features(train_loader, dino_model, device)
     print("Extracting validation features...")
@@ -501,11 +585,13 @@ def main(args):
     print("Extracting test features...")
     x_test, y_test_durations, y_test_events = extract_features(test_loader, dino_model, device)
 
+    # Sanity checks
     print("Checking for NaNs in features...")
     print("x_train contains NaNs:", np.isnan(x_train).any())
     print("x_val contains NaNs:", np.isnan(x_val).any())
     print("x_test contains NaNs:", np.isnan(x_test).any())
 
+    # Remove zero-variance features if any
     variances = np.var(x_train, axis=0)
     if np.any(variances == 0):
         zero_var_features = np.where(variances == 0)[0]
@@ -514,27 +600,27 @@ def main(args):
         x_val = x_val[:, variances != 0]
         x_test = x_test[:, variances != 0]
 
+    # Prepare survival labels
     y_train = (y_train_durations, y_train_events)
     y_val = (y_val_durations, y_val_events)
     y_test = (y_test_durations, y_test_events)
-    if isinstance(y_train, tuple):
-        y_train_durations, y_train_events = y_train
-        y_val_durations, y_val_events = y_val
-        y_test_durations, y_test_events = y_test
-    else:
-        raise ValueError("Expected time_to_event labels")
 
     # Standardize features
     x_mapper = StandardScaler()
     x_train_std = x_mapper.fit_transform(x_train).astype('float32')
     x_val_std = x_mapper.transform(x_val).astype('float32')
     x_test_std = x_mapper.transform(x_test).astype('float32')
-    print("Feature value ranges (train):")
-    print(f"Min: {x_train_std.min()}, Max: {x_train_std.max()}")
-    print(f"Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
-    corr_matrix = pd.DataFrame(x_train_std).corr()
-    print(corr_matrix.abs().unstack().sort_values(ascending=False))
 
+    print("Feature value ranges (train):")
+    print(f"  Min: {x_train_std.min()}, Max: {x_train_std.max()}")
+    print(f"  Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
+
+    # Quick correlation check
+    corr_matrix = pd.DataFrame(x_train_std).corr()
+    print("Max absolute correlation pairs (top 10):")
+    print(corr_matrix.abs().unstack().sort_values(ascending=False).head(10))
+
+    # Basic validity check on survival data
     def validate_survival_data(durations, events):
         sort_idx = np.argsort(durations)
         sorted_durations = durations[sort_idx]
@@ -548,18 +634,11 @@ def main(args):
                 elif num_at_risk == 1:
                     print(f"Warning: Event at {current_time} has only 1 at-risk.")
     validate_survival_data(y_train_durations, y_train_events)
-    print("Minimum duration:", np.min(y_train_durations))
-    if np.any(y_train_durations <= 0):
-        print("Found non-positive durations. Correcting...")
-        y_train_durations[y_train_durations <= 0] = 1e-6
 
-    # -----------------------------
-    # If traditional regression is requested, use lifelines.
-    # -----------------------------
+    # If you choose to do "traditional" lifelines CoxPH:
     if args.coxph_method == 'traditional':
-        from lifelines import CoxPHFitter
-        from lifelines.utils import concordance_index
-
+        if not HAS_LIFELINES:
+            raise ImportError("lifelines is not installed; cannot run traditional CoxPH.")
         feature_names = [f'feat_{i}' for i in range(x_train_std.shape[1])]
         train_df = pd.DataFrame(x_train_std, columns=feature_names)
         train_df['time'] = y_train_durations
@@ -569,7 +648,7 @@ def main(args):
         cph.fit(train_df, duration_col='time', event_col='event')
         print(cph.summary)
 
-        # Evaluate on validation set
+        # Validation
         val_df = pd.DataFrame(x_val_std, columns=feature_names)
         val_df['time'] = y_val_durations
         val_df['event'] = y_val_events
@@ -577,7 +656,7 @@ def main(args):
         c_index_val = concordance_index(val_df['time'], -val_pred, val_df['event'])
         print(f"Validation Concordance Index: {c_index_val}")
 
-        # Evaluate on test set
+        # Test
         test_df = pd.DataFrame(x_test_std, columns=feature_names)
         test_df['time'] = y_test_durations
         test_df['event'] = y_test_events
@@ -605,42 +684,43 @@ def main(args):
         plt.title("Survival Functions for Test Samples")
         plt.savefig(os.path.join(args.output_dir, "test_survival_functions.png"))
         plt.close()
-
         return
 
     # -----------------------------
-    # Else, use the pycox (neural network) based CoxPH model.
+    # pycox-based neural CoxPH
     # -----------------------------
-    # Define the neural network for CoxPH (optionally, you can still choose 'mlp' vs. 'linear')
     in_features = x_train_std.shape[1]
     print("Input feature dimension:", in_features)
     out_features = 1
 
+    # Build the net (either MLP or single linear layer)
     if args.coxph_net == 'mlp':
         num_nodes = [2048, 2048]
-        net = tt.practical.MLPVanilla(in_features, num_nodes, out_features, batch_norm=True,
-                                      dropout=args.dropout, output_bias=False)
+        net = tt.practical.MLPVanilla(
+            in_features,
+            num_nodes,
+            out_features,
+            batch_norm=True,
+            dropout=args.dropout,
+            output_bias=False
+        )
     elif args.coxph_net == 'linear':
-        # Although nn.Linear is used here, the model is trained via the pycox framework.
-        # (This branch is provided if you want to experiment with a one-layer network.)
         net = nn.Linear(in_features, out_features, bias=False)
     else:
-        raise ValueError("Unknown coxph_net option. Choose either 'mlp' or 'linear'.")
+        raise ValueError("Unknown coxph_net option. Choose 'mlp' or 'linear'.")
 
     if args.center_risk:
         net = CenteredModel(net)
-    
-    # Register a forward hook on the network to detect NaNs.
+
     net.register_forward_hook(nan_hook)
-    
+
     model = CoxPH(net, tt.optim.Adam)
     model.optimizer.set_lr(args.learning_rate)
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
 
-    # Save standardized training features for debug purposes.
+    # Save standardized train features for debugging/logging
     model.x_train_std = x_train_std
 
-    # Set up callbacks (including our new ParamCheckerCallback).
     callbacks = [tt.callbacks.EarlyStopping(), LossLogger(), ParamCheckerCallback()]
     if args.gradient_clip > 0:
         callbacks.insert(1, GradientClippingCallback(args.gradient_clip))
@@ -649,25 +729,35 @@ def main(args):
     batch_size = args.batch_size
 
     print("Training the CoxPH model...")
-    log = model.fit(x_train_std, (y_train_durations, y_train_events), batch_size, args.epochs, callbacks, verbose,
-                    val_data=(x_val_std, (y_val_durations, y_val_events)), val_batch_size=batch_size)
-    
+    log = model.fit(
+        x_train_std,
+        (y_train_durations, y_train_events),
+        batch_size,
+        args.epochs,
+        callbacks,
+        verbose,
+        val_data=(x_val_std, (y_val_durations, y_val_events)),
+        val_batch_size=batch_size
+    )
+
+    # Plot training log
     plt.figure()
     log.plot()
-    plt.title("Training Log")
+    plt.title("Training Log (Loss)")
     plt.savefig(os.path.join(args.output_dir, "training_log.png"))
     plt.close()
 
     partial_ll = model.partial_log_likelihood(x_val_std, (y_val_durations, y_val_events)).mean()
     print(f"Partial Log-Likelihood on Validation Set: {partial_ll}")
 
+    # Compute baseline hazards and evaluate
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_test_std)
     plt.figure()
     surv.iloc[:, :5].plot()
-    plt.ylabel('S(t | x)')
-    plt.xlabel('Time')
-    plt.title("Survival Functions for Test Set")
+    plt.ylabel("S(t | x)")
+    plt.xlabel("Time")
+    plt.title("Survival Functions for Test Samples")
     plt.savefig(os.path.join(args.output_dir, "survival_functions.png"))
     plt.close()
 
@@ -684,35 +774,47 @@ def main(args):
     plt.ylabel("Brier Score")
     plt.savefig(os.path.join(args.output_dir, "brier_score.png"))
     plt.close()
-    print(f"Integrated Brier Score: {ev.integrated_brier_score(time_grid)}")
-    print(f"Integrated Negative Binomial Log-Likelihood: {ev.integrated_nbll(time_grid)}")
 
-# -----------------------------
-# Argument Parsing and Entry Point
-# -----------------------------
+    print(f"Integrated Brier Score: {ev.integrated_brier_score(time_grid)}")
+    print(f"Integrated NBLL: {ev.integrated_nbll(time_grid)}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CoxPH model with DINO features")
+    parser = argparse.ArgumentParser(description="Train CoxPH model with DINOv2 features (local weights)")
+
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the root DICOM directory.")
     parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
                         help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
-    parser.add_argument('--preprocessed_root', type=str, default=None, help='Directory to store preprocessed image tensors')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for data loaders')
-    parser.add_argument('--num_slices', type=int, default=2, help='Number of slices per patient')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loaders')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--output_dir', type=str, default='checkpoints', help='Directory to save outputs and models')
-    parser.add_argument('--learning_rate', type=float, default=1e-6, help='Learning rate for the CoxPH model')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping threshold. Set 0 to disable.')
-    parser.add_argument('--center_risk', action='store_true', help='If set, center risk scores for numerical stability')
-    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate for the CoxPH network')
+    parser.add_argument('--preprocessed_root', type=str, default=None, 
+                        help='Directory to store/load preprocessed image tensors')
+    parser.add_argument('--batch_size', type=int, default=8, 
+                        help='Batch size for data loaders')
+    parser.add_argument('--num_slices', type=int, default=2, 
+                        help='Number of slices per patient')
+    parser.add_argument('--num_workers', type=int, default=4, 
+                        help='Number of workers for data loaders')
+    parser.add_argument('--epochs', type=int, default=20, 
+                        help='Number of training epochs')
+    parser.add_argument('--output_dir', type=str, default='checkpoints', 
+                        help='Directory to save outputs and models')
+    parser.add_argument('--learning_rate', type=float, default=1e-6, 
+                        help='Learning rate for the CoxPH model')
+    parser.add_argument('--gradient_clip', type=float, default=1.0, 
+                        help='Gradient clipping threshold. Set 0 to disable.')
+    parser.add_argument('--center_risk', action='store_true', 
+                        help='If set, center risk scores for numerical stability')
+    parser.add_argument('--dropout', type=float, default=0.0, 
+                        help='Dropout rate for the MLP if used')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample from each patient per epoch')
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'],
-                        help='Type of network for pycox survival regression: "mlp" uses a multilayer perceptron, "linear" uses a single linear layer.')
+                        help='Type of network for pycox survival regression.')
     parser.add_argument('--coxph_method', type=str, default='pycox', choices=['pycox', 'traditional'],
-                        help='Regression method: "pycox" uses a neural network approach, "traditional" uses lifelines for standard CoxPH regression.')
-    
+                        help='Regression method: "pycox" or "traditional" (lifelines) for CoxPH.')
+    parser.add_argument('--dinov2_weights', type=str, required=True,
+                        help="Path to your local DINOv2 state dict file (.pth or .pt).")
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     main(args)
