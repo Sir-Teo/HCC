@@ -1,10 +1,26 @@
 # HCC
 
-This is the repository for the Hepatocellular Carcinoma Recurrence Prediction project.
+This is the repository for the Hepatocellular Carcinoma Recurrence Prediction project. This repository implements a survival analysis pipeline that leverages features extracted from DINOv2 and a Cox Proportional Hazards (CoxPH) model using either a custom multi-layer perceptron (MLP) or a linear layer. The code is organized into modular components for data handling, feature extraction, model building, and training, as well as dinov2 SSL code
+
 
 ## Dataset
 
 patient 13850412 might not have axial
+
+## Training
+
+```
+python main.py \
+    --dicom_root /path/to/dicom \
+    --csv_file processed_patient_labels.csv \
+    --dinov2_weights /path/to/dinov2_weights.pth \
+    --output_dir checkpoints \
+    --batch_size 32 \
+    --num_slices 2 \
+    --epochs 20
+```
+
+---
 
 ## SSL 
 

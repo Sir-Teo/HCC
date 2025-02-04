@@ -1,4 +1,3 @@
-# main.py
 import argparse
 import os
 import numpy as np
@@ -10,13 +9,12 @@ from pytorch_lightning import seed_everything
 
 import torchtuples as tt
 from pycox.evaluation import EvalSurv
-
-# Import our modules
 from data.dataset import HCCDataModule
 from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
 from utils.helpers import extract_features
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
+
 
 def validate_survival_data(durations, events):
     sort_idx = np.argsort(durations)
@@ -30,6 +28,52 @@ def validate_survival_data(durations, events):
                 raise ValueError(f"Event at {current_time} has no at-risk individuals.")
             elif num_at_risk == 1:
                 print(f"Warning: Event at {current_time} has only 1 at-risk.")
+
+
+def upsample_training_data(x_train, durations, events):
+    """
+    Upsample the minority class (i.e. the class with fewer samples) so that
+    both classes have equal representation.
+    
+    Parameters:
+      x_train: Feature array.
+      durations: Array of durations.
+      events: Array of event indicators.
+    
+    Returns:
+      x_train_upsampled, durations_upsampled, events_upsampled
+    """
+    # Identify indices for the two classes.
+    idx_event = np.where(events == 1)[0]
+    idx_no_event = np.where(events == 0)[0]
+
+    # Determine which class is the minority.
+    if len(idx_event) == 0 or len(idx_no_event) == 0:
+        print("Warning: One of the classes is empty. Skipping upsampling.")
+        return x_train, durations, events
+
+    if len(idx_event) < len(idx_no_event):
+        minority_idx = idx_event
+        majority_idx = idx_no_event
+    else:
+        minority_idx = idx_no_event
+        majority_idx = idx_event
+
+    n_to_sample = len(majority_idx) - len(minority_idx)
+    # Sample with replacement from the minority indices.
+    sampled_minority_idx = np.random.choice(minority_idx, size=n_to_sample, replace=True)
+    # Combine the original indices with the new sampled indices.
+    new_indices = np.concatenate([np.arange(len(events)), sampled_minority_idx])
+    # Shuffle indices to avoid ordering effects.
+    new_indices = np.random.permutation(new_indices)
+
+    x_train_upsampled = x_train[new_indices]
+    durations_upsampled = durations[new_indices]
+    events_upsampled = events[new_indices]
+
+    print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples.")
+    return x_train_upsampled, durations_upsampled, events_upsampled
+
 
 def main(args):
     seed_everything(42, workers=True)
@@ -50,7 +94,7 @@ def main(args):
     dino_model = load_dinov2_model(args.dinov2_weights)
     dino_model = dino_model.to(device)
     dino_model.eval()
-    dino_model.register_forward_hook(lambda m, i, o: None)  # Optionally register nan_hook
+    dino_model.register_forward_hook(lambda m, i, o: None)  # Optionally register a hook
 
     train_loader = data_module.train_dataloader()
     val_loader = data_module.val_dataloader()
@@ -76,6 +120,13 @@ def main(args):
         x_val = x_val[:, variances != 0]
         x_test = x_test[:, variances != 0]
 
+    # Optionally perform upsampling on the training data if the flag is set.
+    if args.upsampling:
+        print("Performing upsampling on training data...")
+        x_train, y_train_durations, y_train_events = upsample_training_data(
+            x_train, y_train_durations, y_train_events
+        )
+
     y_train = (y_train_durations, y_train_events)
     y_val = (y_val_durations, y_val_events)
     y_test = (y_test_durations, y_test_events)
@@ -91,21 +142,13 @@ def main(args):
 
     validate_survival_data(y_train_durations, y_train_events)
 
-    # For traditional CoxPH via lifelines (if desired), you could insert that branch here.
-
     in_features = x_train_std.shape[1]
     print("Input feature dimension:", in_features)
     out_features = 1
 
     if args.coxph_net == 'mlp':
-        num_nodes = [2048, 2048]
-        net = CustomMLP(
-            in_features,
-            num_nodes,
-            out_features,
-            dropout=args.dropout,
-            l1_lambda=args.l1_lambda
-        )
+        # Instantiate the custom MLP with a fixed architecture
+        net = CustomMLP(in_features, out_features, dropout=args.dropout)
     elif args.coxph_net == 'linear':
         from torch import nn
         net = nn.Linear(in_features, out_features, bias=False)
@@ -115,9 +158,10 @@ def main(args):
     if args.center_risk:
         net = CenteredModel(net)
 
-    net.register_forward_hook(lambda m, i, o: None)  # Optionally register nan_hook
+    net.register_forward_hook(lambda m, i, o: None)  # Optionally register a hook
 
-    model = CoxPHWithL1(net, tt.optim.Adam)
+    # Create the CoxPH model with the custom loss including L1/L2 regularization.
+    model = CoxPHWithL1(net, tt.optim.Adam, alpha=args.alpha, gamma=args.gamma)
     model.optimizer.set_lr(args.learning_rate)
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
 
@@ -178,9 +222,10 @@ def main(args):
     print(f"Integrated Brier Score: {ev.integrated_brier_score(time_grid)}")
     print(f"Integrated NBLL: {ev.integrated_nbll(time_grid)}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1 regularization"
+        description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1/L2 regularization"
     )
 
     parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
@@ -199,13 +244,13 @@ if __name__ == "__main__":
                         help='Number of training epochs')
     parser.add_argument('--output_dir', type=str, default='checkpoints', 
                         help='Directory to save outputs and models')
-    parser.add_argument('--learning_rate', type=float, default=1e-6, 
+    parser.add_argument('--learning_rate', type=float, default=1e-8, 
                         help='Learning rate for the CoxPH model')
-    parser.add_argument('--gradient_clip', type=float, default=0, 
+    parser.add_argument('--gradient_clip', type=float, default=0.05, 
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--center_risk', action='store_true', 
                         help='If set, center risk scores for numerical stability')
-    parser.add_argument('--dropout', type=float, default=0.0, 
+    parser.add_argument('--dropout', type=float, default=0.1, 
                         help='Dropout rate for the MLP if used')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample from each patient per epoch')
@@ -215,8 +260,13 @@ if __name__ == "__main__":
                         help='Regression method: "pycox" or "traditional" (lifelines) for CoxPH.')
     parser.add_argument('--dinov2_weights', type=str, required=True,
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
-    parser.add_argument('--l1_lambda', type=float, default=1e-5,
-                        help="L1 regularization strength for the custom MLP.")
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help="Weight for the regularization term relative to the Cox loss")
+    parser.add_argument('--gamma', type=float, default=0.5,
+                        help="Relative weight between L1 and L2 in the regularizer")
+    # New flag for upsampling
+    parser.add_argument('--upsampling', action='store_true',
+                        help="If set, perform upsampling of the minority class in the training data")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
