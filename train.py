@@ -15,6 +15,9 @@ from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
 from utils.helpers import extract_features
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
 
+# New import for additional visualization
+from lifelines import KaplanMeierFitter
+
 
 def validate_survival_data(durations, events):
     sort_idx = np.argsort(durations)
@@ -186,9 +189,12 @@ def main(args):
         val_batch_size=batch_size
     )
 
-    plt.figure()
+    # Plot the training log (loss curve)
+    plt.figure(figsize=(8, 6))
     log.plot()
     plt.title("Training Log (Loss)")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.savefig(os.path.join(args.output_dir, "training_log.png"))
     plt.close()
 
@@ -197,7 +203,9 @@ def main(args):
 
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_test_std)
-    plt.figure()
+
+    # Plot a few survival functions from the test set
+    plt.figure(figsize=(8, 6))
     surv.iloc[:, :5].plot()
     plt.ylabel("S(t | x)")
     plt.xlabel("Time")
@@ -211,7 +219,7 @@ def main(args):
 
     time_grid = np.linspace(y_test_durations.min(), y_test_durations.max(), 100)
     brier_score = ev.brier_score(time_grid)
-    plt.figure()
+    plt.figure(figsize=(8, 6))
     brier_score.plot()
     plt.title("Brier Score Over Time")
     plt.xlabel("Time")
@@ -219,9 +227,83 @@ def main(args):
     plt.savefig(os.path.join(args.output_dir, "brier_score.png"))
     plt.close()
 
-    print(f"Integrated Brier Score: {ev.integrated_brier_score(time_grid)}")
-    print(f"Integrated NBLL: {ev.integrated_nbll(time_grid)}")
+    integrated_brier = ev.integrated_brier_score(time_grid)
+    integrated_nbll = ev.integrated_nbll(time_grid)
+    print(f"Integrated Brier Score: {integrated_brier}")
+    print(f"Integrated NBLL: {integrated_nbll}")
 
+    # ---- Additional Visualization & Interpretation ----
+    # 1. Risk Stratification: Divide test patients into two groups (high and low risk)
+    #    using the median predicted risk.
+    #    The model’s risk can be approximated by the linear predictor.
+    risk_scores = model.predict(x_test_std).reshape(-1)
+    median_risk = np.median(risk_scores)
+    low_risk_idx = risk_scores <= median_risk
+    high_risk_idx = risk_scores > median_risk
+
+    # Plot histogram of predicted risk scores.
+    plt.figure(figsize=(8, 6))
+    plt.hist(risk_scores, bins=30, color='skyblue', edgecolor='k')
+    plt.axvline(median_risk, color='red', linestyle='--', label=f'Median Risk ({median_risk:.2f})')
+    plt.xlabel("Predicted Risk Score")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Predicted Risk Scores")
+    plt.legend()
+    plt.savefig(os.path.join(args.output_dir, "risk_score_distribution.png"))
+    plt.close()
+
+    # Kaplan-Meier curves for low- and high-risk groups
+    kmf_low = KaplanMeierFitter()
+    kmf_high = KaplanMeierFitter()
+
+    plt.figure(figsize=(8, 6))
+    kmf_low.fit(y_test_durations[low_risk_idx], event_observed=y_test_events[low_risk_idx], label='Low Risk')
+    ax = kmf_low.plot(ci_show=True, color='green')
+    kmf_high.fit(y_test_durations[high_risk_idx], event_observed=y_test_events[high_risk_idx], label='High Risk')
+    kmf_high.plot(ci_show=True, ax=ax, color='red')
+    plt.title("Kaplan-Meier Survival Curves by Risk Group")
+    plt.xlabel("Time")
+    plt.ylabel("Survival Probability")
+    plt.legend()
+    plt.savefig(os.path.join(args.output_dir, "km_risk_stratification.png"))
+    plt.close()
+
+    # 2. Calibration Plot at a Fixed Time Point (e.g., 2 years)
+    #    Compare the predicted survival probability at 2 years with the observed survival probability.
+    fixed_time = 24  # months (or change to the relevant time unit)
+    # Obtain predicted survival probabilities at the fixed time.
+    predicted_surv_probs = surv.loc[fixed_time].values
+    # Group patients by deciles of predicted survival probability.
+    decile_bins = np.percentile(predicted_surv_probs, np.arange(0, 110, 10))
+    bin_indices = np.digitize(predicted_surv_probs, decile_bins, right=True)
+
+    observed_probs = []
+    predicted_avg = []
+    for i in range(1, 11):
+        idx = bin_indices == i
+        if np.sum(idx) > 0:
+            # Use Kaplan-Meier to get observed survival at fixed_time for the bin.
+            kmf = KaplanMeierFitter()
+            kmf.fit(y_test_durations[idx], event_observed=y_test_events[idx])
+            observed_probs.append(kmf.predict(fixed_time))
+            predicted_avg.append(np.mean(predicted_surv_probs[idx]))
+    plt.figure(figsize=(8, 6))
+    plt.plot(predicted_avg, observed_probs, 'o-', label='Calibration Curve')
+    plt.plot([0, 1], [0, 1], '--', color='gray', label='Ideal Calibration')
+    plt.xlabel("Predicted Survival Probability at {} months".format(fixed_time))
+    plt.ylabel("Observed Survival Probability")
+    plt.title("Calibration Plot at {} months".format(fixed_time))
+    plt.legend()
+    plt.savefig(os.path.join(args.output_dir, "calibration_plot.png"))
+    plt.close()
+
+    # 3. Additional statistics reporting
+    print("\nAdditional Statistics:")
+    print(f"  Mean Predicted Risk Score: {np.mean(risk_scores):.4f}")
+    print(f"  Std of Predicted Risk Scores: {np.std(risk_scores):.4f}")
+    print(f"  Median Predicted Survival Probability at {fixed_time} months: {np.median(predicted_surv_probs):.4f}")
+    print(f"  Observed Survival Probability at {fixed_time} months (overall): "
+          f"{KaplanMeierFitter().fit(y_test_durations, event_observed=y_test_events).predict(fixed_time):.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
