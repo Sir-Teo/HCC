@@ -17,8 +17,9 @@ def extract_features(data_loader, model, device):
         for batch in tqdm(data_loader, desc="Extracting Features"):
             images, t, e = batch
             images = images.to(device)
-            batch_size, num_slices, C, H, W = images.size()
-            images = images.view(batch_size * num_slices, C, H, W)
+            batch_size, num_samples, num_slices, C, H, W = images.size()
+            images = images.view(batch_size * num_samples * num_slices, C, H, W)
+
             
             feats = model.forward_features(images)
             feature_dim = feats.size(-1)

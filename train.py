@@ -3,6 +3,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 import torch
 from pytorch_lightning import seed_everything
@@ -15,8 +16,12 @@ from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
 from utils.helpers import extract_features
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
 
-# New import for additional visualization
+# New imports for additional visualization and statistics
 from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
+
+# Use a seaborn style for improved aesthetics
+sns.set(style="whitegrid")
 
 
 def validate_survival_data(durations, events):
@@ -35,22 +40,11 @@ def validate_survival_data(durations, events):
 
 def upsample_training_data(x_train, durations, events):
     """
-    Upsample the minority class (i.e. the class with fewer samples) so that
-    both classes have equal representation.
-    
-    Parameters:
-      x_train: Feature array.
-      durations: Array of durations.
-      events: Array of event indicators.
-    
-    Returns:
-      x_train_upsampled, durations_upsampled, events_upsampled
+    Upsample the minority class so that both classes have equal representation.
     """
-    # Identify indices for the two classes.
     idx_event = np.where(events == 1)[0]
     idx_no_event = np.where(events == 0)[0]
 
-    # Determine which class is the minority.
     if len(idx_event) == 0 or len(idx_no_event) == 0:
         print("Warning: One of the classes is empty. Skipping upsampling.")
         return x_train, durations, events
@@ -63,11 +57,8 @@ def upsample_training_data(x_train, durations, events):
         majority_idx = idx_event
 
     n_to_sample = len(majority_idx) - len(minority_idx)
-    # Sample with replacement from the minority indices.
     sampled_minority_idx = np.random.choice(minority_idx, size=n_to_sample, replace=True)
-    # Combine the original indices with the new sampled indices.
     new_indices = np.concatenate([np.arange(len(events)), sampled_minority_idx])
-    # Shuffle indices to avoid ordering effects.
     new_indices = np.random.permutation(new_indices)
 
     x_train_upsampled = x_train[new_indices]
@@ -89,7 +80,7 @@ def main(args):
         num_slices=args.num_slices,
         num_workers=args.num_workers,
         preprocessed_root=args.preprocessed_root,
-        num_samples_per_patient=args.num_samples_per_patient
+        num_samples=args.num_samples_per_patient
     )
     data_module.setup()
 
@@ -123,7 +114,6 @@ def main(args):
         x_val = x_val[:, variances != 0]
         x_test = x_test[:, variances != 0]
 
-    # Optionally perform upsampling on the training data if the flag is set.
     if args.upsampling:
         print("Performing upsampling on training data...")
         x_train, y_train_durations, y_train_events = upsample_training_data(
@@ -150,7 +140,6 @@ def main(args):
     out_features = 1
 
     if args.coxph_net == 'mlp':
-        # Instantiate the custom MLP with a fixed architecture
         net = CustomMLP(in_features, out_features, dropout=args.dropout)
     elif args.coxph_net == 'linear':
         from torch import nn
@@ -161,9 +150,8 @@ def main(args):
     if args.center_risk:
         net = CenteredModel(net)
 
-    net.register_forward_hook(lambda m, i, o: None)  # Optionally register a hook
+    net.register_forward_hook(lambda m, i, o: None)
 
-    # Create the CoxPH model with the custom loss including L1/L2 regularization.
     model = CoxPHWithL1(net, tt.optim.Adam, alpha=args.alpha, gamma=args.gamma)
     model.optimizer.set_lr(args.learning_rate)
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
@@ -173,7 +161,7 @@ def main(args):
     callbacks = [tt.callbacks.EarlyStopping(), LossLogger(), ParamCheckerCallback()]
     if args.gradient_clip > 0:
         callbacks.insert(1, GradientClippingCallback(args.gradient_clip))
-    
+
     verbose = True
     batch_size = args.batch_size
 
@@ -189,12 +177,14 @@ def main(args):
         val_batch_size=batch_size
     )
 
-    # Plot the training log (loss curve)
-    plt.figure(figsize=(8, 6))
+    # Enhanced Training Log Plot
+    plt.figure(figsize=(10, 6))
     log.plot()
-    plt.title("Training Log (Loss)")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.title("Training Loss Over Epochs", fontsize=14)
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.grid(True)
+    plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "training_log.png"))
     plt.close()
 
@@ -204,12 +194,15 @@ def main(args):
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_test_std)
 
-    # Plot a few survival functions from the test set
-    plt.figure(figsize=(8, 6))
-    surv.iloc[:, :5].plot()
-    plt.ylabel("S(t | x)")
-    plt.xlabel("Time")
-    plt.title("Survival Functions for Test Samples")
+    # Improved Survival Functions Plot
+    plt.figure(figsize=(10, 6))
+    surv.iloc[:, :5].plot(lw=2)
+    plt.ylabel("Survival Probability", fontsize=12)
+    plt.xlabel("Time", fontsize=12)
+    plt.title("Survival Functions for Test Samples", fontsize=14)
+    plt.legend(title="Sample Index", fontsize=10)
+    plt.grid(True)
+    plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "survival_functions.png"))
     plt.close()
 
@@ -219,11 +212,13 @@ def main(args):
 
     time_grid = np.linspace(y_test_durations.min(), y_test_durations.max(), 100)
     brier_score = ev.brier_score(time_grid)
-    plt.figure(figsize=(8, 6))
-    brier_score.plot()
-    plt.title("Brier Score Over Time")
-    plt.xlabel("Time")
-    plt.ylabel("Brier Score")
+    plt.figure(figsize=(10, 6))
+    brier_score.plot(lw=2)
+    plt.title("Brier Score Over Time", fontsize=14)
+    plt.xlabel("Time", fontsize=12)
+    plt.ylabel("Brier Score", fontsize=12)
+    plt.grid(True)
+    plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "brier_score.png"))
     plt.close()
 
@@ -233,22 +228,26 @@ def main(args):
     print(f"Integrated NBLL: {integrated_nbll}")
 
     # ---- Additional Visualization & Interpretation ----
-    # 1. Risk Stratification: Divide test patients into two groups (high and low risk)
-    #    using the median predicted risk.
-    #    The model’s risk can be approximated by the linear predictor.
+    # Risk Stratification based on the median predicted risk
     risk_scores = model.predict(x_test_std).reshape(-1)
     median_risk = np.median(risk_scores)
     low_risk_idx = risk_scores <= median_risk
     high_risk_idx = risk_scores > median_risk
 
-    # Plot histogram of predicted risk scores.
-    plt.figure(figsize=(8, 6))
-    plt.hist(risk_scores, bins=30, color='skyblue', edgecolor='k')
+    # Enhanced Risk Score Distribution Plot with Histogram and Inset Boxplot
+    plt.figure(figsize=(10, 6))
+    sns.histplot(risk_scores, bins=30, color='skyblue', edgecolor='k')
     plt.axvline(median_risk, color='red', linestyle='--', label=f'Median Risk ({median_risk:.2f})')
-    plt.xlabel("Predicted Risk Score")
-    plt.ylabel("Frequency")
-    plt.title("Distribution of Predicted Risk Scores")
+    plt.xlabel("Predicted Risk Score", fontsize=12)
+    plt.ylabel("Frequency", fontsize=12)
+    plt.title("Distribution of Predicted Risk Scores", fontsize=14)
     plt.legend()
+    plt.grid(True)
+    # Inset boxplot
+    inset_ax = plt.axes([0.65, 0.65, 0.2, 0.2])
+    sns.boxplot(x=risk_scores, ax=inset_ax, color='lightgreen')
+    inset_ax.set_xlabel("")
+    inset_ax.set_yticks([])
     plt.savefig(os.path.join(args.output_dir, "risk_score_distribution.png"))
     plt.close()
 
@@ -256,23 +255,45 @@ def main(args):
     kmf_low = KaplanMeierFitter()
     kmf_high = KaplanMeierFitter()
 
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(10, 6))
     kmf_low.fit(y_test_durations[low_risk_idx], event_observed=y_test_events[low_risk_idx], label='Low Risk')
-    ax = kmf_low.plot(ci_show=True, color='green')
+    ax = kmf_low.plot(ci_show=True, color='green', lw=2)
     kmf_high.fit(y_test_durations[high_risk_idx], event_observed=y_test_events[high_risk_idx], label='High Risk')
-    kmf_high.plot(ci_show=True, ax=ax, color='red')
-    plt.title("Kaplan-Meier Survival Curves by Risk Group")
-    plt.xlabel("Time")
-    plt.ylabel("Survival Probability")
-    plt.legend()
+    kmf_high.plot(ci_show=True, ax=ax, color='red', lw=2)
+    plt.title("Kaplan-Meier Survival Curves by Risk Group", fontsize=14)
+    plt.xlabel("Time", fontsize=12)
+    plt.ylabel("Survival Probability", fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True)
+    plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "km_risk_stratification.png"))
     plt.close()
 
-    # 2. Calibration Plot at a Fixed Time Point (e.g., 2 years)
-    #    Compare the predicted survival probability at 2 years with the observed survival probability.
-    fixed_time = 24  # months (or change to the relevant time unit)
-    # Obtain predicted survival probabilities at the fixed time.
+    # Log-Rank Test between risk groups
+    lr_results = logrank_test(
+        y_test_durations[low_risk_idx],
+        y_test_durations[high_risk_idx],
+        event_observed_A=y_test_events[low_risk_idx],
+        event_observed_B=y_test_events[high_risk_idx]
+    )
+    print(f"Log-Rank Test p-value: {lr_results.p_value:.4f}")
+
+    # Median survival times for each group
+    median_low = kmf_low.median_survival_time_
+    median_high = kmf_high.median_survival_time_
+    print(f"Median Survival Time (Low Risk): {median_low}")
+    print(f"Median Survival Time (High Risk): {median_high}")
+
+    # 2. Calibration Plot at a Fixed Time Point (e.g., 24 months)
+    fixed_time = 24  # desired time point (e.g., months)
+    if fixed_time not in surv.index:
+        nearest_idx = np.abs(surv.index - fixed_time).argmin()
+        nearest_time = surv.index[nearest_idx]
+        print(f"Fixed time {fixed_time} not found in survival index, using nearest time {nearest_time} instead.")
+        fixed_time = nearest_time
+
     predicted_surv_probs = surv.loc[fixed_time].values
+
     # Group patients by deciles of predicted survival probability.
     decile_bins = np.percentile(predicted_surv_probs, np.arange(0, 110, 10))
     bin_indices = np.digitize(predicted_surv_probs, decile_bins, right=True)
@@ -282,28 +303,40 @@ def main(args):
     for i in range(1, 11):
         idx = bin_indices == i
         if np.sum(idx) > 0:
-            # Use Kaplan-Meier to get observed survival at fixed_time for the bin.
             kmf = KaplanMeierFitter()
             kmf.fit(y_test_durations[idx], event_observed=y_test_events[idx])
             observed_probs.append(kmf.predict(fixed_time))
             predicted_avg.append(np.mean(predicted_surv_probs[idx]))
-    plt.figure(figsize=(8, 6))
-    plt.plot(predicted_avg, observed_probs, 'o-', label='Calibration Curve')
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(predicted_avg, observed_probs, 'o-', lw=2, label='Calibration Curve')
     plt.plot([0, 1], [0, 1], '--', color='gray', label='Ideal Calibration')
-    plt.xlabel("Predicted Survival Probability at {} months".format(fixed_time))
-    plt.ylabel("Observed Survival Probability")
-    plt.title("Calibration Plot at {} months".format(fixed_time))
-    plt.legend()
+    plt.xlabel(f"Predicted Survival Probability at {fixed_time} months", fontsize=12)
+    plt.ylabel("Observed Survival Probability", fontsize=12)
+    plt.title(f"Calibration Plot at {fixed_time} Months", fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True)
+    plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "calibration_plot.png"))
     plt.close()
 
-    # 3. Additional statistics reporting
+    # Additional statistics reporting
+    overall_kmf = KaplanMeierFitter()
+    overall_kmf.fit(y_test_durations, event_observed=y_test_events)
+    overall_surv = overall_kmf.predict(fixed_time)
+
     print("\nAdditional Statistics:")
     print(f"  Mean Predicted Risk Score: {np.mean(risk_scores):.4f}")
     print(f"  Std of Predicted Risk Scores: {np.std(risk_scores):.4f}")
     print(f"  Median Predicted Survival Probability at {fixed_time} months: {np.median(predicted_surv_probs):.4f}")
-    print(f"  Observed Survival Probability at {fixed_time} months (overall): "
-          f"{KaplanMeierFitter().fit(y_test_durations, event_observed=y_test_events).predict(fixed_time):.4f}")
+    print(f"  Observed Survival Probability at {fixed_time} months (overall): {overall_surv:.4f}")
+
+    # Optionally, compute and display the average predicted survival probability along with its spread.
+    print(f"  Mean Predicted Survival Probability at {fixed_time} months: {np.mean(predicted_surv_probs):.4f}")
+    print(f"  Std of Predicted Survival Probabilities at {fixed_time} months: {np.std(predicted_surv_probs):.4f}")
+
+    # You can add further statistical tests or visuals here as needed.
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -346,7 +379,6 @@ if __name__ == "__main__":
                         help="Weight for the regularization term relative to the Cox loss")
     parser.add_argument('--gamma', type=float, default=0.5,
                         help="Relative weight between L1 and L2 in the regularizer")
-    # New flag for upsampling
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data")
 

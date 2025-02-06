@@ -23,8 +23,8 @@ srun python train.py \
     --batch_size 32 \
     --num_slices 5 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --learning_rate 1e-6 \
-    --num_samples_per_patient 10 \
+    --learning_rate 1e-7 \
+    --num_samples_per_patient 3\
     --center_risk \
     --coxph_net mlp \
     --upsampling \

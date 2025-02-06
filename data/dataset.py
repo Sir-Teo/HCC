@@ -1,4 +1,3 @@
-# data/dataset.py
 import os
 import random
 from collections import defaultdict
@@ -11,7 +10,6 @@ import pydicom
 from torch.utils.data import Dataset, DataLoader, default_collate
 from sklearn.model_selection import train_test_split
 
-# Global debug flag
 DEBUG = False
 
 def nan_hook(module, input, output):
@@ -26,78 +24,124 @@ class HCCDicomDataset(Dataset):
         model_type="linear",
         transform=None,
         num_slices=10,
-        preprocessed_root=None,
-        num_samples_per_patient=1
+        num_samples=1,
+        preprocessed_root=None
     ):
+        """
+        Args:
+            csv_file (str or pd.DataFrame): Path to CSV or already loaded DataFrame.
+            dicom_root (str): Root directory where patient DICOM folders are stored.
+            model_type (str): Either 'linear' or 'time_to_event'.
+            transform (callable): Torchvision transforms to apply on each slice.
+            num_slices (int): Number of slices per sub-sample.
+            num_samples (int): Number of sub-samples to extract from each patient's stack.
+            preprocessed_root (str): Directory for caching/loading preprocessed tensors.
+        """
         self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
         self.num_slices = num_slices
+        self.num_samples = num_samples
         self.preprocessed_root = preprocessed_root
-        self.num_samples_per_patient = num_samples_per_patient
-        self.patient_data = []
-        
+
+        # Build the patient_data list from CSV
         if isinstance(csv_file, str):
             df = pd.read_csv(csv_file)
         else:
             df = csv_file.copy()
+
+        self.patient_data = []
         for _, row in df.iterrows():
             patient_id = str(row['Pre op MRI Accession number'])
             dicom_dir = os.path.join(dicom_root, patient_id)
             if os.path.exists(dicom_dir):
-                data_entry = {'patient_id': patient_id}
+                data_entry = {
+                    'patient_id': patient_id,
+                    'dicom_dir': dicom_dir
+                }
                 if self.model_type == "linear":
                     data_entry['label'] = row['recurrence post tx']
                 elif self.model_type == "time_to_event":
                     data_entry['time'] = row['time']
                     data_entry['event'] = row['event']
-                data_entry['dicom_dir'] = dicom_dir
+                
                 self.patient_data.append(data_entry)
+
         if DEBUG:
-            print(f"[DEBUG] HCCDicomDataset initialized with {len(self.patient_data)} patients, "
-                  f"each yielding {self.num_samples_per_patient} sample(s).")
+            print(f"[DEBUG] HCCDicomDataset initialized with {len(self.patient_data)} patients.")
 
     def __len__(self):
-        return len(self.patient_data) * self.num_samples_per_patient
+        """
+        Now, dataset length = number of patients. We do NOT multiply by num_samples;
+        instead we return multiple sub-samples from a single patient in __getitem__.
+        """
+        return len(self.patient_data)
 
     def __getitem__(self, idx):
-        patient_idx = idx // self.num_samples_per_patient
-        patient = self.patient_data[patient_idx]
+        """
+        Returns:
+            - A 5D tensor of shape [num_samples, num_slices, C, H, W]
+            - label (linear) or (time, event) (time_to_event)
+        """
+        patient = self.patient_data[idx]
         dicom_dir = patient['dicom_dir']
-        image_stack = self.load_axial_series(dicom_dir)
+        patient_id = patient['patient_id']
+
+        # Load the entire axial series (as a single 4D tensor: [total_slices, C, H, W]).
+        full_stack = self.load_axial_series(dicom_dir)
 
         if DEBUG:
-            print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - image_stack shape after loading: {image_stack.shape}")
+            print(f"[DEBUG] __getitem__ for patient {patient_id} - full stack shape: {full_stack.shape}")
 
-        if self.preprocessed_root is None and self.transform:
-            transformed_images = []
-            for img in image_stack:
-                img = self.transform(img)
-                transformed_images.append(img)
-            image_stack = torch.stack(transformed_images)
-        else:
-            if DEBUG:
-                print(f"[DEBUG] __getitem__ patient {patient['patient_id']} - using preprocessed images (no re-transform).")
+        # Generate num_samples 3D sub-stacks (each with num_slices).
+        sub_stacks = []
+        for _ in range(self.num_samples):
+            # Sample sub-stack
+            sampled_stack = self.sample_sub_stack(full_stack)
 
+            # Apply transform (if any) to each slice in this sub-stack.
+            if self.transform is not None:
+                transformed_slices = []
+                for slice_ in sampled_stack:
+                    # slice_ shape: [C, H, W]
+                    slice_ = self.transform(slice_)
+                    transformed_slices.append(slice_)
+                # Re-stack along slice dimension => shape [num_slices, C, H, W]
+                sampled_stack = torch.stack(transformed_slices, dim=0)
+
+            sub_stacks.append(sampled_stack)
+
+        # Shape: [num_samples, num_slices, C, H, W]
+        sub_stacks = torch.stack(sub_stacks, dim=0)
+
+        # Return according to model type
         if self.model_type == "linear":
-            return image_stack, torch.tensor(patient['label'], dtype=torch.float32)
+            label = torch.tensor(patient['label'], dtype=torch.float32)
+            return sub_stacks, label
         elif self.model_type == "time_to_event":
-            return (
-                image_stack,
-                torch.tensor(patient['time'], dtype=torch.float32),
-                torch.tensor(patient['event'], dtype=torch.float32)
-            )
-        
+            time_ = torch.tensor(patient['time'], dtype=torch.float32)
+            event_ = torch.tensor(patient['event'], dtype=torch.float32)
+            return sub_stacks, time_, event_
+
     def load_axial_series(self, dicom_dir):
+        """
+        Loads (or retrieves from cache) all axial slices as a 4D tensor:
+        [num_total_slices, 3, H, W].
+
+        If preprocessed_root is specified, tries to load from .pt file to speed up.
+        """
         patient_id = os.path.basename(dicom_dir)
+
+        # If we have preprocessed data, just load that
         if self.preprocessed_root:
             preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
             if os.path.exists(preprocessed_path):
                 if DEBUG:
                     print(f"[DEBUG] Loading preprocessed tensor for patient {patient_id} from {preprocessed_path}")
                 image_stack = torch.load(preprocessed_path)
-                return self.process_loaded_stack(image_stack)
-        
+                return image_stack  # shape: [num_slices, C, H, W]
+
+        # Otherwise, read from raw DICOM files
         series_dict = defaultdict(list)
         dcm_files = [f for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
         
@@ -114,6 +158,7 @@ class HCCDicomDataset(Dataset):
                 print(f"Error reading DICOM file {fname}: {e}")
                 continue
 
+        # Find all axial series
         axial_series = []
         for orient, dcm_paths in series_dict.items():
             if self.is_axial(orient):
@@ -122,36 +167,40 @@ class HCCDicomDataset(Dataset):
         if not axial_series:
             raise ValueError(f"No axial series found in {dicom_dir}")
 
+        # Sort slices by z-position
         def get_slice_position(dcm_path):
             try:
                 dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
-                return float(dcm.SliceLocation) if hasattr(dcm, 'SliceLocation') else float(dcm.ImagePositionPatient[2])
-            except Exception:
+                if hasattr(dcm, 'SliceLocation'):
+                    return float(dcm.SliceLocation)
+                else:
+                    return float(dcm.ImagePositionPatient[2])
+            except:
                 return 0.0
 
         axial_series.sort(key=get_slice_position)
 
         if DEBUG:
-            print(f"[DEBUG] load_axial_series patient {patient_id}: {len(axial_series)} axial slices found.")
+            print(f"[DEBUG] load_axial_series {patient_id}: {len(axial_series)} axial slices found.")
 
         image_stack = []
         for dcm_path in axial_series:
             try:
                 dcm = pydicom.dcmread(dcm_path)
-                img = self.dicom_to_tensor(dcm)
-                image_stack.append(img)
+                tensor_img = self.dicom_to_tensor(dcm)
+                image_stack.append(tensor_img)
             except Exception as e:
                 print(f"Error processing DICOM file {dcm_path}: {e}")
                 continue
 
-        if image_stack:
-            image_stack = torch.stack(image_stack)
+        if len(image_stack) > 0:
+            # shape: [num_slices, C, H, W]
+            image_stack = torch.stack(image_stack, dim=0)
         else:
+            # No valid images => return empty
             image_stack = torch.zeros((0, 3, 224, 224))
 
-        if DEBUG:
-            print(f"[DEBUG] load_axial_series patient {patient_id} - image_stack shape before saving: {image_stack.shape}")
-
+        # Save preprocessed if requested
         if self.preprocessed_root:
             os.makedirs(self.preprocessed_root, exist_ok=True)
             preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
@@ -159,27 +208,40 @@ class HCCDicomDataset(Dataset):
             if DEBUG:
                 print(f"[DEBUG] Saved preprocessed tensor for patient {patient_id} to {preprocessed_path}")
 
-        return self.process_loaded_stack(image_stack)
-
-    def process_loaded_stack(self, image_stack):
-        current_slices = image_stack.size(0)
-        if DEBUG:
-            print(f"[DEBUG] process_loaded_stack - current slices: {current_slices}, target: {self.num_slices}")
-        if current_slices < self.num_slices:
-            pad_size = self.num_slices - current_slices
-            padding = torch.zeros((pad_size, *image_stack.shape[1:]), dtype=image_stack.dtype)
-            image_stack = torch.cat([image_stack, padding], dim=0)
-            if DEBUG:
-                print(f"[DEBUG] Padded image_stack to shape: {image_stack.shape}")
-        else:
-            selected_indices = torch.randperm(current_slices)[:self.num_slices]
-            selected_indices, _ = torch.sort(selected_indices)
-            image_stack = image_stack[selected_indices]
-            if DEBUG:
-                print(f"[DEBUG] Randomly selected slices. New shape: {image_stack.shape}")
         return image_stack
 
+    def sample_sub_stack(self, full_stack):
+        """
+        Randomly selects `self.num_slices` slices from `full_stack`.
+        If `full_stack` has fewer than `self.num_slices`, it will pad with zeros.
+        Returns a 4D tensor: [num_slices, C, H, W].
+        """
+        total_slices = full_stack.size(0)
+        if DEBUG:
+            print(f"[DEBUG] sample_sub_stack - total slices: {total_slices}, needed: {self.num_slices}")
+
+        if total_slices == 0:
+            # Edge case: no slices at all
+            return torch.zeros((self.num_slices, 3, 224, 224), dtype=full_stack.dtype)
+
+        if total_slices < self.num_slices:
+            # Pad
+            pad_size = self.num_slices - total_slices
+            padding = torch.zeros((pad_size, *full_stack.shape[1:]), dtype=full_stack.dtype)
+            sub_stack = torch.cat([full_stack, padding], dim=0)
+        else:
+            # Randomly select self.num_slices among total_slices
+            selected_indices = torch.randperm(total_slices)[:self.num_slices]
+            selected_indices, _ = torch.sort(selected_indices)
+            sub_stack = full_stack[selected_indices]
+
+        return sub_stack
+
     def is_axial(self, orientation):
+        """
+        Determines if the orientation is axial based on cross product
+        of the row and column direction vectors.
+        """
         row_dir = np.array(orientation[:3], dtype=np.float32)
         col_dir = np.array(orientation[3:], dtype=np.float32)
         cross = np.cross(row_dir, col_dir)
@@ -187,6 +249,7 @@ class HCCDicomDataset(Dataset):
         if norm < 1e-6:
             return False
         cross_normalized = cross / norm
+        # For an axial plane, Z-axis ~ ±1, X & Y ~ 0
         return (
             (abs(cross_normalized[0]) < 5e-2) and
             (abs(cross_normalized[1]) < 5e-2) and
@@ -194,22 +257,32 @@ class HCCDicomDataset(Dataset):
         )
 
     def dicom_to_tensor(self, dcm):
+        """
+        Convert DICOM pixel data to a FloatTensor of shape [C, H, W].
+        We replicate a single channel to 3 channels if needed.
+        """
         img = dcm.pixel_array.astype(np.float32)
+        # Example windowing for CT images:
         if dcm.Modality == 'CT':
-            intercept = float(dcm.RescaleIntercept)
-            slope = float(dcm.RescaleSlope)
+            intercept = float(dcm.RescaleIntercept) if hasattr(dcm, 'RescaleIntercept') else 0.0
+            slope = float(dcm.RescaleSlope) if hasattr(dcm, 'RescaleSlope') else 1.0
             img = slope * img + intercept
+            # Simple clip (e.g., -100 to 400 HU)
             img = np.clip(img, -100, 400)
+            # Then normalize to [0,1]
             img = (img + 100) / 500.0
         else:
-            img = (img - img.min()) / (img.max() - img.min() + 1e-6)
-            img = img * 255.0
+            # If MRI or unknown
+            img_min, img_max = img.min(), img.max()
+            img = (img - img_min) / (img_max - img_min + 1e-6)
+
+        # Expand to 3 channels if grayscale
         if img.ndim == 2:
             img = np.repeat(img[..., np.newaxis], 3, axis=-1)
+
         tensor_img = torch.from_numpy(img).permute(2, 0, 1)
-        if DEBUG:
-            print(f"[DEBUG] dicom_to_tensor - tensor shape: {tensor_img.shape}, min={tensor_img.min()}, max={tensor_img.max()}")
         return tensor_img
+
 
 class HCCDataModule:
     def __init__(
@@ -219,115 +292,152 @@ class HCCDataModule:
         model_type="linear",
         batch_size=2,
         num_slices=20,
+        num_samples=1,
         num_workers=2,
-        preprocessed_root=None,
-        num_samples_per_patient=1
+        preprocessed_root=None
     ):
+        """
+        Args:
+            csv_file (str): Path to your CSV file
+            dicom_root (str): Root directory containing sub-folders for each patient
+            model_type (str): 'linear' or 'time_to_event'
+            batch_size (int): Batch size for DataLoader
+            num_slices (int): Number of slices per sub-sample
+            num_samples (int): Number of sub-samples per patient
+            num_workers (int): Number of DataLoader workers
+            preprocessed_root (str): Where to save/load preprocessed .pt files
+        """
         self.csv_file = csv_file
         self.dicom_root = dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
         self.num_slices = num_slices
+        self.num_samples = num_samples
         self.num_workers = num_workers
         self.preprocessed_root = preprocessed_root
-        self.num_samples_per_patient = num_samples_per_patient
 
-        self.preprocess_transform = T.Compose([
+        # Basic transform example (resize + normalization)
+        self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
         ])
-        self.transform = self.preprocess_transform
 
     def setup(self):
         df = pd.read_csv(self.csv_file)
-        stratify_col = df['recurrence post tx'] if self.model_type == "linear" else df['event']
 
-        train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42, stratify=stratify_col)
-        val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df['event'])
+        # Stratification logic
+        if self.model_type == "linear":
+            stratify_col = df['recurrence post tx']
+        else:
+            stratify_col = df['event']
+
+        train_df, temp_df = train_test_split(
+            df,
+            test_size=0.3,
+            random_state=42,
+            stratify=stratify_col
+        )
+
+        # For demonstration, we do a second split for val/test.
+        # If you have a separate test set, adjust accordingly.
+        if self.model_type == "linear":
+            val_df, test_df = train_test_split(
+                temp_df,
+                test_size=0.5,
+                random_state=42,
+                stratify=temp_df['recurrence post tx']
+            )
+        else:
+            val_df, test_df = train_test_split(
+                temp_df,
+                test_size=0.5,
+                random_state=42,
+                stratify=temp_df['event']
+            )
 
         print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
-        print(f"Label distribution in Train:\n{train_df['recurrence post tx'].value_counts()}")
-        print(f"Label distribution in Val:\n{val_df['recurrence post tx'].value_counts()}")
-        print(f"Label distribution in Test:\n{test_df['recurrence post tx'].value_counts()}")
 
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df,
             dicom_root=self.dicom_root,
             model_type=self.model_type,
-            transform=self.preprocess_transform,
+            transform=self.transform,
             num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root,
-            num_samples_per_patient=self.num_samples_per_patient
+            num_samples=self.num_samples,
+            preprocessed_root=self.preprocessed_root
         )
+
         self.val_dataset = HCCDicomDataset(
             csv_file=val_df,
             dicom_root=self.dicom_root,
             model_type=self.model_type,
-            transform=self.preprocess_transform,
+            transform=self.transform,
             num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root,
-            num_samples_per_patient=self.num_samples_per_patient
+            num_samples=self.num_samples,
+            preprocessed_root=self.preprocessed_root
         )
+
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df,
             dicom_root=self.dicom_root,
             model_type=self.model_type,
-            transform=self.preprocess_transform,
+            transform=self.transform,
             num_slices=self.num_slices,
-            preprocessed_root=self.preprocessed_root,
-            num_samples_per_patient=self.num_samples_per_patient
+            num_samples=self.num_samples,
+            preprocessed_root=self.preprocessed_root
         )
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=True, 
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
             num_workers=self.num_workers,
             collate_fn=self.train_collate_fn
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False, 
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
 
     def test_dataloader(self):
         return DataLoader(
-            self.test_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False, 
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn
         )
 
     def train_collate_fn(self, batch):
+        """
+        For 'time_to_event', optionally ensure a minimum number of events in each batch
+        by flipping some 0 -> 1 if needed. (Same logic you had before.)
+        """
         if self.model_type == "time_to_event":
             events = [sample[2].item() for sample in batch]
-            if sum(events) < 2:
+            # Example logic: ensure at least 2 events per batch
+            if sum(events) < 2 and len(batch) >= 2:
                 indices = random.sample(range(len(batch)), k=2)
                 for idx in indices:
                     x, t, e = batch[idx]
                     batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
-            if DEBUG:
-                print(f"[DEBUG] train_collate_fn - Batch size: {len(batch)}, events sum: {sum([s[2].item() for s in batch])}")
-            return default_collate(batch)
-        else:
-            return default_collate(batch)
+        return default_collate(batch)
 
     def collate_fn(self, batch):
+        """
+        Similarly for validation/test sets for 'time_to_event'.
+        """
         if self.model_type == "time_to_event":
             events = [sample[2].item() for sample in batch]
             if sum(events) == 0 and len(batch) > 0:
-                idx = random.randint(0, len(batch)-1)
+                idx = random.randint(0, len(batch) - 1)
                 x, t, e = batch[idx]
                 batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
-            if DEBUG:
-                print(f"[DEBUG] collate_fn - Batch size: {len(batch)}, events sum: {sum([s[2].item() for s in batch])}")
-            return default_collate(batch)
-        else:
-            return default_collate(batch)
+        return default_collate(batch)
