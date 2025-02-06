@@ -101,6 +101,11 @@ def main(args):
     print("Extracting test features...")
     x_test, y_test_durations, y_test_events = extract_features(test_loader, dino_model, device)
 
+    x_train = x_train.mean(axis=1)  # New shape: (n_samples, n_features)
+    x_val = x_val.mean(axis=1)
+    x_test = x_test.mean(axis=1)
+
+
     print("Checking for NaNs in features...")
     print("x_train contains NaNs:", np.isnan(x_train).any())
     print("x_val contains NaNs:", np.isnan(x_val).any())
@@ -157,8 +162,9 @@ def main(args):
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
 
     model.x_train_std = x_train_std
-
-    callbacks = [tt.callbacks.EarlyStopping(), LossLogger(), ParamCheckerCallback()]
+    callbacks = [LossLogger(), ParamCheckerCallback()]
+    if args.early_stopping:
+        callbacks.append(tt.callbacks.EarlyStopping())
     if args.gradient_clip > 0:
         callbacks.insert(1, GradientClippingCallback(args.gradient_clip))
 
@@ -355,7 +361,7 @@ if __name__ == "__main__":
                         help='Number of slices per patient')
     parser.add_argument('--num_workers', type=int, default=4, 
                         help='Number of workers for data loaders')
-    parser.add_argument('--epochs', type=int, default=20, 
+    parser.add_argument('--epochs', type=int, default=500, 
                         help='Number of training epochs')
     parser.add_argument('--output_dir', type=str, default='checkpoints', 
                         help='Directory to save outputs and models')
@@ -381,6 +387,7 @@ if __name__ == "__main__":
                         help="Relative weight between L1 and L2 in the regularizer")
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data")
+    parser.add_argument('--early_stopping', action='store_true',)
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

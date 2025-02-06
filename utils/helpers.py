@@ -17,15 +17,21 @@ def extract_features(data_loader, model, device):
         for batch in tqdm(data_loader, desc="Extracting Features"):
             images, t, e = batch
             images = images.to(device)
+            # Unpack the 6 dimensions
             batch_size, num_samples, num_slices, C, H, W = images.size()
+            # Combine batch, num_samples, and num_slices dimensions for feature extraction
             images = images.view(batch_size * num_samples * num_slices, C, H, W)
-
             
             feats = model.forward_features(images)
             feature_dim = feats.size(-1)
-            feats = feats.view(batch_size, num_slices, feature_dim)
-            feats = feats.mean(dim=1)
+            # Reshape back: each sample now has `num_slices` feature vectors
+            feats = feats.view(batch_size, num_samples, num_slices, feature_dim)
+            # Average on the slice level
+            feats = feats.mean(dim=2)  # Now shape is (batch_size, num_samples, feature_dim)
             
+            # (Optional) If you want to further average across samples for a patient-level feature:
+            # feats = feats.mean(dim=1)  # Now shape is (batch_size, feature_dim)
+
             features.append(feats.cpu().numpy())
             durations.append(t.cpu().numpy())
             events.append(e.cpu().numpy())

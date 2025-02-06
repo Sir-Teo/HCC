@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p a100_short,a100_dev,a100_long
+#SBATCH -p gpu4_short,a100_short,a100_dev,a100_long
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -24,7 +24,7 @@ srun python train.py \
     --num_slices 5 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 1e-7 \
-    --num_samples_per_patient 3\
+    --num_samples_per_patient 10\
     --center_risk \
     --coxph_net mlp \
     --upsampling \
