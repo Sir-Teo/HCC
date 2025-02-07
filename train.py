@@ -226,8 +226,8 @@ def main(args):
     # Improved Survival Functions Plot with Recurrence Highlighted
     plt.figure(figsize=(10, 6))
     ax = plt.gca()
-    # Plot the survival curves for the first 5 test samples.
-    for i in range(5):
+    # Plot the survival curves for the first 15 test samples.
+    for i in range(15):
         # Plot the survival function for sample i.
         ax.plot(surv.index, surv.iloc[:, i], lw=2, label=f"Sample {i}")
         

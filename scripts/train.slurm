@@ -29,7 +29,7 @@ srun python train.py \
     --coxph_net mlp \
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 2000 \
+    --epochs 500 \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping
