@@ -130,10 +130,32 @@ def main(args):
     y_test = (y_test_durations, y_test_events)
 
     x_mapper = StandardScaler()
-    x_train_std = x_mapper.fit_transform(x_train).astype('float32')
-    x_val_std = x_mapper.transform(x_val).astype('float32')
-    x_test_std = x_mapper.transform(x_test).astype('float32')
+    # --- Process training data ---
+    n_train, n_slices, feat_dim = x_train.shape
+    # Reshape to 2D: (n_patients * num_slices, feature_dim)
+    x_train_reshaped = x_train.reshape(-1, feat_dim)
+    # Fit the scaler and transform
+    x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
+    # Reshape back to original 3D shape
+    x_train_scaled = x_train_scaled.reshape(n_train, n_slices, feat_dim)
 
+    # --- Process validation data ---
+    n_val, n_slices_val, feat_dim_val = x_val.shape
+    x_val_reshaped = x_val.reshape(-1, feat_dim_val)
+    x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
+    x_val_scaled = x_val_scaled.reshape(n_val, n_slices_val, feat_dim_val)
+
+    # --- Process test data ---
+    n_test, n_slices_test, feat_dim_test = x_test.shape
+    x_test_reshaped = x_test.reshape(-1, feat_dim_test)
+    x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
+    x_test_scaled = x_test_scaled.reshape(n_test, n_slices_test, feat_dim_test)
+
+    # --- Flatten slice dimension if the Cox model requires one feature vector per patient ---
+    # (Concatenate the slice and feature dimensions into a single vector.)
+    x_train_std = x_train_scaled.reshape(n_train, -1)
+    x_val_std = x_val_scaled.reshape(n_val, -1)
+    x_test_std = x_test_scaled.reshape(n_test, -1)
     print("Feature value ranges (train):")
     print(f"  Min: {x_train_std.min()}, Max: {x_train_std.max()}")
     print(f"  Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
@@ -200,17 +222,35 @@ def main(args):
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_test_std)
 
-    # Improved Survival Functions Plot
+    # Improved Survival Functions Plot with Recurrence Highlighted
     plt.figure(figsize=(10, 6))
-    surv.iloc[:, :5].plot(lw=2)
-    plt.ylabel("Survival Probability", fontsize=12)
-    plt.xlabel("Time", fontsize=12)
-    plt.title("Survival Functions for Test Samples", fontsize=14)
-    plt.legend(title="Sample Index", fontsize=10)
-    plt.grid(True)
+    ax = plt.gca()
+    # Plot the survival curves for the first 5 test samples.
+    for i in range(5):
+        # Plot the survival function for sample i.
+        ax.plot(surv.index, surv.iloc[:, i], lw=2, label=f"Sample {i}")
+        
+        # If an event (recurrence) was observed for sample i, add a marker.
+        if y_test_events[i] == 1:
+            # Get the observed recurrence time.
+            event_time = y_test_durations[i]
+            # Find the nearest time point in the survival function's time grid.
+            nearest_idx = np.abs(surv.index - event_time).argmin()
+            nearest_time = surv.index[nearest_idx]
+            survival_prob_at_event = surv.iloc[nearest_idx, i]
+            # Plot a red marker at the recurrence.
+            ax.scatter(nearest_time, survival_prob_at_event, color='red', s=50, zorder=5,
+                    label='Recurrence' if i == 0 else "")  # Label only once for the legend
+
+    ax.set_ylabel("Survival Probability", fontsize=12)
+    ax.set_xlabel("Time", fontsize=12)
+    ax.set_title("Survival Functions for Test Samples with Recurrence Highlighted", fontsize=14)
+    ax.legend(title="Sample Index", fontsize=10)
+    ax.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "survival_functions.png"))
     plt.close()
+
 
     ev = EvalSurv(surv, y_test_durations, y_test_events, censor_surv='km')
     concordance = ev.concordance_td()
@@ -371,7 +411,7 @@ if __name__ == "__main__":
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--center_risk', action='store_true', 
                         help='If set, center risk scores for numerical stability')
-    parser.add_argument('--dropout', type=float, default=0.1, 
+    parser.add_argument('--dropout', type=float, default=0.2, 
                         help='Dropout rate for the MLP if used')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample from each patient per epoch')

@@ -14,3 +14,4 @@ checkpoints/
 weights/
 *.pt
 __pycache__/
+**/__pycache__/

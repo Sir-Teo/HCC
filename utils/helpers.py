@@ -6,7 +6,7 @@ import torch
 def extract_features(data_loader, model, device):
     """
     Extract features using the DINOv2 model.
-    Patient-level features are computed by averaging per-slice features.
+    Each slice will have its own feature vector (no averaging on the slice level).
     """
     model.eval()
     features = []
@@ -24,13 +24,10 @@ def extract_features(data_loader, model, device):
             
             feats = model.forward_features(images)
             feature_dim = feats.size(-1)
-            # Reshape back: each sample now has `num_slices` feature vectors
+            # Reshape back: each sample now has num_slices feature vectors, one per slice
             feats = feats.view(batch_size, num_samples, num_slices, feature_dim)
-            # Average on the slice level
-            feats = feats.mean(dim=2)  # Now shape is (batch_size, num_samples, feature_dim)
             
-            # (Optional) If you want to further average across samples for a patient-level feature:
-            # feats = feats.mean(dim=1)  # Now shape is (batch_size, feature_dim)
+            # No averaging on the slice level is performed here
 
             features.append(feats.cpu().numpy())
             durations.append(t.cpu().numpy())

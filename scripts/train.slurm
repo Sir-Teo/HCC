@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu4_short,a100_short,a100_dev,a100_long
+#SBATCH -p a100_short,a100_dev,a100_long
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -21,14 +21,18 @@ conda activate dinov2
 
 srun python train.py \
     --batch_size 32 \
-    --num_slices 5 \
+    --num_slices  30\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --learning_rate 1e-7 \
-    --num_samples_per_patient 10\
+    --learning_rate 1e-6 \
+    --num_samples_per_patient 1\
     --center_risk \
     --coxph_net mlp \
     --upsampling \
-    --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_124999/teacher_checkpoint.pth
+    --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_124999/teacher_checkpoint.pth \
+    --epochs 2000 \
+    --alpha 0.5 \
+    --gamma 0.5 \
+    --early_stopping
 
 
 

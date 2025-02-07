@@ -358,6 +358,11 @@ class HCCDataModule:
 
         print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
 
+        pos_train = (train_df['recurrence post tx'] == 1).sum()
+        pos_val = (val_df['recurrence post tx'] == 1).sum()
+        pos_test = (test_df['recurrence post tx'] == 1).sum()
+        print(f"Positive cases - Train: {pos_train}, Val: {pos_val}, Test: {pos_test}")
+
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df,
             dicom_root=self.dicom_root,
