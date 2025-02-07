@@ -152,10 +152,11 @@ def main(args):
     x_test_scaled = x_test_scaled.reshape(n_test, n_slices_test, feat_dim_test)
 
     # --- Flatten slice dimension if the Cox model requires one feature vector per patient ---
-    # (Concatenate the slice and feature dimensions into a single vector.)
-    x_train_std = x_train_scaled.reshape(n_train, -1)
-    x_val_std = x_val_scaled.reshape(n_val, -1)
-    x_test_std = x_test_scaled.reshape(n_test, -1)
+    # Compute the mean across the slice dimension
+    x_train_std = x_train_scaled.mean(axis=1)
+    x_val_std = x_val_scaled.mean(axis=1)
+    x_test_std = x_test_scaled.mean(axis=1)
+
     print("Feature value ranges (train):")
     print(f"  Min: {x_train_std.min()}, Max: {x_train_std.max()}")
     print(f"  Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
