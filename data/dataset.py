@@ -334,13 +334,12 @@ class HCCDataModule:
 
         train_df, temp_df = train_test_split(
             df,
-            test_size=0.3,
+            test_size=0.35,
             random_state=42,
             stratify=stratify_col
         )
 
-        # For demonstration, we do a second split for val/test.
-        # If you have a separate test set, adjust accordingly.
+
         if self.model_type == "linear":
             val_df, test_df = train_test_split(
                 temp_df,
@@ -421,28 +420,9 @@ class HCCDataModule:
         )
 
     def train_collate_fn(self, batch):
-        """
-        For 'time_to_event', optionally ensure a minimum number of events in each batch
-        by flipping some 0 -> 1 if needed. (Same logic you had before.)
-        """
-        if self.model_type == "time_to_event":
-            events = [sample[2].item() for sample in batch]
-            # Example logic: ensure at least 2 events per batch
-            if sum(events) < 2 and len(batch) >= 2:
-                indices = random.sample(range(len(batch)), k=2)
-                for idx in indices:
-                    x, t, e = batch[idx]
-                    batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
+        # Removed random 0 -> 1 flipping logic.
         return default_collate(batch)
 
     def collate_fn(self, batch):
-        """
-        Similarly for validation/test sets for 'time_to_event'.
-        """
-        if self.model_type == "time_to_event":
-            events = [sample[2].item() for sample in batch]
-            if sum(events) == 0 and len(batch) > 0:
-                idx = random.randint(0, len(batch) - 1)
-                x, t, e = batch[idx]
-                batch[idx] = (x, t, torch.tensor(1.0, dtype=torch.float32))
+        # Removed random 0 -> 1 flipping logic.
         return default_collate(batch)
