@@ -73,9 +73,11 @@ def main(args):
     seed_everything(42, workers=True)
 
     data_module = HCCDataModule(
-        csv_file=args.csv_file,
-        dicom_root=args.dicom_root,
-        model_type="time_to_event",
+        train_csv_file=args.train_csv_file,
+        test_csv_file=args.test_csv_file,
+        train_dicom_root=args.train_dicom_root,
+        test_dicom_root=args.test_dicom_root,
+        model_type="time_to_event",  # or "linear" as needed
         batch_size=args.batch_size,
         num_slices=args.num_slices,
         num_workers=args.num_workers,
@@ -442,10 +444,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1/L2 regularization"
     )
-    parser.add_argument("--dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
-                        help="Path to the root DICOM directory.")
-    parser.add_argument("--csv_file", type=str, default="processed_patient_labels.csv",
-                        help="Path to processed CSV with columns [Pre op MRI Accession number, recurrence post tx, time, event].")
+    parser.add_argument("--train_dicom_root", type=str, default="/path/to/train/dicom",
+                    help="Path to the training DICOM directory.")
+    parser.add_argument("--test_dicom_root", type=str, default="/path/to/test/dicom",
+                        help="Path to the testing DICOM directory.")
+    parser.add_argument("--train_csv_file", type=str, default="train_patient_labels.csv",
+                        help="Path to the training CSV file.")
+    parser.add_argument("--test_csv_file", type=str, default="test_patient_labels.csv",
+                        help="Path to the testing CSV file.")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                         help='Directory to store/load preprocessed image tensors')
     parser.add_argument('--batch_size', type=int, default=32, 

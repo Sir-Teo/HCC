@@ -262,19 +262,8 @@ class HCCDicomDataset(Dataset):
         We replicate a single channel to 3 channels if needed.
         """
         img = dcm.pixel_array.astype(np.float32)
-        # Example windowing for CT images:
-        if dcm.Modality == 'CT':
-            intercept = float(dcm.RescaleIntercept) if hasattr(dcm, 'RescaleIntercept') else 0.0
-            slope = float(dcm.RescaleSlope) if hasattr(dcm, 'RescaleSlope') else 1.0
-            img = slope * img + intercept
-            # Simple clip (e.g., -100 to 400 HU)
-            img = np.clip(img, -100, 400)
-            # Then normalize to [0,1]
-            img = (img + 100) / 500.0
-        else:
-            # If MRI or unknown
-            img_min, img_max = img.min(), img.max()
-            img = (img - img_min) / (img_max - img_min + 1e-6)
+        img_min, img_max = img.min(), img.max()
+        img = (img - img_min) / (img_max - img_min + 1e-6)
 
         # Expand to 3 channels if grayscale
         if img.ndim == 2:
@@ -287,8 +276,10 @@ class HCCDicomDataset(Dataset):
 class HCCDataModule:
     def __init__(
         self,
-        csv_file,
-        dicom_root,
+        train_csv_file,
+        test_csv_file,
+        train_dicom_root,
+        test_dicom_root,
         model_type="linear",
         batch_size=2,
         num_slices=20,
@@ -298,17 +289,21 @@ class HCCDataModule:
     ):
         """
         Args:
-            csv_file (str): Path to your CSV file
-            dicom_root (str): Root directory containing sub-folders for each patient
-            model_type (str): 'linear' or 'time_to_event'
-            batch_size (int): Batch size for DataLoader
-            num_slices (int): Number of slices per sub-sample
-            num_samples (int): Number of sub-samples per patient
-            num_workers (int): Number of DataLoader workers
-            preprocessed_root (str): Where to save/load preprocessed .pt files
+            train_csv_file (str): Path to CSV file for training (to be further split into train and val).
+            test_csv_file (str): Path to CSV file for testing.
+            train_dicom_root (str): Root directory for training patients’ DICOM folders.
+            test_dicom_root (str): Root directory for testing patients’ DICOM folders.
+            model_type (str): 'linear' or 'time_to_event'.
+            batch_size (int): Batch size for DataLoader.
+            num_slices (int): Number of slices per sub-sample.
+            num_samples (int): Number of sub-samples per patient.
+            num_workers (int): Number of DataLoader workers.
+            preprocessed_root (str): Directory to save/load preprocessed tensors.
         """
-        self.csv_file = csv_file
-        self.dicom_root = dicom_root
+        self.train_csv_file = train_csv_file
+        self.test_csv_file = test_csv_file
+        self.train_dicom_root = train_dicom_root
+        self.test_dicom_root = test_dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
         self.num_slices = num_slices
@@ -324,39 +319,24 @@ class HCCDataModule:
         ])
 
     def setup(self):
-        df = pd.read_csv(self.csv_file)
+        # Read the training and testing CSV files separately.
+        train_df_full = pd.read_csv(self.train_csv_file)
+        test_df = pd.read_csv(self.test_csv_file)
 
-        # Stratification logic
+        # Perform a stratified split on the training CSV to get training and validation sets.
         if self.model_type == "linear":
-            stratify_col = df['recurrence post tx']
+            stratify_col = train_df_full['recurrence post tx']
         else:
-            stratify_col = df['event']
+            stratify_col = train_df_full['event']
 
-        train_df, temp_df = train_test_split(
-            df,
+        train_df, val_df = train_test_split(
+            train_df_full,
             test_size=0.35,
             random_state=42,
             stratify=stratify_col
         )
 
-
-        if self.model_type == "linear":
-            val_df, test_df = train_test_split(
-                temp_df,
-                test_size=0.5,
-                random_state=42,
-                stratify=temp_df['recurrence post tx']
-            )
-        else:
-            val_df, test_df = train_test_split(
-                temp_df,
-                test_size=0.5,
-                random_state=42,
-                stratify=temp_df['event']
-            )
-
         print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
-
         pos_train = (train_df['recurrence post tx'] == 1).sum()
         pos_val = (val_df['recurrence post tx'] == 1).sum()
         pos_test = (test_df['recurrence post tx'] == 1).sum()
@@ -364,7 +344,7 @@ class HCCDataModule:
 
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df,
-            dicom_root=self.dicom_root,
+            dicom_root=self.train_dicom_root,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
@@ -374,7 +354,7 @@ class HCCDataModule:
 
         self.val_dataset = HCCDicomDataset(
             csv_file=val_df,
-            dicom_root=self.dicom_root,
+            dicom_root=self.train_dicom_root,  # Validation comes from the same directory as training
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
@@ -384,7 +364,7 @@ class HCCDataModule:
 
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df,
-            dicom_root=self.dicom_root,
+            dicom_root=self.test_dicom_root,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
@@ -420,9 +400,7 @@ class HCCDataModule:
         )
 
     def train_collate_fn(self, batch):
-        # Removed random 0 -> 1 flipping logic.
         return default_collate(batch)
 
     def collate_fn(self, batch):
-        # Removed random 0 -> 1 flipping logic.
         return default_collate(batch)
