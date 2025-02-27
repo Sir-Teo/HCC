@@ -25,7 +25,8 @@ class HCCDicomDataset(Dataset):
         transform=None,
         num_slices=10,
         num_samples=1,
-        preprocessed_root=None
+        preprocessed_root=None,
+        dataset_type="NYU"  # new parameter; default for backwards compatibility
     ):
         """
         Args:
@@ -36,6 +37,8 @@ class HCCDicomDataset(Dataset):
             num_slices (int): Number of slices per sub-sample.
             num_samples (int): Number of sub-samples to extract from each patient's stack.
             preprocessed_root (str): Directory for caching/loading preprocessed tensors.
+            dataset_type (str): Either "TCGA" (for training/validation with an extra series folder)
+                                or "NYU" (for testing with the current structure).
         """
         self.dicom_root = dicom_root
         self.transform = transform
@@ -43,6 +46,7 @@ class HCCDicomDataset(Dataset):
         self.num_slices = num_slices
         self.num_samples = num_samples
         self.preprocessed_root = preprocessed_root
+        self.dataset_type = dataset_type  # store the dataset type
 
         # Build the patient_data list from CSV
         if isinstance(csv_file, str):
@@ -68,7 +72,7 @@ class HCCDicomDataset(Dataset):
                 self.patient_data.append(data_entry)
 
         if DEBUG:
-            print(f"[DEBUG] HCCDicomDataset initialized with {len(self.patient_data)} patients.")
+            print(f"[DEBUG] HCCDicomDataset ({self.dataset_type}) initialized with {len(self.patient_data)} patients.")
 
     def __len__(self):
         """
@@ -140,6 +144,85 @@ class HCCDicomDataset(Dataset):
                     print(f"[DEBUG] Loading preprocessed tensor for patient {patient_id} from {preprocessed_path}")
                 image_stack = torch.load(preprocessed_path)
                 return image_stack  # shape: [num_slices, C, H, W]
+
+        # --- Modified file search based on dataset type ---
+        if self.dataset_type == "TCGA":
+            # For the TCGA dataset, the directory structure is Patient/series/0.dcm (an extra layer)
+            dcm_files = []
+            for series_folder in os.listdir(dicom_dir):
+                series_path = os.path.join(dicom_dir, series_folder)
+                if os.path.isdir(series_path):
+                    for fname in os.listdir(series_path):
+                        if fname.endswith('.dcm'):
+                            dcm_files.append(os.path.join(series_path, fname))
+        else:  # NYU or default: the current implementation
+            dcm_files = [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
+        # --- End modified file search ---
+
+        series_dict = defaultdict(list)
+        for dcm_path in dcm_files:
+            try:
+                dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+                if not hasattr(dcm, 'ImageOrientationPatient') or not hasattr(dcm, 'ImagePositionPatient'):
+                    continue
+                orientation = np.array(dcm.ImageOrientationPatient, dtype=np.float32).round(4)
+                orientation_tuple = tuple(orientation.flatten())
+                series_dict[orientation_tuple].append(dcm_path)
+            except Exception as e:
+                print(f"Error reading DICOM file {dcm_path}: {e}")
+                continue
+
+        # Find all axial series
+        axial_series = []
+        for orient, dcm_paths in series_dict.items():
+            if self.is_axial(orient):
+                axial_series.extend(dcm_paths)
+
+        if not axial_series:
+            raise ValueError(f"No axial series found in {dicom_dir}")
+
+        # Sort slices by z-position
+        def get_slice_position(dcm_path):
+            try:
+                dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+                if hasattr(dcm, 'SliceLocation'):
+                    return float(dcm.SliceLocation)
+                else:
+                    return float(dcm.ImagePositionPatient[2])
+            except:
+                return 0.0
+
+        axial_series.sort(key=get_slice_position)
+
+        if DEBUG:
+            print(f"[DEBUG] load_axial_series {patient_id}: {len(axial_series)} axial slices found.")
+
+        image_stack = []
+        for dcm_path in axial_series:
+            try:
+                dcm = pydicom.dcmread(dcm_path)
+                tensor_img = self.dicom_to_tensor(dcm)
+                image_stack.append(tensor_img)
+            except Exception as e:
+                print(f"Error processing DICOM file {dcm_path}: {e}")
+                continue
+
+        if len(image_stack) > 0:
+            # shape: [num_slices, C, H, W]
+            image_stack = torch.stack(image_stack, dim=0)
+        else:
+            # No valid images => return empty
+            image_stack = torch.zeros((0, 3, 224, 224))
+
+        # Save preprocessed if requested
+        if self.preprocessed_root:
+            os.makedirs(self.preprocessed_root, exist_ok=True)
+            preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
+            torch.save(image_stack, preprocessed_path)
+            if DEBUG:
+                print(f"[DEBUG] Saved preprocessed tensor for patient {patient_id} to {preprocessed_path}")
+
+        return image_stack # shape: [num_slices, C, H, W]
 
         # Otherwise, read from raw DICOM files
         series_dict = defaultdict(list)
@@ -311,7 +394,6 @@ class HCCDataModule:
         self.num_workers = num_workers
         self.preprocessed_root = preprocessed_root
 
-        # Basic transform example (resize + normalization)
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
             T.Normalize(mean=[0.485, 0.456, 0.406],
@@ -319,11 +401,9 @@ class HCCDataModule:
         ])
 
     def setup(self):
-        # Read the training and testing CSV files separately.
         train_df_full = pd.read_csv(self.train_csv_file)
         test_df = pd.read_csv(self.test_csv_file)
 
-        # Perform a stratified split on the training CSV to get training and validation sets.
         if self.model_type == "linear":
             stratify_col = train_df_full['recurrence post tx']
         else:
@@ -342,6 +422,7 @@ class HCCDataModule:
         pos_test = (test_df['recurrence post tx'] == 1).sum()
         print(f"Positive cases - Train: {pos_train}, Val: {pos_val}, Test: {pos_test}")
 
+        # For training and validation, use the "TCGA" dataset type (with extra series folder)
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df,
             dicom_root=self.train_dicom_root,
@@ -349,7 +430,8 @@ class HCCDataModule:
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root,
+            dataset_type="TCGA"  # <== using the TCGA file structure
         )
 
         self.val_dataset = HCCDicomDataset(
@@ -359,9 +441,11 @@ class HCCDataModule:
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root,
+            dataset_type="TCGA"  # <== using the TCGA file structure
         )
 
+        # For testing, use the NYU dataset type (current implementation)
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df,
             dicom_root=self.test_dicom_root,
@@ -369,7 +453,8 @@ class HCCDataModule:
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root
+            preprocessed_root=self.preprocessed_root,
+            dataset_type="NYU"  # <== current structure remains
         )
 
     def train_dataloader(self):
