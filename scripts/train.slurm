@@ -21,7 +21,7 @@ conda activate dinov2
 
 srun python train.py \
     --batch_size 32 \
-    --num_slices  5\
+    --num_slices  100\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 1e-5 \
     --num_samples_per_patient 1\
@@ -30,11 +30,10 @@ srun python train.py \
     --coxph_net mlp \
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 500 \
+    --epochs 1000 \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
-    --bootstrap \
 
 
 

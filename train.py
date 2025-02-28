@@ -13,30 +13,19 @@ from pycox.evaluation import EvalSurv
 from data.dataset import HCCDataModule
 from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
-from utils.helpers import extract_features
+from utils.helpers import extract_features, validate_survival_data
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
 
 # New imports for additional visualization and statistics
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
 
-# Use a seaborn style for improved aesthetics
+# Import plotting functions from plotting.py
+from utils.plotting import (plot_training_log, plot_survival_functions, plot_brier_score, 
+                      plot_risk_score_distribution, plot_kaplan_meier, plot_calibration_plot, 
+                      plot_multi_calibration)
+
 sns.set(style="whitegrid")
-
-
-def validate_survival_data(durations, events):
-    sort_idx = np.argsort(durations)
-    sorted_durations = durations[sort_idx]
-    sorted_events = events[sort_idx]
-    for i in range(len(sorted_durations)):
-        if sorted_events[i] == 1:
-            current_time = sorted_durations[i]
-            num_at_risk = np.sum(sorted_durations >= current_time)
-            if num_at_risk == 0:
-                raise ValueError(f"Event at {current_time} has no at-risk individuals.")
-            elif num_at_risk == 1:
-                print(f"Warning: Event at {current_time} has only 1 at-risk.")
-
 
 def upsample_training_data(x_train, durations, events):
     """
@@ -140,11 +129,8 @@ def main(args):
     x_mapper = StandardScaler()
     # --- Process training data ---
     n_train, n_slices, feat_dim = x_train.shape
-    # Reshape to 2D: (n_patients * num_slices, feature_dim)
     x_train_reshaped = x_train.reshape(-1, feat_dim)
-    # Fit the scaler and transform
     x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
-    # Reshape back to original 3D shape
     x_train_scaled = x_train_scaled.reshape(n_train, n_slices, feat_dim)
 
     # --- Process validation data ---
@@ -160,7 +146,6 @@ def main(args):
     x_test_scaled = x_test_scaled.reshape(n_test, n_slices_test, feat_dim_test)
 
     # --- Flatten slice dimension if the Cox model requires one feature vector per patient ---
-    # Compute the mean across the slice dimension
     x_train_std = x_train_scaled.mean(axis=1)
     x_val_std = x_val_scaled.mean(axis=1)
     x_test_std = x_test_scaled.mean(axis=1)
@@ -218,16 +203,8 @@ def main(args):
         val_batch_size=batch_size
     )
 
-    # Enhanced Training Log Plot
-    plt.figure(figsize=(10, 6))
-    log.plot()
-    plt.title("Training Loss Over Epochs", fontsize=14)
-    plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Loss", fontsize=12)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "training_log.png"))
-    plt.close()
+    # Plot training log
+    plot_training_log(log, args.output_dir)
 
     partial_ll = model.partial_log_likelihood(x_val_std, (y_val_durations, y_val_events)).mean()
     print(f"Partial Log-Likelihood on Validation Set: {partial_ll}")
@@ -235,27 +212,8 @@ def main(args):
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_test_std)
 
-    # Improved Survival Functions Plot with Recurrence Highlighted
-    plt.figure(figsize=(10, 6))
-    ax = plt.gca()
-    # Plot the survival curves for the first 15 test samples.
-    for i in range(15):
-        ax.plot(surv.index, surv.iloc[:, i], lw=2, label=f"Sample {i}")
-        if y_test_events[i] == 1:
-            event_time = y_test_durations[i]
-            nearest_idx = np.abs(surv.index - event_time).argmin()
-            nearest_time = surv.index[nearest_idx]
-            survival_prob_at_event = surv.iloc[nearest_idx, i]
-            ax.scatter(nearest_time, survival_prob_at_event, color='red', s=50, zorder=5,
-                       label='Recurrence' if i == 0 else "")
-    ax.set_ylabel("Survival Probability", fontsize=12)
-    ax.set_xlabel("Time", fontsize=12)
-    ax.set_title("Survival Functions for Test Samples with Recurrence Highlighted", fontsize=14)
-    ax.legend(title="Sample Index", fontsize=10)
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "survival_functions.png"))
-    plt.close()
+    # Plot survival functions for the first 15 test samples
+    plot_survival_functions(surv, y_test_durations, y_test_events, args.output_dir, num_samples=15)
 
     ev = EvalSurv(surv, y_test_durations, y_test_events, censor_surv='km')
     concordance = ev.concordance_td()
@@ -263,61 +221,52 @@ def main(args):
 
     time_grid = np.linspace(y_test_durations.min(), y_test_durations.max(), 100)
     brier_score = ev.brier_score(time_grid)
-    plt.figure(figsize=(10, 6))
-    brier_score.plot(lw=2)
-    plt.title("Brier Score Over Time", fontsize=14)
-    plt.xlabel("Time", fontsize=12)
-    plt.ylabel("Brier Score", fontsize=12)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "brier_score.png"))
-    plt.close()
+    plot_brier_score(time_grid, brier_score, args.output_dir)
 
     integrated_brier = ev.integrated_brier_score(time_grid)
     integrated_nbll = ev.integrated_nbll(time_grid)
     print(f"Integrated Brier Score: {integrated_brier}")
     print(f"Integrated NBLL: {integrated_nbll}")
 
-    # ---- Additional Visualization & Interpretation ----
-    # Risk Stratification based on the median predicted risk
+    # Risk stratification based on the median predicted risk
     risk_scores = model.predict(x_test_std).reshape(-1)
     median_risk = np.median(risk_scores)
     low_risk_idx = risk_scores <= median_risk
     high_risk_idx = risk_scores > median_risk
 
-    # Enhanced Risk Score Distribution Plot with Histogram and Inset Boxplot
-    plt.figure(figsize=(10, 6))
-    sns.histplot(risk_scores, bins=30, color='skyblue', edgecolor='k')
-    plt.axvline(median_risk, color='red', linestyle='--', label=f'Median Risk ({median_risk:.2f})')
-    plt.xlabel("Predicted Risk Score", fontsize=12)
-    plt.ylabel("Frequency", fontsize=12)
-    plt.title("Distribution of Predicted Risk Scores", fontsize=14)
-    plt.legend()
-    plt.grid(True)
-    inset_ax = plt.axes([0.65, 0.65, 0.2, 0.2])
-    sns.boxplot(x=risk_scores, ax=inset_ax, color='lightgreen')
-    inset_ax.set_xlabel("")
-    inset_ax.set_yticks([])
-    plt.savefig(os.path.join(args.output_dir, "risk_score_distribution.png"))
-    plt.close()
+    plot_risk_score_distribution(risk_scores, median_risk, args.output_dir)
 
     # Kaplan-Meier curves for low- and high-risk groups
     kmf_low = KaplanMeierFitter()
     kmf_high = KaplanMeierFitter()
+    plot_kaplan_meier(kmf_low, kmf_high, y_test_durations, y_test_events, low_risk_idx, high_risk_idx, args.output_dir)
 
-    plt.figure(figsize=(10, 6))
-    kmf_low.fit(y_test_durations[low_risk_idx], event_observed=y_test_events[low_risk_idx], label='Low Risk')
-    ax = kmf_low.plot(ci_show=True, color='green', lw=2)
-    kmf_high.fit(y_test_durations[high_risk_idx], event_observed=y_test_events[high_risk_idx], label='High Risk')
-    kmf_high.plot(ci_show=True, ax=ax, color='red', lw=2)
-    plt.title("Kaplan-Meier Survival Curves by Risk Group", fontsize=14)
-    plt.xlabel("Time", fontsize=12)
-    plt.ylabel("Survival Probability", fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "km_risk_stratification.png"))
-    plt.close()
+    # Calibration Plot at a Fixed Time Point (e.g., 24 months)
+    fixed_time = 24  # desired time point (e.g., months)
+    if fixed_time not in surv.index:
+        nearest_idx = np.abs(surv.index - fixed_time).argmin()
+        nearest_time = surv.index[nearest_idx]
+        print(f"Fixed time {fixed_time} not found in survival index, using nearest time {nearest_time} instead.")
+        fixed_time = nearest_time
+
+    predicted_surv_probs = surv.loc[fixed_time].values
+    plot_calibration_plot(surv, fixed_time, predicted_surv_probs, y_test_durations, y_test_events, args.output_dir)
+
+    # Multi-Time Calibration Plots
+    time_points = [12, 24, 36]  # adjust as needed
+    plot_multi_calibration(surv, y_test_durations, y_test_events, time_points, args.output_dir)
+
+    # Additional overall statistics reporting
+    overall_kmf = KaplanMeierFitter()
+    overall_kmf.fit(y_test_durations, event_observed=y_test_events)
+    overall_surv = overall_kmf.predict(fixed_time)
+    print("\nAdditional Statistics:")
+    print(f"  Mean Predicted Risk Score: {np.mean(risk_scores):.4f}")
+    print(f"  Std of Predicted Risk Scores: {np.std(risk_scores):.4f}")
+    print(f"  Median Predicted Survival Probability at {fixed_time} months: {np.median(predicted_surv_probs):.4f}")
+    print(f"  Observed Survival Probability at {fixed_time} months (overall): {overall_surv:.4f}")
+    print(f"  Mean Predicted Survival Probability at {fixed_time} months: {np.mean(predicted_surv_probs):.4f}")
+    print(f"  Std of Predicted Survival Probabilities at {fixed_time} months: {np.std(predicted_surv_probs):.4f}")
 
     # Log-Rank Test between risk groups
     lr_results = logrank_test(
@@ -332,112 +281,6 @@ def main(args):
     median_high = kmf_high.median_survival_time_
     print(f"Median Survival Time (Low Risk): {median_low}")
     print(f"Median Survival Time (High Risk): {median_high}")
-
-    # Calibration Plot at a Fixed Time Point (e.g., 24 months)
-    fixed_time = 24  # desired time point (e.g., months)
-    if fixed_time not in surv.index:
-        nearest_idx = np.abs(surv.index - fixed_time).argmin()
-        nearest_time = surv.index[nearest_idx]
-        print(f"Fixed time {fixed_time} not found in survival index, using nearest time {nearest_time} instead.")
-        fixed_time = nearest_time
-
-    predicted_surv_probs = surv.loc[fixed_time].values
-    decile_bins = np.percentile(predicted_surv_probs, np.arange(0, 110, 10))
-    bin_indices = np.digitize(predicted_surv_probs, decile_bins, right=True)
-
-    observed_probs = []
-    predicted_avg = []
-    for i in range(1, 11):
-        idx = bin_indices == i
-        if np.sum(idx) > 0:
-            kmf = KaplanMeierFitter()
-            kmf.fit(y_test_durations[idx], event_observed=y_test_events[idx])
-            observed_probs.append(kmf.predict(fixed_time))
-            predicted_avg.append(np.mean(predicted_surv_probs[idx]))
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(predicted_avg, observed_probs, 'o-', lw=2, label='Calibration Curve')
-    plt.plot([0, 1], [0, 1], '--', color='gray', label='Ideal Calibration')
-    plt.xlabel(f"Predicted Survival Probability at {fixed_time} months", fontsize=12)
-    plt.ylabel("Observed Survival Probability", fontsize=12)
-    plt.title(f"Calibration Plot at {fixed_time} Months", fontsize=14)
-    plt.legend(fontsize=12)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "calibration_plot.png"))
-    plt.close()
-
-    # ---- Additional Validation Blocks ----
-
-    # Multi-Time Calibration Plots
-    time_points = [12, 24, 36]  # adjust these values as needed
-    plt.figure(figsize=(15, 5))
-    for idx, t in enumerate(time_points):
-        if t not in surv.index:
-            nearest_idx = np.abs(surv.index - t).argmin()
-            t = surv.index[nearest_idx]
-            print(f"Time {time_points[idx]} not found; using nearest time {t} instead.")
-        predicted_probs = surv.loc[t].values
-        decile_bins = np.percentile(predicted_probs, np.arange(0, 110, 10))
-        bin_indices = np.digitize(predicted_probs, decile_bins, right=True)
-
-        observed_probs = []
-        predicted_avg = []
-        for i in range(1, 11):
-            idx_bin = bin_indices == i
-            if np.sum(idx_bin) > 0:
-                kmf = KaplanMeierFitter()
-                kmf.fit(y_test_durations[idx_bin], event_observed=y_test_events[idx_bin])
-                observed_probs.append(kmf.predict(t))
-                predicted_avg.append(np.mean(predicted_probs[idx_bin]))
-        plt.subplot(1, len(time_points), idx+1)
-        plt.plot(predicted_avg, observed_probs, 'o-', lw=2, label='Calibration Curve')
-        plt.plot([0, 1], [0, 1], '--', color='gray', label='Ideal Calibration')
-        plt.xlabel(f"Predicted Prob at {t} months", fontsize=10)
-        plt.ylabel("Observed Survival Prob", fontsize=10)
-        plt.title(f"Calibration at {t} months", fontsize=12)
-        plt.legend(fontsize=8)
-        plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "multi_calibration_plot.png"))
-    plt.close()
-
-    # Optional: Bootstrap Confidence Interval for Concordance Index
-    # Optional: Bootstrap Confidence Interval for Concordance Index
-    if args.bootstrap:
-        from sklearn.utils import resample
-        n_bootstraps = 1000
-        concordance_bootstrap = []
-        for i in range(n_bootstraps):
-            indices = resample(np.arange(len(y_test_durations)), n_samples=len(y_test_durations))
-            surv_bootstrap = surv.iloc[:, indices]
-            durations_bootstrap = y_test_durations[indices]
-            events_bootstrap = y_test_events[indices]
-            ev_bootstrap = EvalSurv(surv_bootstrap, durations_bootstrap, events_bootstrap, censor_surv='km')
-            try:
-                score = ev_bootstrap.concordance_td()
-                concordance_bootstrap.append(score)
-            except ZeroDivisionError:
-                print(f"Warning: ZeroDivisionError in bootstrap iteration {i}, skipping this sample.")
-        if len(concordance_bootstrap) > 0:
-            ci_lower = np.percentile(concordance_bootstrap, 2.5)
-            ci_upper = np.percentile(concordance_bootstrap, 97.5)
-            print(f"Bootstrap 95% CI for Concordance Index: ({ci_lower:.4f}, {ci_upper:.4f})")
-        else:
-            print("No valid bootstrap samples were obtained for computing the Concordance Index CI.")
-
-
-    # Additional overall statistics reporting
-    overall_kmf = KaplanMeierFitter()
-    overall_kmf.fit(y_test_durations, event_observed=y_test_events)
-    overall_surv = overall_kmf.predict(fixed_time)
-    print("\nAdditional Statistics:")
-    print(f"  Mean Predicted Risk Score: {np.mean(risk_scores):.4f}")
-    print(f"  Std of Predicted Risk Scores: {np.std(risk_scores):.4f}")
-    print(f"  Median Predicted Survival Probability at {fixed_time} months: {np.median(predicted_surv_probs):.4f}")
-    print(f"  Observed Survival Probability at {fixed_time} months (overall): {overall_surv:.4f}")
-    print(f"  Mean Predicted Survival Probability at {fixed_time} months: {np.mean(predicted_surv_probs):.4f}")
-    print(f"  Std of Predicted Survival Probabilities at {fixed_time} months: {np.std(predicted_surv_probs):.4f}")
 
 
 if __name__ == "__main__":
@@ -488,8 +331,6 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
-    parser.add_argument('--bootstrap', action='store_true',
-                        help="If set, perform bootstrap validation for the concordance index")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

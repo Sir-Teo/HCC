@@ -37,3 +37,18 @@ def extract_features(data_loader, model, device):
     durations = np.concatenate(durations, axis=0)
     events = np.concatenate(events, axis=0)
     return features, durations, events
+
+
+
+def validate_survival_data(durations, events):
+    sort_idx = np.argsort(durations)
+    sorted_durations = durations[sort_idx]
+    sorted_events = events[sort_idx]
+    for i in range(len(sorted_durations)):
+        if sorted_events[i] == 1:
+            current_time = sorted_durations[i]
+            num_at_risk = np.sum(sorted_durations >= current_time)
+            if num_at_risk == 0:
+                raise ValueError(f"Event at {current_time} has no at-risk individuals.")
+            elif num_at_risk == 1:
+                print(f"Warning: Event at {current_time} has only 1 at-risk.")
