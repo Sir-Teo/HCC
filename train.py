@@ -444,13 +444,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1/L2 regularization"
     )
-    parser.add_argument("--train_dicom_root", type=str, default="/path/to/train/dicom",
+    parser.add_argument("--train_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC",
                     help="Path to the training DICOM directory.")
-    parser.add_argument("--test_dicom_root", type=str, default="/path/to/test/dicom",
+    parser.add_argument("--test_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the testing DICOM directory.")
-    parser.add_argument("--train_csv_file", type=str, default="train_patient_labels.csv",
+    parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
                         help="Path to the training CSV file.")
-    parser.add_argument("--test_csv_file", type=str, default="test_patient_labels.csv",
+    parser.add_argument("--test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv",
                         help="Path to the testing CSV file.")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                         help='Directory to store/load preprocessed image tensors')

@@ -15,3 +15,5 @@ weights/
 *.pt
 __pycache__/
 **/__pycache__/
+
+spreadsheets/
