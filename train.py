@@ -17,19 +17,49 @@ from utils.helpers import extract_features, validate_survival_data, upsample_tra
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
+# Updated import with additional plotting functions
 from utils.plotting import (plot_training_log, plot_survival_functions, plot_brier_score, 
                             plot_risk_score_distribution, plot_kaplan_meier, 
-                            plot_calibration_plot, plot_multi_calibration)
+                            plot_calibration_plot, plot_multi_calibration, 
+                            plot_cumulative_hazard, plot_survival_probability_distribution)
 
 sns.set(style="whitegrid")
+
+
+def bootstrap_evaluation(model, x_val_std, y_val_durations, y_val_events, num_bootstrap=1000):
+    """
+    Perform bootstrap evaluation to estimate the variability of the Concordance Index.
+    
+    Parameters:
+        model: Trained CoxPH model.
+        x_val_std (np.ndarray): Standardized validation features.
+        y_val_durations (np.ndarray): Survival durations for validation data.
+        y_val_events (np.ndarray): Event indicators for validation data.
+        num_bootstrap (int): Number of bootstrap samples.
+    
+    Returns:
+        np.ndarray: Array of bootstrapped concordance index values.
+    """
+    bootstrapped_concordances = []
+    n_samples = len(y_val_durations)
+    for i in range(num_bootstrap):
+        indices = np.random.choice(n_samples, size=n_samples, replace=True)
+        x_boot = x_val_std[indices]
+        durations_boot = y_val_durations[indices]
+        events_boot = y_val_events[indices]
+        surv_boot = model.predict_surv_df(x_boot)
+        ev_boot = EvalSurv(surv_boot, durations_boot, events_boot, censor_surv='km')
+        boot_c_index = ev_boot.concordance_td()
+        bootstrapped_concordances.append(boot_c_index)
+    return np.array(bootstrapped_concordances)
 
 
 def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=False):
     """
     Train the model on data from train_csv and evaluate on val_csv.
     hyperparams is a dict containing parameters such as learning_rate, dropout, alpha, gamma, and coxph_net.
-    If final_eval is True, additional evaluation (e.g., survival plots) may be produced.
-    Returns the chosen evaluation metric (here, the concordance index on the validation fold).
+    If final_eval is True, additional evaluation plots are produced.
+    Returns the evaluation metric (here, the concordance index).
     """
     # Set seed for reproducibility
     seed_everything(42, workers=True)
@@ -37,7 +67,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     # Instantiate the data module with the given CSV files
     data_module = HCCDataModule(
         train_csv_file=train_csv,
-        test_csv_file=val_csv,  # for evaluation, we treat the validation fold as "test"
+        test_csv_file=val_csv,  # treat the validation fold as "test"
         train_dicom_root=args.train_dicom_root,
         test_dicom_root=args.test_dicom_root,
         model_type="time_to_event",
@@ -82,7 +112,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
             x_train, y_train_durations, y_train_events
         )
 
-    # Standardize features (fitting only on train)
+    # Standardize features (fit only on train)
     x_mapper = StandardScaler()
     n_train, n_slices, feat_dim = x_train.shape
     x_train_reshaped = x_train.reshape(-1, feat_dim)
@@ -94,7 +124,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
     x_val_scaled = x_val_scaled.reshape(n_val, n_slices_val, feat_dim_val)
 
-    # For the Cox model, collapse the slice dimension by averaging
+    # Collapse the slice dimension by averaging (for the Cox model)
     x_train_std = x_train_scaled.mean(axis=1)
     x_val_std = x_val_scaled.mean(axis=1)
 
@@ -143,105 +173,89 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
         val_batch_size=args.batch_size
     )
 
-    # (Optional) For final evaluation, you might plot survival curves etc.
+    # Compute baseline hazards and predict survival functions
     model.compute_baseline_hazards()
     surv = model.predict_surv_df(x_val_std)
     ev = EvalSurv(surv, y_val_durations, y_val_events, censor_surv='km')
     concordance = ev.concordance_td()
     print(f"[Fold {fold_id}] Concordance Index: {concordance:.4f}")
 
-    # Optionally, if doing final evaluation (outer loop), you can add more plots and statistics here.
+    # Perform bootstrap evaluation if requested
+    if args.bootstrap:
+        print(f"[Fold {fold_id}] Performing bootstrap evaluation...")
+        boot_results = bootstrap_evaluation(model, x_val_std, y_val_durations, y_val_events, num_bootstrap=1000)
+        mean_boot = np.mean(boot_results)
+        ci_lower = np.percentile(boot_results, 2.5)
+        ci_upper = np.percentile(boot_results, 97.5)
+        print(f"[Fold {fold_id}] Bootstrap Concordance Index: Mean = {mean_boot:.4f}, 95% CI = [{ci_lower:.4f}, {ci_upper:.4f}]")
+
+    # If final evaluation is enabled, produce additional plots
     if final_eval:
-        # e.g., plot survival functions, calibration curves, risk stratification, etc.
-        plot_training_log(log, args.output_dir + f"/training_log_fold{fold_id}")
-        # (Add any additional plotting/evaluation as needed)
-        pass
+        # Create a subdirectory for this fold's outputs
+        fold_output_dir = os.path.join(args.output_dir, f"fold_{fold_id}")
+        os.makedirs(fold_output_dir, exist_ok=True)
+
+        # Plot training log
+        plot_training_log(log, fold_output_dir)
+
+        # Plot survival functions with recurrence markers
+        plot_survival_functions(surv, y_val_durations, y_val_events, fold_output_dir, num_samples=15)
+
+        # Compute and plot Brier score over a time grid
+        time_grid = np.linspace(y_val_durations.min(), y_val_durations.max(), 100)
+        brier_score = ev.brier_score(time_grid)
+        plot_brier_score(time_grid, brier_score, fold_output_dir)
+
+        # Compute risk scores, stratify, and plot risk score distribution
+        risk_scores = model.predict(x_val_std).reshape(-1)
+        median_risk = np.median(risk_scores)
+        plot_risk_score_distribution(risk_scores, median_risk, fold_output_dir)
+
+        # Stratify patients into low- and high-risk groups and plot Kaplan-Meier curves
+        low_risk_idx = risk_scores <= median_risk
+        high_risk_idx = risk_scores > median_risk
+        kmf_low = KaplanMeierFitter()
+        kmf_high = KaplanMeierFitter()
+        plot_kaplan_meier(kmf_low, kmf_high, y_val_durations, y_val_events, low_risk_idx, high_risk_idx, fold_output_dir)
+
+        # Plot calibration curve at a fixed time point (e.g., 24 time units)
+        fixed_time = 24
+        if fixed_time not in surv.index:
+            nearest_idx = np.abs(surv.index - fixed_time).argmin()
+            fixed_time = surv.index[nearest_idx]
+            print(f"[Fold {fold_id}] Fixed time not found; using nearest time {fixed_time} instead.")
+        predicted_surv_probs = surv.loc[fixed_time].values
+        plot_calibration_plot(surv, fixed_time, predicted_surv_probs, y_val_durations, y_val_events, fold_output_dir)
+
+        # Optional: Plot multi-time calibration curves at selected time points
+        time_points = [12, 24, 36]
+        plot_multi_calibration(surv, y_val_durations, y_val_events, time_points, fold_output_dir)
+
+        # New: Plot cumulative hazard functions (H(t) = -log(S(t)))
+        plot_cumulative_hazard(surv, fold_output_dir)
+
+        # New: Plot distribution of predicted survival probabilities at the fixed time
+        plot_survival_probability_distribution(surv, fold_output_dir, time_point=fixed_time)
 
     return concordance
 
 
-def nested_cross_validation(args):
-    """
-    Perform nested cross validation.
-    The outer loop estimates the generalization performance while the inner loop selects hyperparameters.
-    """
-    # Read the entire training CSV into a DataFrame
-    full_df = pd.read_csv(args.train_csv_file)
-
-    outer_cv = KFold(n_splits=args.outer_splits, shuffle=True, random_state=42)
-    outer_scores = []
-
-    # Define a hyperparameter grid for the inner CV search.
-    hyperparameter_grid = {
-        'learning_rate': [1e-8, 1e-7],
-        'dropout': [0.2, 0.5],
-        'alpha': [0.5, 1.0],
-        'gamma': [0.5, 1.0],
-        'coxph_net': ['mlp']  # you could also try 'linear'
-    }
-
-    fold = 0
-    for outer_train_idx, outer_test_idx in outer_cv.split(full_df):
-        fold += 1
-        print(f"\n=== Outer Fold {fold}/{args.outer_splits} ===")
-        outer_train_df = full_df.iloc[outer_train_idx].reset_index(drop=True)
-        outer_test_df = full_df.iloc[outer_test_idx].reset_index(drop=True)
-
-        # Inner loop for hyperparameter tuning on the outer training set
-        inner_cv = KFold(n_splits=args.inner_splits, shuffle=True, random_state=42)
-        best_inner_score = -np.inf
-        best_hyperparams = None
-
-        for hyperparams in ParameterGrid(hyperparameter_grid):
-            inner_scores = []
-            # For each hyperparameter configuration, evaluate with inner CV
-            for inner_train_idx, inner_val_idx in inner_cv.split(outer_train_df):
-                inner_train_df = outer_train_df.iloc[inner_train_idx].reset_index(drop=True)
-                inner_val_df = outer_train_df.iloc[inner_val_idx].reset_index(drop=True)
-                # For the inner loop, we assume that we can write these dataframes to temporary CSVs.
-                inner_train_csv = f"temp_inner_train_fold{fold}.csv"
-                inner_val_csv = f"temp_inner_val_fold{fold}.csv"
-                inner_train_df.to_csv(inner_train_csv, index=False)
-                inner_val_df.to_csv(inner_val_csv, index=False)
-                score = train_and_evaluate(args, inner_train_csv, inner_val_csv, hyperparams, fold_id=f"{fold}-inner")
-                inner_scores.append(score)
-            avg_inner_score = np.mean(inner_scores)
-            print(f"[Fold {fold}] Hyperparams {hyperparams} achieved inner avg concordance: {avg_inner_score:.4f}")
-            if avg_inner_score > best_inner_score:
-                best_inner_score = avg_inner_score
-                best_hyperparams = hyperparams
-
-        print(f"[Fold {fold}] Selected hyperparameters: {best_hyperparams} with score {best_inner_score:.4f}")
-
-        # Now train on the entire outer training set using the best hyperparameters and evaluate on the outer test set.
-        outer_train_csv = f"temp_outer_train_fold{fold}.csv"
-        outer_test_csv = f"temp_outer_test_fold{fold}.csv"
-        outer_train_df.to_csv(outer_train_csv, index=False)
-        outer_test_df.to_csv(outer_test_csv, index=False)
-        outer_score = train_and_evaluate(args, outer_train_csv, outer_test_csv, best_hyperparams, fold_id=f"{fold}-outer", final_eval=True)
-        outer_scores.append(outer_score)
-        print(f"[Fold {fold}] Outer fold concordance: {outer_score:.4f}")
-
-    avg_outer = np.mean(outer_scores)
-    print(f"\n=== Nested CV Average Concordance Index: {avg_outer:.4f} ===")
-
-
 def main(args):
-    if args.nested_cv:
-        nested_cross_validation(args)
-    else:
-        # Original training (non-nested) using provided CSVs.
-        # This is essentially the code you already have.
-        # For brevity, we call train_and_evaluate once on the full training and test CSVs.
-        score = train_and_evaluate(args, args.train_csv_file, args.test_csv_file, 
-                                   hyperparams={
-                                       'learning_rate': args.learning_rate,
-                                       'dropout': args.dropout,
-                                       'alpha': args.alpha,
-                                       'gamma': args.gamma,
-                                       'coxph_net': args.coxph_net
-                                   }, fold_id="full", final_eval=True)
-        print(f"Final Concordance Index: {score:.4f}")
+    score = train_and_evaluate(
+        args, 
+        args.train_csv_file, 
+        args.test_csv_file, 
+        hyperparams={
+            'learning_rate': args.learning_rate,
+            'dropout': args.dropout,
+            'alpha': args.alpha,
+            'gamma': args.gamma,
+            'coxph_net': args.coxph_net
+        }, 
+        fold_id="full", 
+        final_eval=True
+    )
+    print(f"Final Concordance Index: {score:.4f}")
 
 
 if __name__ == "__main__":
@@ -290,13 +304,8 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
-    # Arguments for nested CV
-    parser.add_argument('--nested_cv', action='store_true', 
-                        help="If set, perform nested cross validation instead of a single train/test split")
-    parser.add_argument('--outer_splits', type=int, default=3,
-                        help="Number of outer folds for nested CV")
-    parser.add_argument('--inner_splits', type=int, default=3,
-                        help="Number of inner folds for hyperparameter tuning")
+    parser.add_argument('--bootstrap', action='store_true',
+                        help="If set, perform bootstrap evaluation for the Concordance Index")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
