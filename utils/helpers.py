@@ -52,3 +52,33 @@ def validate_survival_data(durations, events):
                 raise ValueError(f"Event at {current_time} has no at-risk individuals.")
             elif num_at_risk == 1:
                 print(f"Warning: Event at {current_time} has only 1 at-risk.")
+
+def upsample_training_data(x_train, durations, events):
+    """
+    Upsample the minority class so that both classes have equal representation.
+    """
+    idx_event = np.where(events == 1)[0]
+    idx_no_event = np.where(events == 0)[0]
+
+    if len(idx_event) == 0 or len(idx_no_event) == 0:
+        print("Warning: One of the classes is empty. Skipping upsampling.")
+        return x_train, durations, events
+
+    if len(idx_event) < len(idx_no_event):
+        minority_idx = idx_event
+        majority_idx = idx_no_event
+    else:
+        minority_idx = idx_no_event
+        majority_idx = idx_event
+
+    n_to_sample = len(majority_idx) - len(minority_idx)
+    sampled_minority_idx = np.random.choice(minority_idx, size=n_to_sample, replace=True)
+    new_indices = np.concatenate([np.arange(len(events)), sampled_minority_idx])
+    new_indices = np.random.permutation(new_indices)
+
+    x_train_upsampled = x_train[new_indices]
+    durations_upsampled = durations[new_indices]
+    events_upsampled = events[new_indices]
+
+    print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples.")
+    return x_train_upsampled, durations_upsampled, events_upsampled
