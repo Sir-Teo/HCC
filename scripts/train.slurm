@@ -34,6 +34,7 @@ srun python train.py \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
+    --nested_cv \
 
 
 

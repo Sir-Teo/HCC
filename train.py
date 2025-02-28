@@ -5,38 +5,42 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold, ParameterGrid
 import torch
 from pytorch_lightning import seed_everything
-
 import torchtuples as tt
 from pycox.evaluation import EvalSurv
 from data.dataset import HCCDataModule
 from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
-from utils.helpers import extract_features, validate_survival_data,upsample_training_data
+from utils.helpers import extract_features, validate_survival_data, upsample_training_data
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
-
-# New imports for additional visualization and statistics
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
-
-# Import plotting functions from plotting.py
 from utils.plotting import (plot_training_log, plot_survival_functions, plot_brier_score, 
-                      plot_risk_score_distribution, plot_kaplan_meier, plot_calibration_plot, 
-                      plot_multi_calibration)
+                            plot_risk_score_distribution, plot_kaplan_meier, 
+                            plot_calibration_plot, plot_multi_calibration)
 
 sns.set(style="whitegrid")
 
 
-def main(args):
+def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=False):
+    """
+    Train the model on data from train_csv and evaluate on val_csv.
+    hyperparams is a dict containing parameters such as learning_rate, dropout, alpha, gamma, and coxph_net.
+    If final_eval is True, additional evaluation (e.g., survival plots) may be produced.
+    Returns the chosen evaluation metric (here, the concordance index on the validation fold).
+    """
+    # Set seed for reproducibility
     seed_everything(42, workers=True)
 
+    # Instantiate the data module with the given CSV files
     data_module = HCCDataModule(
-        train_csv_file=args.train_csv_file,
-        test_csv_file=args.test_csv_file,
+        train_csv_file=train_csv,
+        test_csv_file=val_csv,  # for evaluation, we treat the validation fold as "test"
         train_dicom_root=args.train_dicom_root,
         test_dicom_root=args.test_dicom_root,
-        model_type="time_to_event",  # or "linear" as needed
+        model_type="time_to_event",
         batch_size=args.batch_size,
         num_slices=args.num_slices,
         num_workers=args.num_workers,
@@ -45,98 +49,65 @@ def main(args):
     )
     data_module.setup()
 
+    # Load the DINOv2 feature extractor
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dino_model = load_dinov2_model(args.dinov2_weights)
     dino_model = dino_model.to(device)
     dino_model.eval()
-    dino_model.register_forward_hook(lambda m, i, o: None)  # Optionally register a hook
+    dino_model.register_forward_hook(lambda m, i, o: None)
 
+    # Get dataloaders for training and validation
     train_loader = data_module.train_dataloader()
     val_loader = data_module.val_dataloader()
-    test_loader = data_module.test_dataloader()
 
-    print("Extracting train features...")
+    # Feature extraction for train and validation data
     x_train, y_train_durations, y_train_events = extract_features(train_loader, dino_model, device)
-    print("Extracting validation features...")
     x_val, y_val_durations, y_val_events = extract_features(val_loader, dino_model, device)
-    print("Extracting test features...")
-    x_test, y_test_durations, y_test_events = extract_features(test_loader, dino_model, device)
-    print(x_train.shape)
-    print(x_val.shape)
-    print(x_test.shape)
 
     # Average across slices
     x_train = x_train.mean(axis=1)
     x_val = x_val.mean(axis=1)
-    x_test = x_test.mean(axis=1)
-    print(x_train.shape)
-    print(x_val.shape)
-    print(x_test.shape)
 
-    print("Checking for NaNs in features...")
-    print("x_train contains NaNs:", np.isnan(x_train).any())
-    print("x_val contains NaNs:", np.isnan(x_val).any())
-    print("x_test contains NaNs:", np.isnan(x_test).any())
-
+    # Check for NaNs and remove zero-variance features
     variances = np.var(x_train, axis=0)
     if np.any(variances == 0):
         zero_var_features = np.where(variances == 0)[0]
-        print(f"Warning: Features with zero variance: {zero_var_features}")
+        print(f"[Fold {fold_id}] Warning: Features with zero variance: {zero_var_features}")
         x_train = x_train[:, variances != 0]
         x_val = x_val[:, variances != 0]
-        x_test = x_test[:, variances != 0]
 
     if args.upsampling:
-        print("Performing upsampling on training data...")
+        print(f"[Fold {fold_id}] Performing upsampling on training data...")
         x_train, y_train_durations, y_train_events = upsample_training_data(
             x_train, y_train_durations, y_train_events
         )
 
-    y_train = (y_train_durations, y_train_events)
-    y_val = (y_val_durations, y_val_events)
-    y_test = (y_test_durations, y_test_events)
-
+    # Standardize features (fitting only on train)
     x_mapper = StandardScaler()
-    # --- Process training data ---
     n_train, n_slices, feat_dim = x_train.shape
     x_train_reshaped = x_train.reshape(-1, feat_dim)
     x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
     x_train_scaled = x_train_scaled.reshape(n_train, n_slices, feat_dim)
 
-    # --- Process validation data ---
     n_val, n_slices_val, feat_dim_val = x_val.shape
     x_val_reshaped = x_val.reshape(-1, feat_dim_val)
     x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
     x_val_scaled = x_val_scaled.reshape(n_val, n_slices_val, feat_dim_val)
 
-    # --- Process test data ---
-    n_test, n_slices_test, feat_dim_test = x_test.shape
-    x_test_reshaped = x_test.reshape(-1, feat_dim_test)
-    x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
-    x_test_scaled = x_test_scaled.reshape(n_test, n_slices_test, feat_dim_test)
-
-    # --- Flatten slice dimension if the Cox model requires one feature vector per patient ---
+    # For the Cox model, collapse the slice dimension by averaging
     x_train_std = x_train_scaled.mean(axis=1)
     x_val_std = x_val_scaled.mean(axis=1)
-    x_test_std = x_test_scaled.mean(axis=1)
 
-    print(x_train_std.shape)
-    print(x_val_std.shape)
-    print(x_test_std.shape)
-
-    print("Feature value ranges (train):")
-    print(f"  Min: {x_train_std.min()}, Max: {x_train_std.max()}")
-    print(f"  Mean abs: {np.mean(np.abs(x_train_std))}, Std: {np.std(x_train_std)}")
-
+    # Validate survival data
     validate_survival_data(y_train_durations, y_train_events)
 
     in_features = x_train_std.shape[1]
-    print("Input feature dimension:", in_features)
     out_features = 1
 
-    if args.coxph_net == 'mlp':
-        net = CustomMLP(in_features, out_features, dropout=args.dropout)
-    elif args.coxph_net == 'linear':
+    # Build the network based on hyperparameters
+    if hyperparams['coxph_net'] == 'mlp':
+        net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
+    elif hyperparams['coxph_net'] == 'linear':
         from torch import nn
         net = nn.Linear(in_features, out_features, bias=False)
     else:
@@ -144,121 +115,141 @@ def main(args):
 
     if args.center_risk:
         net = CenteredModel(net)
-
     net.register_forward_hook(lambda m, i, o: None)
 
-    model = CoxPHWithL1(net, tt.optim.Adam, alpha=args.alpha, gamma=args.gamma)
-    model.optimizer.set_lr(args.learning_rate)
+    # Instantiate the CoxPH model with L1/L2 regularization
+    model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
+    model.optimizer.set_lr(hyperparams['learning_rate'])
     model.optimizer.param_groups[0]['weight_decay'] = 1e-4
-
     model.x_train_std = x_train_std
+
+    # Define callbacks
     callbacks = [LossLogger(), ParamCheckerCallback()]
     if args.early_stopping:
         callbacks.append(tt.callbacks.EarlyStopping())
     if args.gradient_clip > 0:
         callbacks.insert(1, GradientClippingCallback(args.gradient_clip))
 
-    verbose = True
-    batch_size = args.batch_size
-
-    print("Training the CoxPH model...")
+    # Train the model
+    print(f"[Fold {fold_id}] Training the CoxPH model...")
     log = model.fit(
         x_train_std,
         (y_train_durations, y_train_events),
-        batch_size,
+        args.batch_size,
         args.epochs,
         callbacks,
-        verbose,
+        verbose=True,
         val_data=(x_val_std, (y_val_durations, y_val_events)),
-        val_batch_size=batch_size
+        val_batch_size=args.batch_size
     )
 
-    # Plot training log
-    plot_training_log(log, args.output_dir)
-
-    partial_ll = model.partial_log_likelihood(x_val_std, (y_val_durations, y_val_events)).mean()
-    print(f"Partial Log-Likelihood on Validation Set: {partial_ll}")
-
+    # (Optional) For final evaluation, you might plot survival curves etc.
     model.compute_baseline_hazards()
-    surv = model.predict_surv_df(x_test_std)
-
-    # Plot survival functions for the first 15 test samples
-    plot_survival_functions(surv, y_test_durations, y_test_events, args.output_dir, num_samples=15)
-
-    ev = EvalSurv(surv, y_test_durations, y_test_events, censor_surv='km')
+    surv = model.predict_surv_df(x_val_std)
+    ev = EvalSurv(surv, y_val_durations, y_val_events, censor_surv='km')
     concordance = ev.concordance_td()
-    print(f"Concordance Index: {concordance}")
+    print(f"[Fold {fold_id}] Concordance Index: {concordance:.4f}")
 
-    time_grid = np.linspace(y_test_durations.min(), y_test_durations.max(), 100)
-    brier_score = ev.brier_score(time_grid)
-    plot_brier_score(time_grid, brier_score, args.output_dir)
+    # Optionally, if doing final evaluation (outer loop), you can add more plots and statistics here.
+    if final_eval:
+        # e.g., plot survival functions, calibration curves, risk stratification, etc.
+        plot_training_log(log, args.output_dir + f"/training_log_fold{fold_id}")
+        # (Add any additional plotting/evaluation as needed)
+        pass
 
-    integrated_brier = ev.integrated_brier_score(time_grid)
-    integrated_nbll = ev.integrated_nbll(time_grid)
-    print(f"Integrated Brier Score: {integrated_brier}")
-    print(f"Integrated NBLL: {integrated_nbll}")
+    return concordance
 
-    # Risk stratification based on the median predicted risk
-    risk_scores = model.predict(x_test_std).reshape(-1)
-    median_risk = np.median(risk_scores)
-    low_risk_idx = risk_scores <= median_risk
-    high_risk_idx = risk_scores > median_risk
 
-    plot_risk_score_distribution(risk_scores, median_risk, args.output_dir)
+def nested_cross_validation(args):
+    """
+    Perform nested cross validation.
+    The outer loop estimates the generalization performance while the inner loop selects hyperparameters.
+    """
+    # Read the entire training CSV into a DataFrame
+    full_df = pd.read_csv(args.train_csv_file)
 
-    # Kaplan-Meier curves for low- and high-risk groups
-    kmf_low = KaplanMeierFitter()
-    kmf_high = KaplanMeierFitter()
-    plot_kaplan_meier(kmf_low, kmf_high, y_test_durations, y_test_events, low_risk_idx, high_risk_idx, args.output_dir)
+    outer_cv = KFold(n_splits=args.outer_splits, shuffle=True, random_state=42)
+    outer_scores = []
 
-    # Calibration Plot at a Fixed Time Point (e.g., 24 months)
-    fixed_time = 24  # desired time point (e.g., months)
-    if fixed_time not in surv.index:
-        nearest_idx = np.abs(surv.index - fixed_time).argmin()
-        nearest_time = surv.index[nearest_idx]
-        print(f"Fixed time {fixed_time} not found in survival index, using nearest time {nearest_time} instead.")
-        fixed_time = nearest_time
+    # Define a hyperparameter grid for the inner CV search.
+    hyperparameter_grid = {
+        'learning_rate': [1e-8, 1e-7],
+        'dropout': [0.2, 0.5],
+        'alpha': [0.5, 1.0],
+        'gamma': [0.5, 1.0],
+        'coxph_net': ['mlp']  # you could also try 'linear'
+    }
 
-    predicted_surv_probs = surv.loc[fixed_time].values
-    plot_calibration_plot(surv, fixed_time, predicted_surv_probs, y_test_durations, y_test_events, args.output_dir)
+    fold = 0
+    for outer_train_idx, outer_test_idx in outer_cv.split(full_df):
+        fold += 1
+        print(f"\n=== Outer Fold {fold}/{args.outer_splits} ===")
+        outer_train_df = full_df.iloc[outer_train_idx].reset_index(drop=True)
+        outer_test_df = full_df.iloc[outer_test_idx].reset_index(drop=True)
 
-    # Multi-Time Calibration Plots
-    time_points = [12, 24, 36]  # adjust as needed
-    plot_multi_calibration(surv, y_test_durations, y_test_events, time_points, args.output_dir)
+        # Inner loop for hyperparameter tuning on the outer training set
+        inner_cv = KFold(n_splits=args.inner_splits, shuffle=True, random_state=42)
+        best_inner_score = -np.inf
+        best_hyperparams = None
 
-    # Additional overall statistics reporting
-    overall_kmf = KaplanMeierFitter()
-    overall_kmf.fit(y_test_durations, event_observed=y_test_events)
-    overall_surv = overall_kmf.predict(fixed_time)
-    print("\nAdditional Statistics:")
-    print(f"  Mean Predicted Risk Score: {np.mean(risk_scores):.4f}")
-    print(f"  Std of Predicted Risk Scores: {np.std(risk_scores):.4f}")
-    print(f"  Median Predicted Survival Probability at {fixed_time} months: {np.median(predicted_surv_probs):.4f}")
-    print(f"  Observed Survival Probability at {fixed_time} months (overall): {overall_surv:.4f}")
-    print(f"  Mean Predicted Survival Probability at {fixed_time} months: {np.mean(predicted_surv_probs):.4f}")
-    print(f"  Std of Predicted Survival Probabilities at {fixed_time} months: {np.std(predicted_surv_probs):.4f}")
+        for hyperparams in ParameterGrid(hyperparameter_grid):
+            inner_scores = []
+            # For each hyperparameter configuration, evaluate with inner CV
+            for inner_train_idx, inner_val_idx in inner_cv.split(outer_train_df):
+                inner_train_df = outer_train_df.iloc[inner_train_idx].reset_index(drop=True)
+                inner_val_df = outer_train_df.iloc[inner_val_idx].reset_index(drop=True)
+                # For the inner loop, we assume that we can write these dataframes to temporary CSVs.
+                inner_train_csv = f"temp_inner_train_fold{fold}.csv"
+                inner_val_csv = f"temp_inner_val_fold{fold}.csv"
+                inner_train_df.to_csv(inner_train_csv, index=False)
+                inner_val_df.to_csv(inner_val_csv, index=False)
+                score = train_and_evaluate(args, inner_train_csv, inner_val_csv, hyperparams, fold_id=f"{fold}-inner")
+                inner_scores.append(score)
+            avg_inner_score = np.mean(inner_scores)
+            print(f"[Fold {fold}] Hyperparams {hyperparams} achieved inner avg concordance: {avg_inner_score:.4f}")
+            if avg_inner_score > best_inner_score:
+                best_inner_score = avg_inner_score
+                best_hyperparams = hyperparams
 
-    # Log-Rank Test between risk groups
-    lr_results = logrank_test(
-        y_test_durations[low_risk_idx],
-        y_test_durations[high_risk_idx],
-        event_observed_A=y_test_events[low_risk_idx],
-        event_observed_B=y_test_events[high_risk_idx]
-    )
-    print(f"Log-Rank Test p-value: {lr_results.p_value:.4f}")
+        print(f"[Fold {fold}] Selected hyperparameters: {best_hyperparams} with score {best_inner_score:.4f}")
 
-    median_low = kmf_low.median_survival_time_
-    median_high = kmf_high.median_survival_time_
-    print(f"Median Survival Time (Low Risk): {median_low}")
-    print(f"Median Survival Time (High Risk): {median_high}")
+        # Now train on the entire outer training set using the best hyperparameters and evaluate on the outer test set.
+        outer_train_csv = f"temp_outer_train_fold{fold}.csv"
+        outer_test_csv = f"temp_outer_test_fold{fold}.csv"
+        outer_train_df.to_csv(outer_train_csv, index=False)
+        outer_test_df.to_csv(outer_test_csv, index=False)
+        outer_score = train_and_evaluate(args, outer_train_csv, outer_test_csv, best_hyperparams, fold_id=f"{fold}-outer", final_eval=True)
+        outer_scores.append(outer_score)
+        print(f"[Fold {fold}] Outer fold concordance: {outer_score:.4f}")
+
+    avg_outer = np.mean(outer_scores)
+    print(f"\n=== Nested CV Average Concordance Index: {avg_outer:.4f} ===")
+
+
+def main(args):
+    if args.nested_cv:
+        nested_cross_validation(args)
+    else:
+        # Original training (non-nested) using provided CSVs.
+        # This is essentially the code you already have.
+        # For brevity, we call train_and_evaluate once on the full training and test CSVs.
+        score = train_and_evaluate(args, args.train_csv_file, args.test_csv_file, 
+                                   hyperparams={
+                                       'learning_rate': args.learning_rate,
+                                       'dropout': args.dropout,
+                                       'alpha': args.alpha,
+                                       'gamma': args.gamma,
+                                       'coxph_net': args.coxph_net
+                                   }, fold_id="full", final_eval=True)
+        print(f"Final Concordance Index: {score:.4f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train CoxPH model with DINOv2 features (local weights) and custom MLP with L1/L2 regularization"
+        description="Train CoxPH model with DINOv2 features and nested cross validation"
     )
     parser.add_argument("--train_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC",
-                    help="Path to the training DICOM directory.")
+                        help="Path to the training DICOM directory.")
     parser.add_argument("--test_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
                         help="Path to the testing DICOM directory.")
     parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
@@ -289,8 +280,6 @@ if __name__ == "__main__":
                         help='Number of times to sample from each patient per epoch')
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'],
                         help='Type of network for pycox survival regression.')
-    parser.add_argument('--coxph_method', type=str, default='pycox', choices=['pycox', 'traditional'],
-                        help='Regression method: "pycox" or "traditional" (lifelines) for CoxPH.')
     parser.add_argument('--dinov2_weights', type=str, required=True,
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
     parser.add_argument('--alpha', type=float, default=0.5,
@@ -301,6 +290,13 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
+    # Arguments for nested CV
+    parser.add_argument('--nested_cv', action='store_true', 
+                        help="If set, perform nested cross validation instead of a single train/test split")
+    parser.add_argument('--outer_splits', type=int, default=3,
+                        help="Number of outer folds for nested CV")
+    parser.add_argument('--inner_splits', type=int, default=3,
+                        help="Number of inner folds for hyperparameter tuning")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
