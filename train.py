@@ -5,7 +5,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold, ParameterGrid
 import torch
 from pytorch_lightning import seed_everything
 import torchtuples as tt
@@ -17,41 +16,12 @@ from utils.helpers import extract_features, validate_survival_data, upsample_tra
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
-# Updated import with additional plotting functions
 from utils.plotting import (plot_training_log, plot_survival_functions, plot_brier_score, 
                             plot_risk_score_distribution, plot_kaplan_meier, 
                             plot_calibration_plot, plot_multi_calibration, 
                             plot_cumulative_hazard, plot_survival_probability_distribution)
 
 sns.set(style="whitegrid")
-
-
-def bootstrap_evaluation(model, x_val_std, y_val_durations, y_val_events, num_bootstrap=1000):
-    """
-    Perform bootstrap evaluation to estimate the variability of the Concordance Index.
-    
-    Parameters:
-        model: Trained CoxPH model.
-        x_val_std (np.ndarray): Standardized validation features.
-        y_val_durations (np.ndarray): Survival durations for validation data.
-        y_val_events (np.ndarray): Event indicators for validation data.
-        num_bootstrap (int): Number of bootstrap samples.
-    
-    Returns:
-        np.ndarray: Array of bootstrapped concordance index values.
-    """
-    bootstrapped_concordances = []
-    n_samples = len(y_val_durations)
-    for i in range(num_bootstrap):
-        indices = np.random.choice(n_samples, size=n_samples, replace=True)
-        x_boot = x_val_std[indices]
-        durations_boot = y_val_durations[indices]
-        events_boot = y_val_events[indices]
-        surv_boot = model.predict_surv_df(x_boot)
-        ev_boot = EvalSurv(surv_boot, durations_boot, events_boot, censor_surv='km')
-        boot_c_index = ev_boot.concordance_td()
-        bootstrapped_concordances.append(boot_c_index)
-    return np.array(bootstrapped_concordances)
 
 
 def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=False):
@@ -180,43 +150,32 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     concordance = ev.concordance_td()
     print(f"[Fold {fold_id}] Concordance Index: {concordance:.4f}")
 
-    # Perform bootstrap evaluation if requested
-    if args.bootstrap:
-        print(f"[Fold {fold_id}] Performing bootstrap evaluation...")
-        boot_results = bootstrap_evaluation(model, x_val_std, y_val_durations, y_val_events, num_bootstrap=1000)
-        mean_boot = np.mean(boot_results)
-        ci_lower = np.percentile(boot_results, 2.5)
-        ci_upper = np.percentile(boot_results, 97.5)
-        print(f"[Fold {fold_id}] Bootstrap Concordance Index: Mean = {mean_boot:.4f}, 95% CI = [{ci_lower:.4f}, {ci_upper:.4f}]")
-
     # If final evaluation is enabled, produce additional plots
     if final_eval:
-        # Create a subdirectory for this fold's outputs
-        fold_output_dir = os.path.join(args.output_dir, f"fold_{fold_id}")
-        os.makedirs(fold_output_dir, exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
 
         # Plot training log
-        plot_training_log(log, fold_output_dir)
+        plot_training_log(log, args.output_dir)
 
         # Plot survival functions with recurrence markers
-        plot_survival_functions(surv, y_val_durations, y_val_events, fold_output_dir, num_samples=15)
+        plot_survival_functions(surv, y_val_durations, y_val_events, args.output_dir, num_samples=15)
 
         # Compute and plot Brier score over a time grid
         time_grid = np.linspace(y_val_durations.min(), y_val_durations.max(), 100)
         brier_score = ev.brier_score(time_grid)
-        plot_brier_score(time_grid, brier_score, fold_output_dir)
+        plot_brier_score(time_grid, brier_score, args.output_dir)
 
         # Compute risk scores, stratify, and plot risk score distribution
         risk_scores = model.predict(x_val_std).reshape(-1)
         median_risk = np.median(risk_scores)
-        plot_risk_score_distribution(risk_scores, median_risk, fold_output_dir)
+        plot_risk_score_distribution(risk_scores, median_risk, args.output_dir)
 
         # Stratify patients into low- and high-risk groups and plot Kaplan-Meier curves
         low_risk_idx = risk_scores <= median_risk
         high_risk_idx = risk_scores > median_risk
         kmf_low = KaplanMeierFitter()
         kmf_high = KaplanMeierFitter()
-        plot_kaplan_meier(kmf_low, kmf_high, y_val_durations, y_val_events, low_risk_idx, high_risk_idx, fold_output_dir)
+        plot_kaplan_meier(kmf_low, kmf_high, y_val_durations, y_val_events, low_risk_idx, high_risk_idx, args.output_dir)
 
         # Plot calibration curve at a fixed time point (e.g., 24 time units)
         fixed_time = 24
@@ -225,34 +184,35 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
             fixed_time = surv.index[nearest_idx]
             print(f"[Fold {fold_id}] Fixed time not found; using nearest time {fixed_time} instead.")
         predicted_surv_probs = surv.loc[fixed_time].values
-        plot_calibration_plot(surv, fixed_time, predicted_surv_probs, y_val_durations, y_val_events, fold_output_dir)
+        plot_calibration_plot(surv, fixed_time, predicted_surv_probs, y_val_durations, y_val_events, args.output_dir)
 
         # Optional: Plot multi-time calibration curves at selected time points
         time_points = [12, 24, 36]
-        plot_multi_calibration(surv, y_val_durations, y_val_events, time_points, fold_output_dir)
+        plot_multi_calibration(surv, y_val_durations, y_val_events, time_points, args.output_dir)
 
-        # New: Plot cumulative hazard functions (H(t) = -log(S(t)))
-        plot_cumulative_hazard(surv, fold_output_dir)
+        # Plot cumulative hazard functions (H(t) = -log(S(t)))
+        plot_cumulative_hazard(surv, args.output_dir)
 
-        # New: Plot distribution of predicted survival probabilities at the fixed time
-        plot_survival_probability_distribution(surv, fold_output_dir, time_point=fixed_time)
+        # Plot distribution of predicted survival probabilities at the fixed time
+        plot_survival_probability_distribution(surv, args.output_dir, time_point=fixed_time)
 
     return concordance
 
 
 def main(args):
+    # Use single train/test split based on provided CSV files
     score = train_and_evaluate(
-        args, 
-        args.train_csv_file, 
-        args.test_csv_file, 
+        args,
+        args.train_csv_file,
+        args.test_csv_file,
         hyperparams={
             'learning_rate': args.learning_rate,
             'dropout': args.dropout,
             'alpha': args.alpha,
             'gamma': args.gamma,
             'coxph_net': args.coxph_net
-        }, 
-        fold_id="full", 
+        },
+        fold_id="full",
         final_eval=True
     )
     print(f"Final Concordance Index: {score:.4f}")
@@ -260,7 +220,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train CoxPH model with DINOv2 features and nested cross validation"
+        description="Train CoxPH model with DINOv2 features"
     )
     parser.add_argument("--train_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC",
                         help="Path to the training DICOM directory.")
@@ -304,9 +264,6 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
-    parser.add_argument('--bootstrap', action='store_true',
-                        help="If set, perform bootstrap evaluation for the Concordance Index")
-
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     main(args)

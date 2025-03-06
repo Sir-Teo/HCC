@@ -201,3 +201,5 @@ def plot_survival_probability_distribution(surv, output_dir, time_point=None):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"survival_probability_distribution_{time_point}.png"))
     plt.close()
+
+

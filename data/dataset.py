@@ -157,8 +157,7 @@ class HCCDicomDataset(Dataset):
                         file_path = os.path.join(root, fname)
                         try:
                             dcm = pydicom.dcmread(file_path, stop_before_pixels=True)
-                            # Skip CT images
-                            if hasattr(dcm, 'Modality') and dcm.Modality.upper() == 'CT':
+                            if not (hasattr(dcm, 'Modality') and dcm.Modality.upper() == 'MR'):
                                 continue
                         except Exception as e:
                             if DEBUG:
