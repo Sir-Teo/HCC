@@ -207,7 +207,7 @@ def upsample_df(df, target_column='event'):
     if len(df_minority) == 0 or len(df_majority) == 0:
         return df
     # Upsample minority class to match the majority class count
-    df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=42)
+    df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=1)
     return pd.concat([df_majority, df_minority_upsampled]).reset_index(drop=True)
 
 # =========
@@ -223,8 +223,8 @@ def cross_validation_mode(args):
     df_test_full['dicom_root'] = args.test_dicom_root
 
     # Prepare stratified splits using StratifiedKFold for each CSV
-    skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
-    skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
+    skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
+    skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
     
     train_splits = list(skf_train.split(df_train_full, df_train_full['event']))
     test_splits = list(skf_test.split(df_test_full, df_test_full['event']))
@@ -240,8 +240,16 @@ def cross_validation_mode(args):
         df_test_train = df_test_full.iloc[test_train_idx].reset_index(drop=True)
         df_test_test = df_test_full.iloc[test_test_idx].reset_index(drop=True)
         
+        # Print dataset information before upsampling
+        print(f"[CV Fold {fold}] Dataset Information before upsampling:")
+        print(f"  df_train_train: {len(df_train_train)} patients, Positive events: {df_train_train['event'].sum()}, Negative events: {len(df_train_train) - df_train_train['event'].sum()}")
+        print(f"  df_train_test: {len(df_train_test)} patients, Positive events: {df_train_test['event'].sum()}, Negative events: {len(df_train_test) - df_train_test['event'].sum()}")
+        print(f"  df_test_train: {len(df_test_train)} patients, Positive events: {df_test_train['event'].sum()}, Negative events: {len(df_test_train) - df_test_train['event'].sum()}")
+        print(f"  df_test_test: {len(df_test_test)} patients, Positive events: {df_test_test['event'].sum()}, Negative events: {len(df_test_test) - df_test_test['event'].sum()}")
+        
         # Upsample the test_train split if required
         if args.upsampling:
+            print(f"[CV Fold {fold}] Performing upsampling on df_test_train...")
             df_test_train = upsample_df(df_test_train, target_column='event')
         
         # Create new training and test sets by combining splits from both CSVs
@@ -274,6 +282,7 @@ def cross_validation_mode(args):
     avg_concordance = sum(fold_scores) / len(fold_scores)
     print(f"Average Concordance Index over {args.cv_folds} folds: {avg_concordance:.4f}")
 
+
 # =========
 # Modified main() to support cross validation mode
 # =========
@@ -297,9 +306,7 @@ def main(args):
         )
         print(f"Final Concordance Index: {score:.4f}")
 
-# =========
-# Updated argparse (add cross-validation options)
-# =========
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train CoxPH model with DINOv2 features"
@@ -316,7 +323,7 @@ if __name__ == "__main__":
                         help='Directory to store/load preprocessed image tensors')
     parser.add_argument('--batch_size', type=int, default=32, 
                         help='Batch size for data loaders')
-    parser.add_argument('--num_slices', type=int, default=2, 
+    parser.add_argument('--num_slices', type=int, default=64, 
                         help='Number of slices per patient')
     parser.add_argument('--num_workers', type=int, default=4, 
                         help='Number of workers for data loaders')
@@ -346,7 +353,6 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
-    # New cross-validation arguments
     parser.add_argument('--cross_validation', action='store_true',
                         help="Enable cross validation mode")
     parser.add_argument('--cv_folds', type=int, default=5,
