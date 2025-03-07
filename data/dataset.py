@@ -37,8 +37,7 @@ class HCCDicomDataset(Dataset):
             num_slices (int): Number of slices per sub-sample.
             num_samples (int): Number of sub-samples to extract from each patient's stack.
             preprocessed_root (str): Directory for caching/loading preprocessed tensors.
-            dataset_type (str): Either "TCGA" (for training/validation with an extra series folder)
-                                or "NYU" (for testing with the current structure).
+            dataset_type (str): Either "TCGA" or "NYU".
         """
         self.dicom_root = dicom_root
         self.transform = transform
@@ -57,7 +56,11 @@ class HCCDicomDataset(Dataset):
         self.patient_data = []
         for _, row in df.iterrows():
             patient_id = str(row['Pre op MRI Accession number'])
-            dicom_dir = os.path.join(dicom_root, patient_id)
+            # Use the dicom root from the CSV row if available; otherwise fall back
+            if 'dicom_root' in row:
+                dicom_dir = os.path.join(row['dicom_root'], patient_id)
+            else:
+                dicom_dir = os.path.join(dicom_root, patient_id)
             if os.path.exists(dicom_dir):
                 data_entry = {
                     'patient_id': patient_id,
@@ -348,8 +351,15 @@ class HCCDataModule:
         ])
 
     def setup(self):
-        train_df_full = pd.read_csv(self.train_csv_file)
-        test_df = pd.read_csv(self.test_csv_file)
+        if isinstance(self.train_csv_file, pd.DataFrame):
+            train_df_full = self.train_csv_file.copy()
+        else:
+            train_df_full = pd.read_csv(self.train_csv_file)
+
+        if isinstance(self.test_csv_file, pd.DataFrame):
+            test_df = self.test_csv_file.copy()
+        else:
+            test_df = pd.read_csv(self.test_csv_file)
 
         if self.model_type == "linear":
             stratify_col = train_df_full['event']
@@ -358,7 +368,7 @@ class HCCDataModule:
 
         train_df, val_df = train_test_split(
             train_df_full,
-            test_size=0.35,
+            test_size=0.2,
             random_state=42,
             stratify=stratify_col
         )

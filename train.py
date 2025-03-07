@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
 import torch
 from pytorch_lightning import seed_everything
 import torchtuples as tt
@@ -197,27 +198,108 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
         plot_survival_probability_distribution(surv, args.output_dir, time_point=fixed_time)
 
     return concordance
+# =========
+# Upsampling helper (for dataframes)
+# =========
+def upsample_df(df, target_column='event'):
+    df_majority = df[df[target_column] == 0]
+    df_minority = df[df[target_column] == 1]
+    if len(df_minority) == 0 or len(df_majority) == 0:
+        return df
+    # Upsample minority class to match the majority class count
+    df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=42)
+    return pd.concat([df_majority, df_minority_upsampled]).reset_index(drop=True)
 
+# =========
+# New cross-validation mode function
+# =========
+def cross_validation_mode(args):
+    # Read CSV files
+    df_train_full = pd.read_csv(args.train_csv_file)
+    df_test_full = pd.read_csv(args.test_csv_file)
+    
+    # Inject the proper DICOM roots into the dataframes
+    df_train_full['dicom_root'] = args.train_dicom_root
+    df_test_full['dicom_root'] = args.test_dicom_root
 
+    # Prepare stratified splits using StratifiedKFold for each CSV
+    skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
+    skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
+    
+    train_splits = list(skf_train.split(df_train_full, df_train_full['event']))
+    test_splits = list(skf_test.split(df_test_full, df_test_full['event']))
+    
+    fold_scores = []
+    for fold in range(args.cv_folds):
+        train_train_idx, train_test_idx = train_splits[fold]
+        test_train_idx, test_test_idx = test_splits[fold]
+        
+        # Split each CSV into two parts
+        df_train_train = df_train_full.iloc[train_train_idx].reset_index(drop=True)
+        df_train_test = df_train_full.iloc[train_test_idx].reset_index(drop=True)
+        df_test_train = df_test_full.iloc[test_train_idx].reset_index(drop=True)
+        df_test_test = df_test_full.iloc[test_test_idx].reset_index(drop=True)
+        
+        # Upsample the test_train split if required
+        if args.upsampling:
+            df_test_train = upsample_df(df_test_train, target_column='event')
+        
+        # Create new training and test sets by combining splits from both CSVs
+        df_new_train = pd.concat([df_train_train, df_test_train]).reset_index(drop=True)
+        df_new_test = pd.concat([df_train_test, df_test_test]).reset_index(drop=True)
+        
+        print(f"[CV Fold {fold}] New train: {len(df_new_train)} patients, New test: {len(df_new_test)} patients")
+        pos_train = (df_new_train['event'] == 1).sum()
+        pos_test = (df_new_test['event'] == 1).sum()
+        print(f"[CV Fold {fold}] Positive cases - Train: {pos_train}, Test: {pos_test}")
+        
+        # Call the existing training routine using the new splits.
+        # (train_and_evaluate accepts a DataFrame instead of a file path.)
+        concordance = train_and_evaluate(
+            args,
+            train_csv=df_new_train,
+            val_csv=df_new_test,
+            hyperparams={
+                'learning_rate': args.learning_rate,
+                'dropout': args.dropout,
+                'alpha': args.alpha,
+                'gamma': args.gamma,
+                'coxph_net': args.coxph_net
+            },
+            fold_id=f"fold_{fold}",
+            final_eval=False  # Set to True only for final evaluation if desired
+        )
+        fold_scores.append(concordance)
+    
+    avg_concordance = sum(fold_scores) / len(fold_scores)
+    print(f"Average Concordance Index over {args.cv_folds} folds: {avg_concordance:.4f}")
+
+# =========
+# Modified main() to support cross validation mode
+# =========
 def main(args):
-    # Use single train/test split based on provided CSV files
-    score = train_and_evaluate(
-        args,
-        args.train_csv_file,
-        args.test_csv_file,
-        hyperparams={
-            'learning_rate': args.learning_rate,
-            'dropout': args.dropout,
-            'alpha': args.alpha,
-            'gamma': args.gamma,
-            'coxph_net': args.coxph_net
-        },
-        fold_id="full",
-        final_eval=True
-    )
-    print(f"Final Concordance Index: {score:.4f}")
+    if args.cross_validation:
+        cross_validation_mode(args)
+    else:
+        score = train_and_evaluate(
+            args,
+            args.train_csv_file,
+            args.test_csv_file,
+            hyperparams={
+                'learning_rate': args.learning_rate,
+                'dropout': args.dropout,
+                'alpha': args.alpha,
+                'gamma': args.gamma,
+                'coxph_net': args.coxph_net
+            },
+            fold_id="full",
+            final_eval=True
+        )
+        print(f"Final Concordance Index: {score:.4f}")
 
-
+# =========
+# Updated argparse (add cross-validation options)
+# =========
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train CoxPH model with DINOv2 features"
@@ -264,6 +346,11 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used during training")
+    # New cross-validation arguments
+    parser.add_argument('--cross_validation', action='store_true',
+                        help="Enable cross validation mode")
+    parser.add_argument('--cv_folds', type=int, default=5,
+                        help="Number of cross validation folds")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     main(args)
