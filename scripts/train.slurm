@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -p a100_short,a100_long,radiology,a100_dev,gpu4_dev
+#SBATCH -p a100_short,radiology
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
-#SBATCH --time=3:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --job-name=hcc
 #SBATCH --output=/gpfs/data/shenlab/wz1492/HCC/logs/train-%J.log
 #SBATCH --exclude=a100-4020
@@ -34,7 +34,8 @@ srun python train.py \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
-    --cross_validation 
+    --cross_validation \
+    --leave_one_out
 
 
 
