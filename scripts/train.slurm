@@ -35,7 +35,7 @@ srun python train.py \
     --gamma 0.5 \
     --early_stopping \
     --cross_validation \
-    --leave_one_out
+
 
 
 

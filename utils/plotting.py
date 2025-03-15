@@ -6,6 +6,8 @@ from lifelines import KaplanMeierFitter
 
 sns.set(style="whitegrid")
 
+def ensure_dir(directory):
+    os.makedirs(directory, exist_ok=True)
 
 def plot_training_log(log, output_dir):
     """Plot training loss over epochs."""
@@ -168,8 +170,8 @@ def plot_cumulative_hazard(surv, output_dir):
     cumulative_hazard = -np.log(surv)
     # Plot cumulative hazard for a few sample patients for clarity
     for i in range(min(10, cumulative_hazard.shape[1])):
-        plt.plot(cumulative_hazard.index, cumulative_hazard.iloc[:, i], lw=2, alpha=0.7,
-                 label=f"Sample {i}" if i < 5 else None)
+        plt.plot(cumulative_hazard.index, cumulative_hazard.iloc[:, i],
+                 lw=2, alpha=0.7, label=f"Sample {i}" if i < 5 else None)
     plt.title("Cumulative Hazard Functions", fontsize=14)
     plt.xlabel("Time", fontsize=12)
     plt.ylabel("Cumulative Hazard", fontsize=12)
@@ -202,4 +204,122 @@ def plot_survival_probability_distribution(surv, output_dir, time_point=None):
     plt.savefig(os.path.join(output_dir, f"survival_probability_distribution_{time_point}.png"))
     plt.close()
 
+def plot_cv_metrics(fold_stats, output_dir, figsize=(14, 8), dpi=100):
+    """
+    Plot cross-validation metrics with improved visualization:
+      - Bar plot of the concordance index per fold with mean line
+      - Bar plot of the event rate for both training and testing data per fold
+      - Summary statistics table
+      
+    Parameters:
+    -----------
+    fold_stats : list of dict
+        List of dictionaries containing fold statistics
+    output_dir : str
+        Directory to save the output plots
+    figsize : tuple, optional
+        Figure size in inches (width, height)
+    dpi : int, optional
+        Resolution of the output figure
+    """
+    ensure_dir(output_dir)
+    folds = [stat["fold"] for stat in fold_stats]
+    concordances = [stat["concordance"] for stat in fold_stats]
+    train_event_rates = [stat["train_events"] / stat["train_total"] for stat in fold_stats]
+    test_event_rates = [stat["test_events"] / stat["test_total"] for stat in fold_stats]
+    
+    # Calculate summary statistics
+    mean_concordance = np.mean(concordances)
+    std_concordance = np.std(concordances)
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 1])
+    
+    # Plot Concordance Index per fold
+    ax1 = fig.add_subplot(gs[0, 0])
+    bars = ax1.bar(folds, concordances, color='steelblue', alpha=0.8, edgecolor='black')
+    
+    # Add mean line
+    ax1.axhline(y=mean_concordance, color='red', linestyle='--', 
+                label=f'Mean: {mean_concordance:.3f}')
+    
+    # Add labels to bars
+    for bar in bars:
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    ax1.set_xlabel("Fold", fontsize=11)
+    ax1.set_ylabel("Concordance Index", fontsize=11)
+    ax1.set_title("Concordance Index per Fold", fontsize=13, fontweight='bold')
+    ax1.set_ylim(max(0, min(concordances) - 0.1), min(1, max(concordances) + 0.1))
+    ax1.grid(axis='y', linestyle='--', alpha=0.7)
+    ax1.legend()
+    
+    # Plot Event Rates per fold for train and test
+    ax2 = fig.add_subplot(gs[0, 1])
+    width = 0.35
+    indices = np.arange(len(folds))
+    
+    train_bars = ax2.bar(indices - width/2, train_event_rates, width=width, 
+                         color='forestgreen', label='Train Event Rate', alpha=0.8, edgecolor='black')
+    test_bars = ax2.bar(indices + width/2, test_event_rates, width=width, 
+                        color='orangered', label='Test Event Rate', alpha=0.8, edgecolor='black')
+    
+    # Add labels to bars
+    for bars, rates in [(train_bars, train_event_rates), (test_bars, test_event_rates)]:
+        for bar, rate in zip(bars, rates):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{rate:.2f}', ha='center', va='bottom', fontsize=9)
+    
+    ax2.set_xlabel("Fold", fontsize=11)
+    ax2.set_ylabel("Event Rate", fontsize=11)
+    ax2.set_title("Event Rates per Fold", fontsize=13, fontweight='bold')
+    ax2.set_xticks(indices)
+    ax2.set_xticklabels(folds)
+    ax2.legend()
+    ax2.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Add summary statistics table
+    ax3 = fig.add_subplot(gs[1, :])
+    ax3.axis('off')
+    
+    # Calculate additional statistics
+    mean_train_rate = np.mean(train_event_rates)
+    mean_test_rate = np.mean(test_event_rates)
+    max_concordance = np.max(concordances)
+    min_concordance = np.min(concordances)
+    
+    table_data = [
+        ['Metric', 'Mean', 'Std Dev', 'Min', 'Max'],
+        ['Concordance', f'{mean_concordance:.3f}', f'{std_concordance:.3f}', 
+         f'{min_concordance:.3f}', f'{max_concordance:.3f}'],
+        ['Train Event Rate', f'{mean_train_rate:.3f}', f'{np.std(train_event_rates):.3f}', 
+         f'{np.min(train_event_rates):.3f}', f'{np.max(train_event_rates):.3f}'],
+        ['Test Event Rate', f'{mean_test_rate:.3f}', f'{np.std(test_event_rates):.3f}', 
+         f'{np.min(test_event_rates):.3f}', f'{np.max(test_event_rates):.3f}'],
+    ]
+    
+    table = ax3.table(cellText=table_data, loc='center', cellLoc='center', 
+                     colWidths=[0.2, 0.2, 0.2, 0.2, 0.2])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+    
+    # Color the header row
+    for i in range(len(table_data[0])):
+        table[(0, i)].set_facecolor('#4472C4')
+        table[(0, i)].set_text_props(color='white', fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save high-resolution figure
+    fig_path = os.path.join(output_dir, "cv_metrics.png")
+    plt.savefig(fig_path, dpi=dpi, bbox_inches='tight')
 
+    
+    plt.close()
+    
+    return fig_path
