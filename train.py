@@ -6,10 +6,11 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 import torchtuples as tt
 from pycox.evaluation import EvalSurv
 from lifelines import KaplanMeierFitter
+import datetime  # new import for timestamp
 
 # Custom module imports
 from data.dataset import HCCDataModule
@@ -17,7 +18,7 @@ from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
 from utils.helpers import extract_features, validate_survival_data, upsample_training_data
 from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
-from utils.plotting import (plot_training_log, plot_survival_functions, plot_brier_score,
+from utils.plotting import (plot_survival_functions, plot_brier_score,
                       plot_risk_score_distribution, plot_kaplan_meier, plot_calibration_plot,
                       plot_multi_calibration, plot_cumulative_hazard, plot_survival_probability_distribution,
                       plot_cv_metrics)
@@ -25,15 +26,13 @@ from utils.plotting import (plot_training_log, plot_survival_functions, plot_bri
 sns.set(style="whitegrid")
 
 
-def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=False):
+def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=True):
     """
     Train the model on data from train_csv and evaluate on val_csv.
     Returns the concordance index computed on the validation set.
-    In this way, when passing the same DataFrame for training and validation,
-    you get an estimate of the training c-index.
     """
     # Set seed for reproducibility
-    torch.manual_seed(42)
+    # torch.manual_seed(42)
     
     # Instantiate the data module with CSV files or DataFrames
     data_module = HCCDataModule(
@@ -153,9 +152,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     # Final evaluation: produce additional plots using plotting module if requested
     if final_eval:
         os.makedirs(args.output_dir, exist_ok=True)
-        
-        plot_training_log(log, args.output_dir)
-        
+    
         plot_survival_functions(surv, y_val_durations, y_val_events, args.output_dir, num_samples=15)
         
         time_grid = np.linspace(y_val_durations.min(), y_val_durations.max(), 100)
@@ -185,7 +182,6 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
         plot_multi_calibration(surv, y_val_durations, y_val_events, time_points, args.output_dir)
         
         plot_cumulative_hazard(surv, args.output_dir)
-        
         plot_survival_probability_distribution(surv, args.output_dir, time_point=fixed_time)
     
     return concordance
@@ -201,11 +197,17 @@ def upsample_df(df, target_column='event'):
 
 
 def cross_validation_mode(args):
+    # Read training CSV
     df_train_full = pd.read_csv(args.train_csv_file)
-    df_test_full = pd.read_csv(args.test_csv_file)
-    
     df_train_full['dicom_root'] = args.train_dicom_root
-    df_test_full['dicom_root'] = args.test_dicom_root
+
+    # If test CSV is provided, read it; otherwise, use only the training dataset.
+    if args.test_csv_file:
+        df_test_full = pd.read_csv(args.test_csv_file)
+        df_test_full['dicom_root'] = args.test_dicom_root
+    else:
+        df_test_full = None
+        print("No test CSV provided. Performing cross validation on the training dataset only.")
     
     fold_stats = []
     
@@ -217,8 +219,12 @@ def cross_validation_mode(args):
         'coxph_net': args.coxph_net
     }
     
+    # Leave-One-Out Cross Validation
     if args.leave_one_out:
-        df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True)
+        if df_test_full is not None:
+            df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True)
+        else:
+            df_all = df_train_full
         print(f"[LOO CV] Combined dataset has {len(df_all)} patients.")
         from sklearn.model_selection import LeaveOneOut
         loo = LeaveOneOut()
@@ -240,7 +246,7 @@ def cross_validation_mode(args):
                 val_csv=df_new_train,
                 hyperparams=hyperparams,
                 fold_id=f"LOO_fold_{fold}_train",
-                final_eval=False
+                final_eval=True
             )
             # Compute testing concordance by evaluating on the test split
             test_concordance = train_and_evaluate(
@@ -249,7 +255,7 @@ def cross_validation_mode(args):
                 val_csv=df_new_test,
                 hyperparams=hyperparams,
                 fold_id=f"LOO_fold_{fold}_test",
-                final_eval=False
+                final_eval=True
             )
             fold_stats.append({
                 "fold": fold,
@@ -261,67 +267,105 @@ def cross_validation_mode(args):
                 "test_events": pos_test
             })
     else:
-        from sklearn.model_selection import StratifiedKFold
-        skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
-        skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
-        train_splits = list(skf_train.split(df_train_full, df_train_full['event']))
-        test_splits = list(skf_test.split(df_test_full, df_test_full['event']))
-        
-        for fold in range(args.cv_folds):
-            train_train_idx, train_test_idx = train_splits[fold]
-            test_train_idx, test_test_idx = test_splits[fold]
-            
-            df_train_train = df_train_full.iloc[train_train_idx].reset_index(drop=True)
-            df_train_test = df_train_full.iloc[train_test_idx].reset_index(drop=True)
-            df_test_train = df_test_full.iloc[test_train_idx].reset_index(drop=True)
-            df_test_test = df_test_full.iloc[test_test_idx].reset_index(drop=True)
-            
-            print(f"[CV Fold {fold}] Dataset Information before upsampling:")
-            print(f"  df_train_train: {len(df_train_train)} patients, Positive events: {df_train_train['event'].sum()}")
-            print(f"  df_train_test: {len(df_train_test)} patients, Positive events: {df_train_test['event'].sum()}")
-            print(f"  df_test_train: {len(df_test_train)} patients, Positive events: {df_test_train['event'].sum()}")
-            print(f"  df_test_test: {len(df_test_test)} patients, Positive events: {df_test_test['event'].sum()}")
-            
-            if args.upsampling:
-                print(f"[CV Fold {fold}] Performing upsampling on df_test_train...")
-                df_test_train = upsample_df(df_test_train, target_column='event')
-            
-            df_new_train = pd.concat([df_train_train, df_test_train]).reset_index(drop=True)
-            df_new_test = pd.concat([df_train_test, df_test_test]).reset_index(drop=True)
-            
-            pos_train = (df_new_train['event'] == 1).sum()
-            pos_test = (df_new_test['event'] == 1).sum()
-            print(f"[CV Fold {fold}] New train: {len(df_new_train)} patients, Positive events: {pos_train}")
-            print(f"[CV Fold {fold}] New test: {len(df_new_test)} patients, Positive events: {pos_test}")
-            
-            # Compute training concordance for the fold
-            train_concordance = train_and_evaluate(
-                args,
-                train_csv=df_new_train,
-                val_csv=df_new_train,
-                hyperparams=hyperparams,
-                fold_id=f"fold_{fold}_train",
-                final_eval=False
-            )
-            # Compute testing concordance for the fold
-            test_concordance = train_and_evaluate(
-                args,
-                train_csv=df_new_train,
-                val_csv=df_new_test,
-                hyperparams=hyperparams,
-                fold_id=f"fold_{fold}_test",
-                final_eval=False
-            )
-            
-            fold_stats.append({
-                "fold": fold,
-                "train_concordance": train_concordance,
-                "test_concordance": test_concordance,
-                "train_total": len(df_new_train),
-                "train_events": pos_train,
-                "test_total": len(df_new_test),
-                "test_events": pos_test
-            })
+        # Non-LOO cross validation
+        if df_test_full is not None:
+            # When both training and testing CSVs are provided, use separate stratified splits.
+            skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
+            skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
+            train_splits = list(skf_train.split(df_train_full, df_train_full['event']))
+            test_splits = list(skf_test.split(df_test_full, df_test_full['event']))
+            for fold in range(args.cv_folds):
+                train_train_idx, train_test_idx = train_splits[fold]
+                test_train_idx, test_test_idx = test_splits[fold]
+                
+                df_train_train = df_train_full.iloc[train_train_idx].reset_index(drop=True)
+                df_train_test = df_train_full.iloc[train_test_idx].reset_index(drop=True)
+                df_test_train = df_test_full.iloc[test_train_idx].reset_index(drop=True)
+                df_test_test = df_test_full.iloc[test_test_idx].reset_index(drop=True)
+                
+                print(f"[CV Fold {fold}] Dataset Information before upsampling:")
+                print(f"  df_train_train: {len(df_train_train)} patients, Positive events: {df_train_train['event'].sum()}")
+                print(f"  df_train_test: {len(df_train_test)} patients, Positive events: {df_train_test['event'].sum()}")
+                print(f"  df_test_train: {len(df_test_train)} patients, Positive events: {df_test_train['event'].sum()}")
+                print(f"  df_test_test: {len(df_test_test)} patients, Positive events: {df_test_test['event'].sum()}")
+                
+                if args.upsampling:
+                    print(f"[CV Fold {fold}] Performing upsampling on df_test_train...")
+                    df_test_train = upsample_df(df_test_train, target_column='event')
+                
+                df_new_train = pd.concat([df_train_train, df_test_train]).reset_index(drop=True)
+                df_new_test = pd.concat([df_train_test, df_test_test]).reset_index(drop=True)
+                
+                pos_train = (df_new_train['event'] == 1).sum()
+                pos_test = (df_new_test['event'] == 1).sum()
+                print(f"[CV Fold {fold}] New train: {len(df_new_train)} patients, Positive events: {pos_train}")
+                print(f"[CV Fold {fold}] New test: {len(df_new_test)} patients, Positive events: {pos_test}")
+                
+                # Compute training concordance for the fold
+                train_concordance = train_and_evaluate(
+                    args,
+                    train_csv=df_new_train,
+                    val_csv=df_new_train,
+                    hyperparams=hyperparams,
+                    fold_id=f"fold_{fold}_train",
+                    final_eval=True
+                )
+                # Compute testing concordance for the fold
+                test_concordance = train_and_evaluate(
+                    args,
+                    train_csv=df_new_train,
+                    val_csv=df_new_test,
+                    hyperparams=hyperparams,
+                    fold_id=f"fold_{fold}_test",
+                    final_eval=True
+                )
+                
+                fold_stats.append({
+                    "fold": fold,
+                    "train_concordance": train_concordance,
+                    "test_concordance": test_concordance,
+                    "train_total": len(df_new_train),
+                    "train_events": pos_train,
+                    "test_total": len(df_new_test),
+                    "test_events": pos_test
+                })
+        else:
+            # When no test CSV is provided, perform StratifiedKFold on the training dataset only.
+            from sklearn.model_selection import StratifiedKFold
+            skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
+            for fold, (train_idx, test_idx) in enumerate(skf.split(df_train_full, df_train_full['event'])):
+                df_new_train = df_train_full.iloc[train_idx].reset_index(drop=True)
+                df_new_test = df_train_full.iloc[test_idx].reset_index(drop=True)
+                pos_train = (df_new_train['event'] == 1).sum()
+                pos_test = (df_new_test['event'] == 1).sum()
+                print(f"[CV Fold {fold}] Train: {len(df_new_train)} patients, Positive events: {pos_train}")
+                print(f"[CV Fold {fold}] Test: {len(df_new_test)} patients, Positive events: {pos_test}")
+                
+                train_concordance = train_and_evaluate(
+                    args,
+                    train_csv=df_new_train,
+                    val_csv=df_new_train,
+                    hyperparams=hyperparams,
+                    fold_id=f"fold_{fold}_train",
+                    final_eval=True
+                )
+                test_concordance = train_and_evaluate(
+                    args,
+                    train_csv=df_new_train,
+                    val_csv=df_new_test,
+                    hyperparams=hyperparams,
+                    fold_id=f"fold_{fold}_test",
+                    final_eval=True
+                )
+                fold_stats.append({
+                    "fold": fold,
+                    "train_concordance": train_concordance,
+                    "test_concordance": test_concordance,
+                    "train_total": len(df_new_train),
+                    "train_events": pos_train,
+                    "test_total": len(df_new_test),
+                    "test_events": pos_test
+                })
     
     # Calculate and print average concordance values across folds
     avg_train_concordance = np.mean([stat["train_concordance"] for stat in fold_stats])
@@ -337,47 +381,69 @@ def cross_validation_mode(args):
     plot_cv_metrics(fold_stats, args.output_dir)
     
     # ---------------- Final evaluation on full datasets ----------------
-    # For stratified CV, we train a final model on the full training data (df_train_full)
-    # and then evaluate on both the full training and full testing datasets.
     if not args.leave_one_out:
-        print("Training final model on full training dataset and evaluating on full training and testing datasets...")
-        final_concordance_train = train_and_evaluate(
-            args,
-            train_csv=df_train_full,
-            val_csv=df_train_full,
-            hyperparams=hyperparams,
-            fold_id="final_full_train",
-            final_eval=False
-        )
-        final_concordance_test = train_and_evaluate(
-            args,
-            train_csv=df_train_full,
-            val_csv=df_test_full,
-            hyperparams=hyperparams,
-            fold_id="final_full_test",
-            final_eval=True
-        )
-        print(f"Final Concordance Index on full training dataset: {final_concordance_train:.4f}")
-        print(f"Final Concordance Index on full testing dataset: {final_concordance_test:.4f}")
+        if df_test_full is not None:
+            print("Training final model on full training dataset and evaluating on full training and testing datasets...")
+            final_concordance_train = train_and_evaluate(
+                args,
+                train_csv=df_train_full,
+                val_csv=df_train_full,
+                hyperparams=hyperparams,
+                fold_id="final_full_train",
+                final_eval=True
+            )
+            final_concordance_test = train_and_evaluate(
+                args,
+                train_csv=df_train_full,
+                val_csv=df_test_full,
+                hyperparams=hyperparams,
+                fold_id="final_full_test",
+                final_eval=True
+            )
+            print(f"Final Concordance Index on full training dataset: {final_concordance_train:.4f}")
+            print(f"Final Concordance Index on full testing dataset: {final_concordance_test:.4f}")
+        else:
+            print("Training final model on full training dataset with a hold-out split...")
+            # Perform a hold-out train-test split on the training dataset
+            df_train, df_test = train_test_split(
+                df_train_full, test_size=0.2, stratify=df_train_full['event'], random_state=42
+            )
+            final_concordance_train = train_and_evaluate(
+                args,
+                train_csv=df_train,
+                val_csv=df_train,
+                hyperparams=hyperparams,
+                fold_id="final_full_train",
+                final_eval=True
+            )
+            final_concordance_test = train_and_evaluate(
+                args,
+                train_csv=df_train,
+                val_csv=df_test,
+                hyperparams=hyperparams,
+                fold_id="final_full_test",
+                final_eval=True
+            )
+            print(f"Final Concordance Index on training subset: {final_concordance_train:.4f}")
+            print(f"Final Concordance Index on hold-out test subset: {final_concordance_test:.4f}")
     else:
-        # For LOOCV, use the combined dataset (df_all)
         print("Training final model on full dataset (LOOCV) and evaluating...")
         final_concordance_all = train_and_evaluate(
             args,
-            train_csv=df_all,
-            val_csv=df_all,
+            train_csv=df_train_full if df_test_full is None else pd.concat([df_train_full, df_test_full]).reset_index(drop=True),
+            val_csv=df_train_full if df_test_full is None else pd.concat([df_train_full, df_test_full]).reset_index(drop=True),
             hyperparams=hyperparams,
             fold_id="final_all",
-            final_eval=False
+            final_eval=True
         )
         print(f"Final Concordance Index on full dataset (LOOCV): {final_concordance_all:.4f}")
-
 
 
 def main(args):
     if args.cross_validation:
         cross_validation_mode(args)
     else:
+        # For non-cross-validation mode, test CSV must be provided.
         score = train_and_evaluate(
             args,
             args.train_csv_file,
@@ -403,8 +469,13 @@ if __name__ == "__main__":
                          help="Path to the testing DICOM directory.")
     parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
                          help="Path to the training CSV file.")
+    # Remove the default for test_csv_file so that it can be omitted.
+    # /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv
+    # /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC
+    # --test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv
+    # /gpfs/data/mankowskilab/HCC_Recurrence/dicom
     parser.add_argument("--test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv",
-                         help="Path to the testing CSV file.")
+                         help="Path to the testing CSV file. If not provided, a train-test split will be performed on the training dataset.")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                          help='Directory to store/load preprocessed image tensors')
     parser.add_argument('--batch_size', type=int, default=32,
@@ -416,7 +487,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=500,
                         help='Number of training epochs')
     parser.add_argument('--output_dir', type=str, default='checkpoints',
-                        help='Directory to save outputs and models')
+                        help='Base directory to save outputs and models')
     parser.add_argument('--learning_rate', type=float, default=1e-8,
                         help='Learning rate for the CoxPH model')
     parser.add_argument('--gradient_clip', type=float, default=0.05,
@@ -447,5 +518,10 @@ if __name__ == "__main__":
                         help="Enable leave-one-out cross validation mode (combines CSVs and uses LOOCV)")
     
     args = parser.parse_args()
+
+    # Create a unique subdirectory for each run using a timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.output_dir = os.path.join(args.output_dir, f"run_{timestamp}")
     os.makedirs(args.output_dir, exist_ok=True)
+    
     main(args)
