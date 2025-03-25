@@ -3,6 +3,8 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from lifelines import KaplanMeierFitter
+from lifelines.utils import concordance_index
+
 
 sns.set(style="whitegrid")
 
@@ -186,62 +188,48 @@ def plot_survival_probability_distribution(surv, output_dir, time_point=None):
     plt.savefig(os.path.join(output_dir, f"survival_probability_distribution_{time_point}.png"))
     plt.close()
 
-def plot_cv_metrics(fold_stats, output_dir, figsize=(14, 8), dpi=100):
+def plot_cv_metrics(predicted_risk_scores, event_times, event_indicators, output_dir, figsize=(14, 8), dpi=100):
     """
-    Plot cross-validation metrics with improved visualization:
-      - Bar plot of the test concordance index per fold with a mean line.
-      - Summary statistics table for the test concordance.
+    Plot cross-validation metrics based on per-patient predictions:
+      - Histogram of predicted risk scores with overall C-index in the title.
+      - Summary table of overall metrics.
     """
-    ensure_dir(output_dir)
-    folds = [stat["fold"] for stat in fold_stats]
-    test_concordances = [stat["test_concordance"] for stat in fold_stats]
+    # Compute overall concordance index using lifelines
+    overall_concordance = concordance_index(event_times, predicted_risk_scores, event_observed=event_indicators)
     
-    mean_concordance = np.mean(test_concordances)
-    std_concordance = np.std(test_concordances)
-    
-    fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1])
-    
-    ax1 = fig.add_subplot(gs[0, 0])
-    bars = ax1.bar(folds, test_concordances, color='steelblue', alpha=0.8, edgecolor='black')
-    
-    ax1.axhline(y=mean_concordance, color='red', linestyle='--', 
-                label=f'Mean: {mean_concordance:.3f}')
-    
-    for bar in bars:
-        height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                 f'{height:.3f}', ha='center', va='bottom', fontsize=9)
-    
-    ax1.set_xlabel("Fold", fontsize=11)
-    ax1.set_ylabel("Test Concordance Index", fontsize=11)
-    ax1.set_title("Test Concordance Index per Fold", fontsize=13, fontweight='bold')
-    ax1.set_ylim(max(0, min(test_concordances) - 0.1), min(1, max(test_concordances) + 0.1))
-    ax1.grid(axis='y', linestyle='--', alpha=0.7)
-    ax1.legend()
-    
-    ax2 = fig.add_subplot(gs[1, 0])
-    ax2.axis('off')
-    
-    table_data = [
-        ['Metric', 'Mean', 'Std Dev', 'Min', 'Max'],
-        ['Test Concordance', f'{mean_concordance:.3f}', f'{std_concordance:.3f}', 
-         f'{min(test_concordances):.3f}', f'{max(test_concordances):.3f}']
-    ]
-    
-    table = ax2.table(cellText=table_data, loc='center', cellLoc='center', 
-                      colWidths=[0.2, 0.2, 0.2, 0.2, 0.2])
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.5)
-    
-    for i in range(len(table_data[0])):
-        table[(0, i)].set_facecolor('#4472C4')
-        table[(0, i)].set_text_props(color='white', fontweight='bold')
-    
-    plt.tight_layout()
-    fig_path = os.path.join(output_dir, "cv_metrics.png")
-    plt.savefig(fig_path, dpi=dpi, bbox_inches='tight')
+    # Histogram of predicted risk scores
+    plt.figure(figsize=figsize)
+    plt.hist(predicted_risk_scores, bins=20, color='steelblue', edgecolor='black', alpha=0.7)
+    plt.xlabel("Predicted Risk Score")
+    plt.ylabel("Frequency")
+    plt.title(f"Predicted Risk Score Distribution\nOverall Concordance Index: {overall_concordance:.3f}")
+    hist_path = os.path.join(output_dir, "cv_risk_score_distribution.png")
+    plt.savefig(hist_path, dpi=dpi, bbox_inches='tight')
     plt.close()
     
-    return fig_path
+    # Summary table of metrics
+    mean_risk = np.mean(predicted_risk_scores)
+    std_risk = np.std(predicted_risk_scores)
+    min_risk = np.min(predicted_risk_scores)
+    max_risk = np.max(predicted_risk_scores)
+    
+    fig, ax = plt.subplots(figsize=(6, 2))
+    ax.axis('off')
+    table_data = [
+        ['Metric', 'Value'],
+        ['Overall C-index', f'{overall_concordance:.3f}'],
+        ['Mean Risk Score', f'{mean_risk:.3f}'],
+        ['Std Dev Risk Score', f'{std_risk:.3f}'],
+        ['Min Risk Score', f'{min_risk:.3f}'],
+        ['Max Risk Score', f'{max_risk:.3f}']
+    ]
+    
+    table = ax.table(cellText=table_data, loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    plt.tight_layout()
+    table_path = os.path.join(output_dir, "cv_summary_metrics.png")
+    plt.savefig(table_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+    
+    return hist_path, table_path

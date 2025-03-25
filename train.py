@@ -211,7 +211,6 @@ def cross_validation_mode(args):
     df_train_full = pd.read_csv(args.train_csv_file)
     df_train_full['dicom_root'] = args.train_dicom_root
 
-    # If test CSV is provided, read it; otherwise, use only the training dataset.
     if args.test_csv_file:
         df_test_full = pd.read_csv(args.test_csv_file)
         df_test_full['dicom_root'] = args.test_dicom_root
@@ -222,7 +221,8 @@ def cross_validation_mode(args):
     all_predicted_risk_scores = []
     all_event_times = []
     all_event_indicators = []
-    
+    fold_cindices = []  # List to store per-fold concordance indices
+
     hyperparams = {
         'learning_rate': args.learning_rate,
         'dropout': args.dropout,
@@ -232,27 +232,21 @@ def cross_validation_mode(args):
     }
     
     if args.leave_one_out:
-        # For LOOCV, combine all data (if test CSV is provided, combine with training)
-        if df_test_full is not None:
-            df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True)
-        else:
-            df_all = df_train_full
-        print(f"[LOO CV] Combined dataset has {len(df_all)} patients.")
+        # Leave-one-out branch (unchanged)
         from sklearn.model_selection import LeaveOneOut
+        df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True) if df_test_full is not None else df_train_full
+        print(f"[LOO CV] Combined dataset has {len(df_all)} patients.")
         loo = LeaveOneOut()
         splits = list(loo.split(df_all))
         for fold, (train_idx, test_idx) in enumerate(splits):
             df_new_train = df_all.iloc[train_idx].reset_index(drop=True)
             df_new_test = df_all.iloc[test_idx].reset_index(drop=True)
-            pos_train = (df_new_train['event'] == 1).sum()
-            pos_test = (df_new_test['event'] == 1).sum()
-            print(f"[LOO Fold {fold}] Train patients: {len(df_new_train)}, Positive events: {pos_train}")
-            print(f"[LOO Fold {fold}] Test patient: {len(df_new_test)}, Positive events: {pos_test}")
+            print(f"[LOO Fold {fold}] Train patients: {len(df_new_train)}, Positive events: {(df_new_train['event'] == 1).sum()}")
+            print(f"[LOO Fold {fold}] Test patient: {len(df_new_test)}, Positive events: {(df_new_test['event'] == 1).sum()}")
             if args.upsampling:
                 print(f"[LOO Fold {fold}] Performing upsampling on training data...")
                 df_new_train = upsample_df(df_new_train, target_column='event')
             
-            # Train on N-1 patients and predict on the left-out patient
             risk_scores, durations, events = train_and_evaluate(
                 args,
                 train_csv=df_new_train,
@@ -262,15 +256,15 @@ def cross_validation_mode(args):
                 final_eval=False,
                 return_predictions=True
             )
-            # Append the single-patient prediction (risk_scores, durations, events are arrays of length 1)
+            # For LOOCV, each fold has one prediction; overall metrics can be computed later if desired.
             all_predicted_risk_scores.extend(risk_scores.tolist())
             all_event_times.extend(durations.tolist())
             all_event_indicators.extend(events.tolist())
-        
     else:
-        # Non-LOO cross validation mode
+        # Non-LOOCV cross validation mode
         if df_test_full is not None:
             # When both training and testing CSVs are provided, perform stratified splits separately.
+            from sklearn.model_selection import StratifiedKFold
             skf_train = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
             skf_test = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
             train_splits = list(skf_train.split(df_train_full, df_train_full['event']))
@@ -289,7 +283,6 @@ def cross_validation_mode(args):
                     print(f"[CV Fold {fold}] Performing upsampling on df_test_fold training subset if needed...")
                     df_train_train = upsample_df(df_train_train, target_column='event')
                 
-                # Train on combined training data and predict on the test fold
                 risk_scores, durations, events = train_and_evaluate(
                     args,
                     train_csv=df_train_train,
@@ -299,11 +292,17 @@ def cross_validation_mode(args):
                     final_eval=False,
                     return_predictions=True
                 )
+                # Compute the fold's concordance index
+                fold_cindex = concordance_index(durations, risk_scores, event_observed=events)
+                print(f"[CV Fold {fold}] Concordance Index: {fold_cindex:.4f}")
+                fold_cindices.append(fold_cindex)
+                
                 all_predicted_risk_scores.extend(risk_scores.tolist())
                 all_event_times.extend(durations.tolist())
                 all_event_indicators.extend(events.tolist())
         else:
             # When no test CSV is provided, perform StratifiedKFold on the training dataset only.
+            from sklearn.model_selection import StratifiedKFold
             skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
             for fold, (train_idx, test_idx) in enumerate(skf.split(df_train_full, df_train_full['event'])):
                 df_new_train = df_train_full.iloc[train_idx].reset_index(drop=True)
@@ -320,15 +319,32 @@ def cross_validation_mode(args):
                     final_eval=False,
                     return_predictions=True
                 )
+                # Compute the fold's concordance index
+                fold_cindex = concordance_index(durations, risk_scores, event_observed=events)
+                print(f"[CV Fold {fold}] Concordance Index: {fold_cindex:.4f}")
+                fold_cindices.append(fold_cindex)
+                
                 all_predicted_risk_scores.extend(risk_scores.tolist())
                 all_event_times.extend(durations.tolist())
                 all_event_indicators.extend(events.tolist())
     
-    # Compute overall concordance index using the aggregated predictions
+    # Compute overall concordance index on aggregated predictions (if needed)
     overall_cindex = concordance_index(all_event_times, np.array(all_predicted_risk_scores), event_observed=np.array(all_event_indicators))
-    print(f"Overall Concordance Index from CV: {overall_cindex:.4f}")
+    print(f"Overall Concordance Index from aggregated CV predictions: {overall_cindex:.4f}")
     
-    # Plot cross-validation metrics (histogram and summary table)
+    # Report summary statistics for per-fold concordance indices
+    mean_cindex = np.mean(fold_cindices)
+    std_cindex = np.std(fold_cindices)
+    min_cindex = np.min(fold_cindices)
+    max_cindex = np.max(fold_cindices)
+    
+    print("\nCross Validation Concordance Index Statistics:")
+    print(f"Mean: {mean_cindex:.4f}")
+    print(f"Standard Deviation: {std_cindex:.4f}")
+    print(f"Minimum: {min_cindex:.4f}")
+    print(f"Maximum: {max_cindex:.4f}")
+    
+    # Optionally, plot CV metrics using your existing plotting functions
     plot_cv_metrics(np.array(all_predicted_risk_scores), np.array(all_event_times), np.array(all_event_indicators), args.output_dir)
 
 
@@ -379,11 +395,11 @@ if __name__ == "__main__":
                         help='Base directory to save outputs and models')
     parser.add_argument('--learning_rate', type=float, default=1e-5,
                         help='Learning rate for the CoxPH model')
-    parser.add_argument('--gradient_clip', type=float, default=0.05,
+    parser.add_argument('--gradient_clip', type=float, default=0.1,
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--center_risk', action='store_true',
                         help='If set, center risk scores for numerical stability')
-    parser.add_argument('--dropout', type=float, default=0.2,
+    parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate for the MLP if used')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample from each patient per epoch')
@@ -401,7 +417,7 @@ if __name__ == "__main__":
                         help="If set, early stopping will be used during training")
     parser.add_argument('--cross_validation', action='store_true',
                         help="Enable cross validation mode")
-    parser.add_argument('--cv_folds', type=int, default=5,
+    parser.add_argument('--cv_folds', type=int, default=10,
                         help="Number of cross validation folds")
     parser.add_argument('--leave_one_out', action='store_true',
                         help="Enable leave-one-out cross validation mode (combines CSVs and uses LOOCV)")
