@@ -20,21 +20,22 @@ source ~/.bashrc
 conda activate dinov2
 
 srun python train.py \
-    --batch_size 128 \
+    --batch_size 80 \
     --num_slices  64\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --learning_rate 1e-6 \
+    --learning_rate 5e-5 \
     --num_samples_per_patient 1\
-    --gradient_clip 1\
+    --gradient_clip 3\
     --center_risk \
     --coxph_net mlp \
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 500 \
+    --epochs 10000 \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
     --cross_validation \
+
 
 
 
