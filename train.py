@@ -207,20 +207,23 @@ def upsample_df(df, target_column='event'):
 
 
 def cross_validation_mode(args):
-    # Read training CSV
+    # Read training CSV and add a source column
     df_train_full = pd.read_csv(args.train_csv_file)
     df_train_full['dicom_root'] = args.train_dicom_root
+    df_train_full['source'] = 'train'  # mark train samples
 
     if args.test_csv_file:
         df_test_full = pd.read_csv(args.test_csv_file)
         df_test_full['dicom_root'] = args.test_dicom_root
+        df_test_full['source'] = 'test'  # mark test samples
     else:
         df_test_full = None
         print("No test CSV provided. Performing cross validation on the training dataset only.")
-    
+
     all_predicted_risk_scores = []
     all_event_times = []
     all_event_indicators = []
+    all_sources = []  # New list to store source info for each prediction
     fold_cindices = []  # List to store per-fold concordance indices
 
     hyperparams = {
@@ -231,8 +234,8 @@ def cross_validation_mode(args):
         'coxph_net': args.coxph_net
     }
     
+    # Determine combined dataset based on whether test CSV is provided
     if args.leave_one_out:
-        # Leave-one-out branch remains unchanged.
         from sklearn.model_selection import LeaveOneOut
         df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True) if df_test_full is not None else df_train_full
         print(f"[LOO CV] Combined dataset has {len(df_all)} patients.")
@@ -256,12 +259,13 @@ def cross_validation_mode(args):
                 final_eval=False,
                 return_predictions=True
             )
+            # Extend the aggregated lists; also record the source for these predictions
             all_predicted_risk_scores.extend(risk_scores.tolist())
             all_event_times.extend(durations.tolist())
             all_event_indicators.extend(events.tolist())
+            all_sources.extend(df_new_test['source'].tolist())
     else:
         # Non-LOOCV cross validation mode with combined data
-        # Combine the CSVs if a test CSV is provided
         df_all = pd.concat([df_train_full, df_test_full]).reset_index(drop=True) if df_test_full is not None else df_train_full
         print(f"[CV] Combined dataset has {len(df_all)} patients.")
         from sklearn.model_selection import StratifiedKFold
@@ -284,7 +288,7 @@ def cross_validation_mode(args):
                 final_eval=False,
                 return_predictions=True
             )
-            # Compute the fold's concordance index
+            # Compute and report the fold's concordance index
             fold_cindex = concordance_index(durations, risk_scores, event_observed=events)
             print(f"[CV Fold {fold}] Concordance Index: {fold_cindex:.4f}")
             fold_cindices.append(fold_cindex)
@@ -292,23 +296,53 @@ def cross_validation_mode(args):
             all_predicted_risk_scores.extend(risk_scores.tolist())
             all_event_times.extend(durations.tolist())
             all_event_indicators.extend(events.tolist())
+            all_sources.extend(df_new_test['source'].tolist())
     
-    # Compute overall concordance index on aggregated predictions (if needed)
+    # Compute overall concordance index on aggregated predictions (combined across sources)
     overall_cindex = concordance_index(all_event_times, np.array(all_predicted_risk_scores), event_observed=np.array(all_event_indicators))
     print(f"Overall Concordance Index from aggregated CV predictions: {overall_cindex:.4f}")
     
-    # Report summary statistics for per-fold concordance indices
+    # Report summary statistics for per-fold concordance indices (combined)
     mean_cindex = np.mean(fold_cindices)
     std_cindex = np.std(fold_cindices)
     min_cindex = np.min(fold_cindices)
     max_cindex = np.max(fold_cindices)
     
-    print("\nCross Validation Concordance Index Statistics:")
+    print("\nCross Validation Concordance Index Statistics (combined):")
     print(f"Mean: {mean_cindex:.4f}")
     print(f"Standard Deviation: {std_cindex:.4f}")
     print(f"Minimum: {min_cindex:.4f}")
     print(f"Maximum: {max_cindex:.4f}")
-    
+
+    # Now, if both CSVs are provided, compute and report stats separately for train and test sources.
+    if df_test_full is not None:
+        all_sources = np.array(all_sources)
+        all_predicted_risk_scores = np.array(all_predicted_risk_scores)
+        all_event_times = np.array(all_event_times)
+        all_event_indicators = np.array(all_event_indicators)
+        
+        # Identify indices for training and test samples
+        train_indices = np.where(all_sources == 'train')[0]
+        test_indices = np.where(all_sources == 'test')[0]
+        
+        if len(train_indices) > 0:
+            train_risk_scores = all_predicted_risk_scores[train_indices]
+            train_event_times = all_event_times[train_indices]
+            train_event_indicators = all_event_indicators[train_indices]
+            train_cindex = concordance_index(train_event_times, train_risk_scores, event_observed=train_event_indicators)
+            print(f"\nTraining CSV Only Concordance Index: {train_cindex:.4f}")
+        else:
+            print("\nNo training CSV samples found in the CV folds.")
+            
+        if len(test_indices) > 0:
+            test_risk_scores = all_predicted_risk_scores[test_indices]
+            test_event_times = all_event_times[test_indices]
+            test_event_indicators = all_event_indicators[test_indices]
+            test_cindex = concordance_index(test_event_times, test_risk_scores, event_observed=test_event_indicators)
+            print(f"Test CSV Only Concordance Index: {test_cindex:.4f}")
+        else:
+            print("No test CSV samples found in the CV folds.")
+
     # Optionally, plot CV metrics using your existing plotting functions
     plot_cv_metrics(np.array(all_predicted_risk_scores), np.array(all_event_times), np.array(all_event_indicators), args.output_dir)
 
