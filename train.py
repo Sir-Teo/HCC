@@ -151,7 +151,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     
     if return_predictions:
         # Predict risk scores for the validation set and return along with ground-truth
-        risk_scores = model.predict(x_val_std).reshape(-1)
+        risk_scores = -model.predict(x_val_std).reshape(-1)
         return risk_scores, y_val_durations, y_val_events
     else:
         # Compute survival predictions and evaluate concordance
@@ -417,7 +417,7 @@ if __name__ == "__main__":
                         help="If set, early stopping will be used during training")
     parser.add_argument('--cross_validation', action='store_true',
                         help="Enable cross validation mode")
-    parser.add_argument('--cv_folds', type=int, default=10,
+    parser.add_argument('--cv_folds', type=int, default=20,
                         help="Number of cross validation folds")
     parser.add_argument('--leave_one_out', action='store_true',
                         help="Enable leave-one-out cross validation mode (combines CSVs and uses LOOCV)")
