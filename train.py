@@ -209,16 +209,26 @@ def upsample_df(df, target_column='event'):
 def cross_validation_mode(args):
     # Read training CSV and add a source column
     df_train_full = pd.read_csv(args.train_csv_file)
+    n_train_original = len(df_train_full) 
     df_train_full['dicom_root'] = args.train_dicom_root
     df_train_full['source'] = 'train'  # mark train samples
 
     if args.test_csv_file:
         df_test_full = pd.read_csv(args.test_csv_file)
-        df_test_full['dicom_root'] = args.test_dicom_root
-        df_test_full['source'] = 'test'  # mark test samples
+        df_test_full["dicom_root"] = args.test_dicom_root
+        n_test_original = len(df_test_full)
+        common_cols = list(set(df_train_full.columns) & set(df_test_full.columns))
+        if 'event' not in common_cols: 
+            raise ValueError("'event' column missing.")
+        df_all = pd.concat([df_train_full[common_cols].copy(), df_test_full[common_cols].copy()])
+        # Instead of using np.arange, use the actual test DataFrame indices
+        original_test_indices_in_all = df_test_full.index.values
+        print(f"[CV Mode Option B] Combined train ({n_train_original}) and test ({n_test_original}) datasets. Total: {len(df_all)}")
     else:
-        df_test_full = None
-        print("No test CSV provided. Performing cross validation on the training dataset only.")
+        df_all = df_train_full.copy()
+        n_test_original = 0
+        original_test_indices_in_all = None
+        print(f"No test CSV provided. CV on training data only (Size: {len(df_all)}).")
 
     all_predicted_risk_scores = []
     all_event_times = []
@@ -378,7 +388,7 @@ if __name__ == "__main__":
                          help="Path to the testing DICOM directory.")
     parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
                          help="Path to the training CSV file.")
-    parser.add_argument("--test_csv_file", type=str, default="",
+    parser.add_argument("--test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv",
                          help="Path to the testing CSV file. If not provided, a train-test split will be performed on the training dataset.")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                          help='Directory to store/load preprocessed image tensors')

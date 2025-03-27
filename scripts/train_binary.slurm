@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -p a100_short,radiology
+#SBATCH -p a100_short,radiology,a100_dev
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
-#SBATCH --time=3-00:00:00
+#SBATCH --time=3:00:00
 #SBATCH --job-name=hcc
 #SBATCH --output=/gpfs/data/shenlab/wz1492/HCC/logs/train-%J.log
 #SBATCH --exclude=a100-4020
@@ -20,6 +20,10 @@ source ~/.bashrc
 conda activate dinov2
 
 srun python train_binary.py \
+    --train_dicom_root  /gpfs/data/mankowskilab/HCC_Recurrence/dicom \
+    --test_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
+    --train_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
+    --test_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
     --batch_size 64 \
     --num_slices  64\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
@@ -29,7 +33,7 @@ srun python train_binary.py \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
     --epochs 1000 \
     --cross_validation \
-    --leave_one_out
+
 
 
 

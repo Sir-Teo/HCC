@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -p a100_dev,radiology,a100_short
+#SBATCH -p radiology,a100_short
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
-#SBATCH --time=3:00:00
+#SBATCH --time=48:00:00
 #SBATCH --job-name=hcc
 #SBATCH --output=/gpfs/data/shenlab/wz1492/HCC/logs/train-%J.log
 #SBATCH --exclude=a100-4020
@@ -20,21 +20,26 @@ source ~/.bashrc
 conda activate dinov2
 
 srun python train.py \
+    --train_dicom_root  /gpfs/data/mankowskilab/HCC_Recurrence/dicom \
+    --test_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
+    --train_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
+    --test_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
     --batch_size 80 \
     --num_slices  64\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
-    --learning_rate 5e-5 \
+    --learning_rate 1e-5 \
     --num_samples_per_patient 1\
-    --gradient_clip 3\
+    --gradient_clip 5\
     --center_risk \
     --coxph_net mlp \
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 10000 \
+    --epochs 1000 \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
-    --cross_validation \
+
+
 
 
 

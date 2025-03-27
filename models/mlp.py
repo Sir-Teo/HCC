@@ -6,7 +6,7 @@ from pycox.models import CoxPH
 DEBUG = False
 
 class CustomMLP(nn.Module):
-    def __init__(self, in_features,out_features,dropout=0.0):
+    def __init__(self, in_features, out_features, dropout=0.0):
         """
         MLP specifically designed for input features of size 768 and output 1.
         The architecture is: 768 -> 512 -> 128 -> 1.
@@ -14,9 +14,11 @@ class CustomMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(512, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(128, out_features)
