@@ -24,14 +24,14 @@ srun python train_binary.py \
     --test_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
     --train_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --test_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
-    --batch_size 64 \
-    --num_slices  64\
+    --batch_size 32 \
+    --num_slices  32\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 1e-5 \
     --num_samples_per_patient 1\
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 1000 \
+    --epochs 10 \
     --cross_validation \
 
 

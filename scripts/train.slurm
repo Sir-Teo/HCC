@@ -29,7 +29,7 @@ srun python train.py \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 1e-5 \
     --num_samples_per_patient 1\
-    --gradient_clip 5\
+    --gradient_clip 2\
     --center_risk \
     --coxph_net mlp \
     --upsampling \

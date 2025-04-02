@@ -4,576 +4,501 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
-# Import necessary metrics
-from sklearn.metrics import (
-    roc_auc_score, roc_curve, 
-    precision_recall_curve, average_precision_score, # For PR Curve and PR-AUC
-    precision_score, recall_score, f1_score # Precision, Recall, F1
-)
-from sklearn.model_selection import StratifiedKFold, LeaveOneOut
-import datetime
+from sklearn.model_selection import StratifiedKFold, train_test_split
+import datetime  # new import for timestamp
+
+import numpy as np
 from tqdm import tqdm
-import warnings
-import copy # For saving best model state in early stopping
-
-# Custom module imports
-# Ensure these paths are correct relative to your script location
-from data.dataset import HCCDataModule
-from models.dino import load_dinov2_model
-
-# Suppress UndefinedMetricWarning (often occurs with F1/Precision/Recall in single-class/no-prediction scenarios)
-warnings.filterwarnings("ignore", category=RuntimeWarning) 
-warnings.filterwarnings("ignore", category=UserWarning, module='sklearn')
-
+import torch
 
 def extract_features(data_loader, model, device):
-    """ Extracts features using the DINOv2 model. """
+    """
+    Extract features using the DINOv2 model.
+    Each slice will have its own feature vector (no averaging on the slice level).
+    """
     model.eval()
     features = []
+    durations = []
     events = []
-    patient_ids = [] 
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Extracting Features"):
-            if len(batch) == 3:
-                images, e, pids = batch
-                patient_ids.extend(pids)
-            else:
-                images, e = batch
-            
+            images, t, e = batch
             images = images.to(device)
-            b, s, n, c, h, w = images.shape # Use descriptive names
-            images = images.view(b * s * n, c, h, w)
+            # Unpack the 6 dimensions
+            batch_size, num_samples, num_slices, C, H, W = images.size()
+            # Combine batch, num_samples, and num_slices dimensions for feature extraction
+            images = images.view(batch_size * num_samples * num_slices, C, H, W)
             
-            feats = model.forward_features(images) 
-            feat_dim = feats.shape[-1]
+            feats = model.forward_features(images)
+            feature_dim = feats.size(-1)
+            # Reshape back: each sample now has num_slices feature vectors, one per slice
+            feats = feats.view(batch_size, num_samples, num_slices, feature_dim)
             
-            # Reshape assuming output is (B*S*N, Dim) -> (B, S, N, Dim)
-            feats = feats.view(b, s, n, feat_dim)
+            # No averaging on the slice level is performed here
 
             features.append(feats.cpu().numpy())
+            durations.append(t.cpu().numpy())
             events.append(e.cpu().numpy())
 
     features = np.concatenate(features, axis=0)
+    durations = np.concatenate(durations, axis=0)
     events = np.concatenate(events, axis=0)
-    
-    if patient_ids:
-       return features, events, patient_ids
-    else:
-       return features, events
-
-#############################################
-# Plotting functions (ROC, PR, Loss)       #
-#############################################
-
-def plot_roc_curve(y_true, y_scores, output_dir, fold_id=""):
-    """Plots and saves the ROC curve."""
-    if len(np.unique(y_true)) < 2:
-        print(f"Skipping ROC plot for {fold_id}: Only one class present.")
-        return
-    try:
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        roc_auc = roc_auc_score(y_true, y_scores)
-    except ValueError as e:
-        print(f"Could not generate ROC curve for {fold_id}: {e}")
-        return
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.4f})')
-    plt.plot([0, 1], [0, 1], linestyle='--', color='grey', label='Chance')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curve {fold_id}')
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, f'roc_curve_{fold_id}.png'))
-    plt.close()
-
-def plot_pr_curve(y_true, y_scores, output_dir, fold_id=""):
-    """Plots and saves the Precision-Recall curve."""
-    if len(np.unique(y_true)) < 2:
-        print(f"Skipping PR plot for {fold_id}: Only one class present.")
-        return
-    try:
-        precision, recall, _ = precision_recall_curve(y_true, y_scores)
-        pr_auc = average_precision_score(y_true, y_scores)
-    except ValueError as e:
-        print(f"Could not generate PR curve for {fold_id}: {e}")
-        return
-        
-    plt.figure(figsize=(8, 6))
-    plt.plot(recall, precision, label=f'PR curve (AP = {pr_auc:.4f})')
-    # Calculate baseline (proportion of positives)
-    baseline = np.sum(y_true) / len(y_true) if len(y_true) > 0 else 0
-    plt.axhline(baseline, linestyle='--', color='grey', label=f'Baseline ({baseline:.2f})')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title(f'Precision-Recall Curve {fold_id}')
-    plt.legend(loc="lower left") # Often better for PR curves
-    plt.grid(True)
-    # Consider setting limits if needed, e.g., plt.ylim([0.0, 1.05])
-    plt.savefig(os.path.join(output_dir, f'pr_curve_{fold_id}.png'))
-    plt.close()
+    return features, durations, events
 
 
-def plot_loss_curves(train_losses, val_losses, output_dir, fold_id=""):
-    """Plots and saves the training and validation loss curves."""
-    plt.figure(figsize=(8, 6))
-    plt.plot(train_losses, label="Training Loss")
-    if val_losses: # Only plot validation loss if available (for early stopping)
-        plt.plot(val_losses, label="Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(f"Loss Curve {fold_id}")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, f"loss_curve_{fold_id}.png"))
-    plt.close()
 
-#############################################
-#  Upsampling function for classification   #
-#############################################
+def validate_survival_data(durations, events):
+    sort_idx = np.argsort(durations)
+    sorted_durations = durations[sort_idx]
+    sorted_events = events[sort_idx]
+    for i in range(len(sorted_durations)):
+        if sorted_events[i] == 1:
+            current_time = sorted_durations[i]
+            num_at_risk = np.sum(sorted_durations >= current_time)
+            if num_at_risk == 0:
+                raise ValueError(f"Event at {current_time} has no at-risk individuals.")
+            elif num_at_risk == 1:
+                print(f"Warning: Event at {current_time} has only 1 at-risk.")
 
-def upsample_training_data_classifier(x, y):
-    """ Upsamples minority class in feature arrays (x, y). """
-    unique_classes, counts = np.unique(y, return_counts=True)
-    if len(unique_classes) < 2: return x, y 
-    minority_class = unique_classes[np.argmin(counts)]
-    majority_class = unique_classes[np.argmax(counts)]
-    idx_minority = np.where(y == minority_class)[0]
-    idx_majority = np.where(y == majority_class)[0]
-    n_majority, n_minority = len(idx_majority), len(idx_minority)
-    if n_minority == 0 or n_majority == 0 or n_minority == n_majority: return x, y
-    sampled_indices = np.random.choice(idx_minority, size=n_majority - n_minority, replace=True)
-    x_upsampled = np.concatenate([x, x[sampled_indices]], axis=0)
-    y_upsampled = np.concatenate([y, y[sampled_indices]], axis=0)
-    shuffle_perm = np.random.permutation(len(y_upsampled))
-    x_upsampled, y_upsampled = x_upsampled[shuffle_perm], y_upsampled[shuffle_perm]
-    return x_upsampled, y_upsampled
-
-#############################################
-#       Binary Classifier Model             #
-#############################################
-
-class BinaryClassifier(torch.nn.Module):
-    """Simple Linear Binary Classifier."""
-    def __init__(self, in_features):
-        super(BinaryClassifier, self).__init__()
-        self.linear = torch.nn.Linear(in_features, 1)
-    def forward(self, x):
-        return self.linear(x)
-
-#############################################
-#       Metrics Calculation Helper          #
-#############################################
-
-def calculate_metrics(y_true, y_prob, threshold=0.5, prefix=""):
-    """Calculates ROC-AUC, PR-AUC, Precision, Recall, F1-Score."""
-    metrics = {
-        f'{prefix}ROC_AUC': np.nan, 
-        f'{prefix}PR_AUC': np.nan, 
-        f'{prefix}Precision': np.nan, 
-        f'{prefix}Recall': np.nan, 
-        f'{prefix}F1': np.nan
-    }
-    
-    if y_true is None or y_prob is None or len(y_true) == 0 or len(y_prob) == 0:
-        print(f"Warning: Empty data provided for metric calculation ({prefix}).")
-        return metrics
-        
-    y_true = np.array(y_true)
-    y_prob = np.array(y_prob)
-
-    # --- AUC Metrics ---
-    # Check if both classes are present for AUC calculations
-    if len(np.unique(y_true)) >= 2:
-        try:
-            metrics[f'{prefix}ROC_AUC'] = roc_auc_score(y_true, y_prob)
-        except ValueError as e: print(f"Warning: ROC AUC Error ({prefix}): {e}")
-        try:
-            # PR-AUC (Average Precision)
-            metrics[f'{prefix}PR_AUC'] = average_precision_score(y_true, y_prob) 
-        except ValueError as e: print(f"Warning: PR AUC Error ({prefix}): {e}")
-    else:
-         # print(f"Warning: Only one class present ({prefix}). ROC AUC / PR AUC are not defined.")
-         pass # Avoid repetitive warnings
-
-    # --- Threshold-based Metrics (Precision, Recall, F1) ---
-    try:
-        y_pred = (y_prob >= threshold).astype(int)
-        # Use zero_division=0 to return 0 instead of raising error
-        metrics[f'{prefix}Precision'] = precision_score(y_true, y_pred, zero_division=0)
-        metrics[f'{prefix}Recall'] = recall_score(y_true, y_pred, zero_division=0)
-        metrics[f'{prefix}F1'] = f1_score(y_true, y_pred, zero_division=0) 
-    except Exception as e:
-        print(f"Warning: Could not compute P/R/F1 ({prefix}). Reason: {e}")
-        
-    return metrics
-
-#############################################
-#    Training and Evaluation Function       #
-#############################################
-
-def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", 
-                       final_eval=True, return_predictions=False):
+def upsample_training_data(x_train, durations, events):
     """
-    Trains a linear binary classifier with early stopping, calculates requested metrics.
-    Returns metrics dict OR (probabilities, true_labels, sample_indices).
+    Upsample the minority class so that both classes have equal representation.
     """
+    idx_event = np.where(events == 1)[0]
+    idx_no_event = np.where(events == 0)[0]
+
+    if len(idx_event) == 0 or len(idx_no_event) == 0:
+        print("Warning: One of the classes is empty. Skipping upsampling.")
+        return x_train, durations, events
+
+    if len(idx_event) < len(idx_no_event):
+        minority_idx = idx_event
+        majority_idx = idx_no_event
+    else:
+        minority_idx = idx_no_event
+        majority_idx = idx_event
+
+    n_to_sample = len(majority_idx) - len(minority_idx)
+    sampled_minority_idx = np.random.choice(minority_idx, size=n_to_sample, replace=True)
+    new_indices = np.concatenate([np.arange(len(events)), sampled_minority_idx])
+    new_indices = np.random.permutation(new_indices)
+
+    x_train_upsampled = x_train[new_indices]
+    durations_upsampled = durations[new_indices]
+    events_upsampled = events[new_indices]
+
+    print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples.")
+    return x_train_upsampled, durations_upsampled, events_upsampled
+
+# Custom module imports
+from data.dataset import HCCDataModule
+from models.dino import load_dinov2_model
+# The following model imports for survival models are no longer used:
+# from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1
+from utils.helpers import extract_features, validate_survival_data, upsample_training_data
+from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback
+from utils.plotting import (plot_cv_metrics,  # if you wish to adapt plotting for classification, modify accordingly.
+                      plot_survival_functions, plot_brier_score,
+                      plot_risk_score_distribution, plot_kaplan_meier, plot_calibration_plot,
+                      plot_multi_calibration, plot_cumulative_hazard, plot_survival_probability_distribution)
+
+sns.set(style="whitegrid")
+
+def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_eval=True, return_predictions=False):
+    """
+    Train the model on data from train_csv and evaluate on val_csv.
+    In this version, if args.cross_validation is True, the evaluation is done on the test CSV
+    (using the test_dataloader) instead of the validation split from the training CSV.
+    """
+    # Set seed for reproducibility
     torch.manual_seed(42)
-    np.random.seed(42)
     
-    # --- Data Setup ---
+    # Instantiate the data module.
+    # Here we pass the CSVs (or DataFrames) directly to the data module.
     data_module = HCCDataModule(
-        train_csv_file=train_csv, train_dicom_root=args.train_dicom_root,
-        test_csv_file=val_csv, test_dicom_root=args.test_dicom_root,
-        model_type="linear", batch_size=args.batch_size, num_slices=args.num_slices,
-        num_workers=args.num_workers, preprocessed_root=args.preprocessed_root,
-        num_samples=args.num_samples_per_patient
+        train_csv_file=train_csv,
+        test_csv_file=val_csv,  # when in CV mode, this is the fold test DataFrame/CSV
+        train_dicom_root=args.train_dicom_root,
+        test_dicom_root=args.test_dicom_root,
+        model_type="time_to_event",
+        batch_size=args.batch_size,
+        num_slices=args.num_slices,
+        num_samples=args.num_samples_per_patient,
+        num_workers=args.num_workers,
+        preprocessed_root=args.preprocessed_root
     )
     data_module.setup()
-    train_loader = data_module.train_dataloader()
-    val_loader = data_module.val_dataloader()  # For early stopping loss calc
-
+    
+    # Load the DINOv2 feature extractor
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dino_model = load_dinov2_model(args.dinov2_weights)
+    dino_model = dino_model.to(device)
+    dino_model.eval()
+    dino_model.register_forward_hook(lambda m, i, o: None)
     
-    # --- Feature Extraction ---
-    dino_model = load_dinov2_model(args.dinov2_weights).to(device).eval()
-    print(f"[Fold {fold_id}] Extracting training features...")
-    extracted_train = extract_features(train_loader, dino_model, device)
-    x_train, y_train = extracted_train[0], extracted_train[1]
-    
-    print(f"[Fold {fold_id}] Extracting validation features...")
-    extracted_val = extract_features(val_loader, dino_model, device)
-    # Check if sample indices were returned from the loader
-    if len(extracted_val) == 3:
-        x_val, y_val, val_indices = extracted_val
+    # Use the training dataloader for feature extraction on training data.
+    train_loader = data_module.train_dataloader()
+    # For evaluation, if in CV mode, use the test dataloader (which is built from the fold test CSV)
+    # otherwise, use the val_dataloader.
+    if args.cross_validation:
+        eval_loader = data_module.test_dataloader()
     else:
-        x_val, y_val = extracted_val
-        val_indices = None
-
-    # --- Fallback: if no indices from the loader and val_csv is a DataFrame, use its index ---
-    if val_indices is None and isinstance(val_csv, pd.DataFrame):
-        num_val_samples = x_val.shape[0]
-        val_indices = np.array(val_csv.index)[:num_val_samples]
+        eval_loader = data_module.val_dataloader()
     
-    # Average features & remove zero variance
-    x_train = x_train.mean(axis=(1, 2)) 
-    x_val = x_val.mean(axis=(1, 2)) 
+    # Feature extraction for training and evaluation data
+    x_train, y_train_durations, y_train_events = extract_features(train_loader, dino_model, device)
+    x_eval, y_eval_durations, y_eval_events = extract_features(eval_loader, dino_model, device)
+    
+    # Average across samples (for each patient) if needed
+    x_train = x_train.mean(axis=1)
+    x_eval = x_eval.mean(axis=1)
+    
+    # Remove zero-variance features
     variances = np.var(x_train, axis=0)
-    non_zero_var_mask = variances != 0
-    if np.any(~non_zero_var_mask):
-        num_zero = np.sum(~non_zero_var_mask)
-        print(f"[Fold {fold_id}] Warning: Removing {num_zero} features with zero variance...")
-        x_train = x_train[:, non_zero_var_mask]
-        x_val = x_val[:, non_zero_var_mask]
-        if x_train.shape[1] == 0: 
-            raise ValueError(f"[Fold {fold_id}] All features removed.")
+    if np.any(variances == 0):
+        zero_var_features = np.where(variances == 0)[0]
+        print(f"[Fold {fold_id}] Warning: Features with zero variance: {zero_var_features}")
+        x_train = x_train[:, variances != 0]
+        x_eval = x_eval[:, variances != 0]
     
-    # --- Preprocessing (Upsampling, Scaling) ---
     if args.upsampling:
-        print(f"[Fold {fold_id}] Upsampling training features...")
-        x_train, y_train = upsample_training_data_classifier(x_train, y_train)
-    scaler = StandardScaler()
-    x_train = scaler.fit_transform(x_train).astype("float32")
-    x_val = scaler.transform(x_val).astype("float32")
-    y_train = np.array(y_train).astype("float32")
-    y_val = np.array(y_val).astype("float32")
+        print(f"[Fold {fold_id}] Performing upsampling on training data...")
+        x_train, y_train_durations, y_train_events = upsample_training_data(
+            x_train, y_train_durations, y_train_events
+        )
     
-    # --- Model & Training Setup ---
-    in_features = x_train.shape[1]
-    model = BinaryClassifier(in_features).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
-    criterion = torch.nn.BCEWithLogitsLoss() 
+    # Standardize features (fit only on train)
+    x_mapper = StandardScaler()
+    n_train, n_slices, feat_dim = x_train.shape
+    x_train_reshaped = x_train.reshape(-1, feat_dim)
+    x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
+    x_train_scaled = x_train_scaled.reshape(n_train, n_slices, feat_dim)
     
-    train_dataset = torch.utils.data.TensorDataset(torch.tensor(x_train), torch.tensor(y_train))
-    val_dataset = torch.utils.data.TensorDataset(torch.tensor(x_val), torch.tensor(y_val))
+    n_eval, n_slices_eval, feat_dim_eval = x_eval.shape
+    x_eval_reshaped = x_eval.reshape(-1, feat_dim_eval)
+    x_eval_scaled = x_mapper.transform(x_eval_reshaped).astype('float32')
+    x_eval_scaled = x_eval_scaled.reshape(n_eval, n_slices_eval, feat_dim_eval)
+    
+    # Collapse the slice dimension by averaging
+    x_train_std = x_train_scaled.mean(axis=1)
+    x_eval_std = x_eval_scaled.mean(axis=1)
+    
+    # Validate survival data (if applicable)
+    validate_survival_data(y_train_durations, y_train_events)
+    
+    in_features = x_train_std.shape[1]
+    
+    # For classification, replace the survival model with a single linear layer.
+    from torch import nn
+    net = nn.Linear(in_features, 1)
+    net.to(device)
+    
+    # Define optimizer and loss function
+    optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
+    criterion = torch.nn.BCEWithLogitsLoss()
+    
+    # Prepare training and evaluation tensors
+    train_tensor_x = torch.tensor(x_train_std, dtype=torch.float32).to(device)
+    train_tensor_y = torch.tensor(y_train_events.astype(np.float32), dtype=torch.float32).to(device)
+    eval_tensor_x = torch.tensor(x_eval_std, dtype=torch.float32).to(device)
+    eval_tensor_y = torch.tensor(y_eval_events.astype(np.float32), dtype=torch.float32).to(device)
+    
+    train_dataset = torch.utils.data.TensorDataset(train_tensor_x, train_tensor_y)
+    eval_dataset = torch.utils.data.TensorDataset(eval_tensor_x, eval_tensor_y)
+    
     train_loader_cls = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader_cls = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    eval_loader_cls = torch.utils.data.DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # --- Early Stopping Initialization ---
+    # Training loop with early stopping if enabled
     best_val_loss = float('inf')
+    patience = 10
     epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
-    
-    print(f"[Fold {fold_id}] Starting training (max {args.epochs} epochs, Early Stopping patience={args.early_stopping_patience})...")
-    # --- Training Loop ---
     for epoch in range(args.epochs):
-        model.train()
-        epoch_train_losses = []
+        net.train()
+        train_losses = []
         for batch_x, batch_y in train_loader_cls:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device).unsqueeze(1)
             optimizer.zero_grad()
-            logits = model(batch_x)
-            loss = criterion(logits, batch_y)
+            outputs = net(batch_x).squeeze()  # shape: (batch_size)
+            loss = criterion(outputs, batch_y)
             loss.backward()
             if args.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.gradient_clip)
             optimizer.step()
-            epoch_train_losses.append(loss.item())
-        avg_train_loss = np.mean(epoch_train_losses)
-        train_losses.append(avg_train_loss)
-
-        model.eval()
-        epoch_val_losses = []
+            train_losses.append(loss.item())
+        avg_train_loss = np.mean(train_losses)
+        
+        # Validation/Evaluation
+        net.eval()
+        eval_losses = []
+        all_eval_preds = []
         with torch.no_grad():
-            for batch_x_val, batch_y_val in val_loader_cls:
-                batch_x_val, batch_y_val = batch_x_val.to(device), batch_y_val.to(device).unsqueeze(1)
-                val_logits = model(batch_x_val)
-                val_loss = criterion(val_logits, batch_y_val)
-                epoch_val_losses.append(val_loss.item())
-        avg_val_loss = np.mean(epoch_val_losses)
-        val_losses.append(avg_val_loss)
-
-        log_msg = f"[Fold {fold_id}] Epoch {epoch+1}/{args.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}"
-        if avg_val_loss < best_val_loss - args.early_stopping_delta:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            best_model_state = copy.deepcopy(model.state_dict())
-            log_msg += " (New best)"
-        else:
-            epochs_no_improve += 1
-            log_msg += f" (No improve {epochs_no_improve}/{args.early_stopping_patience})"
-        if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1 or epochs_no_improve == 0:
-             print(log_msg)
-        if epochs_no_improve >= args.early_stopping_patience:
-            print(f"[Fold {fold_id}] Early stopping triggered at epoch {epoch+1}. Best Val Loss: {best_val_loss:.4f}")
-            break
-            
-    if best_model_state:
-        print(f"[Fold {fold_id}] Loading best model state from epoch {epoch + 1 - epochs_no_improve}.")
-        model.load_state_dict(best_model_state)
-    else:
-        print(f"[Fold {fold_id}] Warning: No best model state saved. Using final model state.")
-
-    print(f"[Fold {fold_id}] Final evaluation on validation set...")
-    model.eval()
-    all_probs = []
-    all_labels = []
+            for batch_x, batch_y in eval_loader_cls:
+                outputs = net(batch_x).squeeze()
+                loss = criterion(outputs, batch_y)
+                eval_losses.append(loss.item())
+                all_eval_preds.append(outputs)
+        avg_eval_loss = np.mean(eval_losses)
+        all_eval_preds = torch.cat(all_eval_preds)
+        eval_probs = torch.sigmoid(all_eval_preds)
+        eval_pred_labels = (eval_probs >= 0.5).float()
+        eval_accuracy = (eval_pred_labels.cpu().numpy() == eval_tensor_y.cpu().numpy()).mean()
+        
+        print(f"[Fold {fold_id}] Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_train_loss:.4f} - Eval Loss: {avg_eval_loss:.4f} - Eval Accuracy: {eval_accuracy:.4f}")
+        
+        if args.early_stopping:
+            if avg_eval_loss < best_val_loss:
+                best_val_loss = avg_eval_loss
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"[Fold {fold_id}] Early stopping triggered at epoch {epoch+1}")
+                    break
+                    
+    # After training, evaluate on the full evaluation set
+    net.eval()
     with torch.no_grad():
-        for batch_x, batch_y in val_loader_cls:
-            batch_x = batch_x.to(device)
-            logits = model(batch_x)
-            probs = torch.sigmoid(logits)
-            all_probs.extend(probs.cpu().numpy().flatten().tolist())
-            all_labels.extend(batch_y.numpy().flatten().tolist())
-
-    fold_metrics = calculate_metrics(all_labels, all_probs, prefix="")
-    print(f"[Fold {fold_id}] Final Validation Metrics: " + ", ".join([f"{k}: {v:.4f}" for k, v in fold_metrics.items()]))
-
-    if final_eval:
-        os.makedirs(args.output_dir, exist_ok=True)
-        plot_roc_curve(all_labels, all_probs, args.output_dir, fold_id=fold_id)
-        plot_pr_curve(all_labels, all_probs, args.output_dir, fold_id=fold_id)
-        plot_loss_curves(train_losses, val_losses, args.output_dir, fold_id=fold_id)
-
+        outputs = net(eval_tensor_x).squeeze()
+        eval_probs = torch.sigmoid(outputs).cpu().numpy()
+        eval_pred_labels = (eval_probs >= 0.5).astype(int)
+        eval_accuracy = (eval_pred_labels == y_eval_events).mean()
+    
     if return_predictions:
-        # Now we are sure val_indices is not empty if val_csv was provided
-        return np.array(all_probs), np.array(all_labels), np.array(val_indices)
+        # Return predicted probabilities along with durations and events.
+        return eval_probs, y_eval_durations, y_eval_events
     else:
-        return fold_metrics
+        print(f"[Fold {fold_id}] Accuracy: {eval_accuracy:.4f}")
+        if final_eval and not return_predictions:
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, f"fold_{fold_id}_accuracy.txt"), "w") as f:
+                f.write(f"Validation Accuracy: {eval_accuracy:.4f}\n")
+        return eval_accuracy
 
 
 
-#############################################
-#         Cross-Validation Mode             #
-#############################################
+def upsample_df(df, target_column='event'):
+    df_majority = df[df[target_column] == 0]
+    df_minority = df[df[target_column] == 1]
+    if len(df_minority) == 0 or len(df_majority) == 0:
+        return df
+    df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=1)
+    return pd.concat([df_majority, df_minority_upsampled]).reset_index(drop=True)
 
 def cross_validation_mode(args):
-    # --- Data Preparation (Option B) ---
+    """
+    For each fold, we create training and test DataFrames,
+    add a source column to the test set, and pass them directly to the data module.
+    We also record the fold id for each prediction.
+    """
+    # Load the full training CSV and add a source column for later tracking.
     df_train_full = pd.read_csv(args.train_csv_file)
-    df_train_full["dicom_root"] = args.train_dicom_root
-    n_train_original = len(df_train_full)
-    original_test_indices_in_all = None 
-    n_test_original = 0
+    df_train_full['dicom_root'] = args.train_dicom_root
+    df_train_full['source'] = 'train'
 
+    df_test_full = None
     if args.test_csv_file:
-        try:
-            df_test_full = pd.read_csv(args.test_csv_file)
-            df_test_full["dicom_root"] = args.test_dicom_root
-            n_test_original = len(df_test_full)
-            common_cols = list(set(df_train_full.columns) & set(df_test_full.columns))
-            if 'event' not in common_cols: raise ValueError("'event' column missing.")
-            df_all = pd.concat([df_train_full[common_cols].copy(), df_test_full[common_cols].copy()])
-            original_test_indices_in_all = np.arange(n_train_original, n_train_original + n_test_original)
-            print(f"[CV Mode Option B] Combined train ({n_train_original}) and test ({n_test_original}) datasets. Total: {len(df_all)}")
-        except Exception as e:
-            print(f"Warning: Error combining CSVs ({e}). CV on training data only.")
-            df_all = df_train_full.copy()
-            n_test_original = 0
+        df_test_full = pd.read_csv(args.test_csv_file)
+        df_test_full['dicom_root'] = args.test_dicom_root
+        df_test_full['source'] = 'test'
+        df_all = pd.concat([df_train_full, df_test_full], ignore_index=True)
+        print(f"[CV Mode] Combined train ({len(df_train_full)}) and test ({len(df_test_full)}) datasets. Total: {len(df_all)}")
     else:
-        df_all = df_train_full.copy()
+        df_all = df_train_full.copy().reset_index(drop=True)
         print(f"No test CSV provided. CV on training data only (Size: {len(df_all)}).")
-    
-    # --- CV Setup ---
-    all_predicted_probs, all_labels, all_fold_test_indices = [], [], []
-    hyperparams = {"learning_rate": args.learning_rate}
-    
-    if args.leave_one_out:
-        cv_method, n_splits, cv_type = LeaveOneOut(), len(df_all), "LOOCV"
-        splits = list(cv_method.split(df_all)) 
-    else:
-        cv_method = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
-        n_splits, cv_type = args.cv_folds, f"{args.cv_folds}-Fold_CV"
-        try: 
-            splits = list(cv_method.split(df_all, df_all["event"]))
-        except Exception as e: 
-            print(f"StratifiedKFold Error: {e}. Aborting."); 
-            return
 
-    print(f"\nStarting {cv_type} using dataset (size={len(df_all)})...")
+    # Hyperparameters for training
+    hyperparams = {
+        'learning_rate': args.learning_rate,
+        'dropout': args.dropout,
+        'alpha': args.alpha,
+        'gamma': args.gamma,
+        'coxph_net': args.coxph_net
+    }
 
-    # --- CV Loop ---
-    for fold, (train_idx, test_idx) in enumerate(splits):
-        df_new_train = df_all.iloc[train_idx]
-        df_new_test = df_all.iloc[test_idx]
+    # Prepare arrays to collect predictions and sources.
+    all_predicted_risk_scores = []
+    all_event_times = []
+    all_event_indicators = []
+    all_sources = []  # will store 'train' or 'test' from the fold test CSV
+    all_fold_ids = []  # record the fold id for each prediction
+    fold_accuracies = []
 
-        fold_id_str = f"{cv_type}_fold_{fold+1}_of_{n_splits}"
-        print(f"\n--- {fold_id_str} ---")
-        print(f"Train: {len(df_new_train)} (Pos: {df_new_train['event'].sum()}), Test: {len(df_new_test)} (Pos: {df_new_test['event'].sum()})")
-        
-        # Capture predictions, labels, and sample indices from the evaluated fold
-        preds, labels, indices = train_and_evaluate(
-            args, train_csv=df_new_train, val_csv=df_new_test,
-            hyperparams=hyperparams, fold_id=fold_id_str,
-            final_eval=False, return_predictions=True
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=1)
+    for fold, (train_idx, test_idx) in enumerate(kf.split(df_all)):
+        df_fold_train = df_all.iloc[train_idx].reset_index(drop=True)
+        df_fold_test = df_all.iloc[test_idx].reset_index(drop=True)
+        print(f"[CV Fold {fold}] Train: {len(df_fold_train)} patients, Positive events: {df_fold_train['event'].sum()}")
+        print(f"[CV Fold {fold}] Test: {len(df_fold_test)} patients, Positive events: {df_fold_test['event'].sum()}")
+
+        if args.upsampling:
+            print(f"[CV Fold {fold}] Performing upsampling on training data...")
+            df_fold_train = upsample_df(df_fold_train, target_column='event')
+
+        # Ensure the fold test set has a source column.
+        if 'source' not in df_fold_test.columns:
+            df_fold_test['source'] = 'test'
+
+        # Instead of writing temporary CSV files, we pass the DataFrames directly.
+        # (Alternatively, you can save them as CSVs and pass the file paths.)
+        fold_train_csv = df_fold_train  # DataFrame
+        fold_test_csv = df_fold_test    # DataFrame
+
+        # Call train_and_evaluate (it will use the test_dataloader because args.cross_validation is True)
+        risk_scores, durations, events = train_and_evaluate(
+            args,
+            train_csv=fold_train_csv,
+            val_csv=fold_test_csv,
+            hyperparams=hyperparams,
+            fold_id=f"fold_{fold}",
+            final_eval=False,
+            return_predictions=True
         )
-        all_predicted_probs.extend(preds.tolist())
-        all_labels.extend(labels.tolist())
-        all_fold_test_indices.extend(indices.tolist()) 
+        fold_accuracy = np.mean((risk_scores >= 0.5).astype(int) == events)
+        print(f"[CV Fold {fold}] Accuracy: {fold_accuracy:.4f}")
+        fold_accuracies.append(fold_accuracy)
 
-    # --- Aggregated Evaluation ---
-    print("\n--- Cross-Validation Aggregated Results ---")
-    if not all_labels: 
-        print("Error: No results aggregated."); 
-        return
-        
-    all_labels = np.array(all_labels)
-    all_predicted_probs = np.array(all_predicted_probs)
-    all_fold_test_indices = np.array(all_fold_test_indices)
+        # Extend overall arrays.
+        all_predicted_risk_scores.extend(risk_scores.tolist())
+        all_event_times.extend(durations.tolist())
+        all_event_indicators.extend(events.tolist())
+        # Use the source column from df_fold_test.
+        fold_sources = df_fold_test['source'].tolist()[:len(risk_scores)]
+        all_sources.extend(fold_sources)
+        all_fold_ids.extend([fold] * len(risk_scores))
 
-    print("\nOverall Aggregated Metrics (on all test folds):")
-    overall_metrics = calculate_metrics(all_labels, all_predicted_probs, prefix="Overall_")
-    for name, value in overall_metrics.items(): 
-        print(f"  {name}: {value:.4f}")
-    
-    # Plot aggregated curves
-    os.makedirs(args.output_dir, exist_ok=True)
-    plot_roc_curve(all_labels, all_predicted_probs, args.output_dir, fold_id="aggregated_CV")
-    plot_pr_curve(all_labels, all_predicted_probs, args.output_dir, fold_id="aggregated_CV")
+    # Save final CSV with aggregated predictions from all folds.
+    final_predictions = pd.DataFrame({
+         "fold": all_fold_ids,
+         "predicted_risk_score": all_predicted_risk_scores,
+         "event_time": all_event_times,
+         "event_indicator": all_event_indicators,
+         "source": all_sources
+    })
+    final_csv_path = os.path.join(args.output_dir, "final_cv_predictions.csv")
+    final_predictions.to_csv(final_csv_path, index=False)
+    print(f"Final predictions CSV saved to {final_csv_path}")
 
-    # --- Dataset-Specific Reporting ---
-    if n_test_original > 0 and original_test_indices_in_all is not None:
-        print("\nSubset Metrics (based on original dataset source):")
-        mask_original_test = np.isin(all_fold_test_indices, original_test_indices_in_all)
-        mask_original_train = ~mask_original_test
+    # Compute overall accuracy from aggregated predictions.
+    all_predicted_risk_scores = np.array(all_predicted_risk_scores)
+    all_event_indicators = np.array(all_event_indicators)
+    overall_accuracy = np.mean((all_predicted_risk_scores >= 0.5).astype(int) == all_event_indicators)
+    print(f"\nOverall Accuracy from aggregated CV predictions: {overall_accuracy:.4f}")
 
-        print(f"\n  Metrics on subset from original TRAIN data ({np.sum(mask_original_train)} samples):")
-        train_subset_metrics = calculate_metrics(all_labels[mask_original_train], all_predicted_probs[mask_original_train], prefix="TrainSubset_")
-        for name, value in train_subset_metrics.items(): 
-            print(f"    {name}: {value:.4f}")
+    # Print summary stats for per-fold accuracies.
+    mean_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+    min_accuracy = np.min(fold_accuracies)
+    max_accuracy = np.max(fold_accuracies)
+    print("\nCross Validation Accuracy Statistics (combined):")
+    print(f"Mean: {mean_accuracy:.4f}")
+    print(f"Standard Deviation: {std_accuracy:.4f}")
+    print(f"Minimum: {min_accuracy:.4f}")
+    print(f"Maximum: {max_accuracy:.4f}")
 
-        print(f"\n  Metrics on subset from original TEST data ({np.sum(mask_original_test)} samples):")
-        test_subset_metrics = calculate_metrics(all_labels[mask_original_test], all_predicted_probs[mask_original_test], prefix="TestSubset_")
-        for name, value in test_subset_metrics.items(): 
-            print(f"    {name}: {value:.4f}")
-    elif n_test_original == 0:
-         print("\nNote: Only original training data used for CV.")
+    # Optionally, report separate accuracies if the original test CSV was provided.
+    if df_test_full is not None:
+        all_sources = np.array(all_sources)
+        test_indices = np.where(all_sources == 'test')[0]
+        train_indices = np.where(all_sources == 'train')[0]
 
-    print("--- End Cross-Validation ---")
+        if len(train_indices) > 0:
+            train_risk_scores = all_predicted_risk_scores[train_indices]
+            train_event_indicators = all_event_indicators[train_indices]
+            train_accuracy = np.mean((train_risk_scores >= 0.5).astype(int) == train_event_indicators)
+            print(f"\nTraining CSV Only Accuracy: {train_accuracy:.4f}")
+        else:
+            print("\nNo training CSV samples found in the CV folds.")
 
-
-#############################################
-#                Main Function              #
-#############################################
+        if len(test_indices) > 0:
+            test_risk_scores = all_predicted_risk_scores[test_indices]
+            test_event_indicators = all_event_indicators[test_indices]
+            test_accuracy = np.mean((test_risk_scores >= 0.5).astype(int) == test_event_indicators)
+            print(f"Test CSV Only Accuracy: {test_accuracy:.4f}")
+        else:
+            print("No test CSV samples found in the CV folds.")
 
 def main(args):
-    # Add early stopping defaults if not provided
-    if args.early_stopping_patience <= 0:
-        print("Early stopping disabled (patience <= 0).")
-        args.early_stopping_patience = args.epochs # Effectively disable it
-        
-    if args.cross_validation or args.leave_one_out:
-        if args.leave_one_out: args.cross_validation = True; print("LOOCV enabled.")
-        elif args.cv_folds < 2: print("Warning: cv_folds < 2, setting to 5."); args.cv_folds = 5
+    if args.cross_validation:
         cross_validation_mode(args)
     else:
-        if not args.test_csv_file: raise ValueError("test_csv_file is required for non-CV runs.")
-        print("Running standard train/test evaluation...")
-        metrics = train_and_evaluate(
-            args, args.train_csv_file, args.test_csv_file,
-            hyperparams={"learning_rate": args.learning_rate},
-            fold_id="TrainTestRun", final_eval=True, return_predictions=False
+        score = train_and_evaluate(
+            args,
+            args.train_csv_file,
+            args.test_csv_file,
+            hyperparams={
+                'learning_rate': args.learning_rate,
+                'dropout': args.dropout,
+                'alpha': args.alpha,
+                'gamma': args.gamma,
+                'coxph_net': args.coxph_net
+            },
+            fold_id="full",
+            final_eval=True,
+            return_predictions=False
         )
-        print("\n--- Final Evaluation Results on Test Set ---")
-        for name, value in metrics.items(): print(f"  {name}: {value:.4f}")
-        print("--- End Final Evaluation ---")
+        print(f"Final Accuracy: {score:.4f}")
 
-#############################################
-#          Argument Parsing & Run           #
-#############################################
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train/Evaluate linear binary classifier with DINOv2 features.")
-    # Paths
-    parser.add_argument("--train_dicom_root", type=str, required=True, help="Base DICOM directory for training.")
-    parser.add_argument("--test_dicom_root", type=str, required=True, help="Base DICOM directory for testing.")
-    parser.add_argument("--train_csv_file", type=str, required=True, help="Path to the training CSV.")
-    parser.add_argument("--test_csv_file", type=str, default=None, help="Path to the test CSV.")
-    parser.add_argument('--preprocessed_root', type=str, default=None, help='Optional: Preprocessed tensors directory.')
-    parser.add_argument('--dinov2_weights', type=str, required=True, help="Path to DINOv2 weights.")
-    parser.add_argument('--output_dir', type=str, default='checkpoints_classifier', help='Base directory for outputs.')
-
-    # Data Loading & Feature Extraction
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size.')
-    parser.add_argument('--num_slices', type=int, default=64, help='Slices per patient.')
-    parser.add_argument('--num_workers', type=int, default=4, help='Dataloader workers.')
-    parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Samples per patient.')
-    
-    # Training Params
-    parser.add_argument('--epochs', type=int, default=100, help='Max training epochs.') # Increased default for early stopping
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Classifier learning rate.')
-    parser.add_argument('--gradient_clip', type=float, default=0.1, help='Gradient clipping threshold (<=0 disables).')
-    parser.add_argument('--upsampling', action='store_true', help="Enable upsampling on training features.")
-    
-    # --- Early Stopping Arguments ---
-    parser.add_argument('--early_stopping_patience', type=int, default=10, 
-                        help='Epochs to wait for validation loss improvement before stopping. <=0 to disable.')
-    parser.add_argument('--early_stopping_delta', type=float, default=1e-5, # Small delta to detect meaningful improvement
-                        help='Minimum change in validation loss to qualify as improvement.')
-
-    # Cross-Validation Params
-    parser.add_argument('--cross_validation', action='store_true', help="Enable K-Fold CV (Option B).")
-    parser.add_argument('--cv_folds', type=int, default=5, help="K-Fold CV folds.")
-    parser.add_argument('--leave_one_out', action='store_true', help="Enable LOOCV.")
+    parser = argparse.ArgumentParser(description="Train binary classification model with DINOv2 features")
+    parser.add_argument("--train_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC",
+                         help="Path to the training DICOM directory.")
+    parser.add_argument("--test_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
+                         help="Path to the testing DICOM directory.")
+    parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
+                         help="Path to the training CSV file.")
+    parser.add_argument("--test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv",
+                         help="Path to the testing CSV file. If not provided, a train-test split will be performed on the training dataset.")
+    parser.add_argument('--preprocessed_root', type=str, default=None, 
+                         help='Directory to store/load preprocessed image tensors')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for data loaders')
+    parser.add_argument('--num_slices', type=int, default=64,
+                        help='Number of slices per patient')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of workers for data loaders')
+    parser.add_argument('--epochs', type=int, default=500,
+                        help='Number of training epochs')
+    parser.add_argument('--output_dir', type=str, default='checkpoints',
+                        help='Base directory to save outputs and models')
+    parser.add_argument('--learning_rate', type=float, default=1e-5,
+                        help='Learning rate for the classification model')
+    parser.add_argument('--gradient_clip', type=float, default=0.1,
+                        help='Gradient clipping threshold. Set 0 to disable.')
+    parser.add_argument('--center_risk', action='store_true',
+                        help='(Unused in classification) If set, center risk scores for numerical stability')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='(Unused in linear classification) Dropout rate if using an MLP')
+    parser.add_argument('--num_samples_per_patient', type=int, default=1,
+                        help='Number of times to sample from each patient per epoch')
+    parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'],
+                        help='(Unused in classification) Type of network for pycox survival regression.')
+    parser.add_argument('--dinov2_weights', type=str, required=True,
+                        help="Path to your local DINOv2 state dict file (.pth or .pt).")
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help="(Unused in classification) Weight for the regularization term relative to the Cox loss")
+    parser.add_argument('--gamma', type=float, default=0.5,
+                        help="(Unused in classification) Relative weight between L1 and L2 in the regularizer")
+    parser.add_argument('--upsampling', action='store_true',
+                        help="If set, perform upsampling of the minority class in the training data")
+    parser.add_argument('--early_stopping', action='store_true',
+                        help="If set, early stopping will be used during training")
+    parser.add_argument('--cross_validation', action='store_true',
+                        help="Enable cross validation mode")
+    parser.add_argument('--cv_folds', type=int, default=2,
+                        help="Number of cross validation folds")
+    parser.add_argument('--leave_one_out', action='store_true',
+                        help="Enable leave-one-out cross validation mode (combines CSVs and uses LOOCV)")
     
     args = parser.parse_args()
-    
-    # Setup output directory
+
+    # Create a unique subdirectory for each run using a timestamp
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name_parts = [f"run_{timestamp}"]
-    if args.cross_validation: run_name_parts.append(f"{args.cv_folds}fold" if not args.leave_one_out else "LOOCV")
-    run_name_parts.append(f"lr{args.learning_rate}")
-    if args.upsampling: run_name_parts.append("upsampled")
-    if args.early_stopping_patience > 0: run_name_parts.append(f"ES{args.early_stopping_patience}")
-    run_name = "_".join(run_name_parts)
-    args.output_dir = os.path.join(args.output_dir, run_name)
+    args.output_dir = os.path.join(args.output_dir, f"run_{timestamp}")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print("="*50)
-    print("Starting Run Configuration:")
-    for k, v in vars(args).items(): print(f"  {k}: {v}")
-    print(f"  Output Directory: {args.output_dir}")
-    # Use current date/time based on system
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"  Current Time: {current_time}") # Add current time info
-    print("="*50)
-       
     main(args)
-
-    print("\n" + "="*50)
-    print(f"Run finished. Outputs saved to: {args.output_dir}")
-    print("="*50)

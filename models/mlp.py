@@ -14,11 +14,9 @@ class CustomMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 512),
-            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(512, 128),
-            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(128, out_features)
