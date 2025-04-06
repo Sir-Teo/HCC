@@ -10,7 +10,22 @@ import pydicom
 from torch.utils.data import Dataset, DataLoader, default_collate
 from sklearn.model_selection import train_test_split
 
-DEBUG = False
+DEBUG = True
+
+def infer_dataset_type(csv_input):
+    # If csv_input is a file path string, use the file name to infer dataset type.
+    if isinstance(csv_input, pd.DataFrame):
+        # Use the second row if available, otherwise fallback to the first row.
+        row_idx = 1 if len(csv_input) > 1 else 0
+        row_data = csv_input.iloc[row_idx]
+        for cell in row_data:
+            if isinstance(cell, str):
+                cell_lower = cell.lower()
+                if "tcga" in cell_lower:
+                    return "TCGA"
+                elif "nyu" in cell_lower:
+                    return "NYU"
+    return "NYU"
 
 def nan_hook(module, input, output):
     if torch.isnan(output).any() and DEBUG:
@@ -26,7 +41,7 @@ class HCCDicomDataset(Dataset):
         num_slices=10,
         num_samples=1,
         preprocessed_root=None,
-        dataset_type="NYU"  # new parameter; default for backwards compatibility
+        dataset_type="NYU"
     ):
         """
         Args:
@@ -73,10 +88,63 @@ class HCCDicomDataset(Dataset):
                     data_entry['event'] = row['event']
                 
                 self.patient_data.append(data_entry)
+        print(f"[DEBUG] Found {len(self.patient_data)} patients in the dataset.")
+
+        # --- Filtering out patients with no valid images ---
+        filtered_patient_data = []
+        for entry in self.patient_data:
+            if self._has_valid_images(entry['dicom_dir']):
+                filtered_patient_data.append(entry)
+            else:
+                if DEBUG:
+                    print(f"[DEBUG] Filtering out patient {entry['patient_id']} due to no valid images.")
+        self.patient_data = filtered_patient_data
 
         if DEBUG:
             print(f"[DEBUG] HCCDicomDataset ({self.dataset_type}) initialized with {len(self.patient_data)} patients.")
 
+    def _has_valid_images(self, dicom_dir):
+        """
+        Checks if the DICOM directory contains at least one valid image.
+        For TCGA, traverse the top-level series folders.
+        For NYU, look for .dcm files and check header fields.
+        """
+        if not os.path.exists(dicom_dir):
+            return False
+
+        if self.dataset_type == "TCGA":
+            for top_folder in os.listdir(dicom_dir):
+                top_folder_path = os.path.join(dicom_dir, top_folder)
+                if "MR" not in top_folder.upper():
+                    continue
+                for subfolder in os.listdir(top_folder_path):
+                    subfolder_path = os.path.join(top_folder_path, subfolder)
+                    for fname in os.listdir(subfolder_path):
+                        if not fname.endswith(".dcm"):
+                            continue
+                        file_path = os.path.join(subfolder_path, fname)
+                        try:
+                            # Only read header information
+                            dcm = pydicom.dcmread(file_path, stop_before_pixels=True)
+                            return True  # Valid image found
+                        except Exception:
+                            continue
+            return False
+        else:  # NYU
+            dcm_files = [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
+            for dcm_path in dcm_files:
+                try:
+                    dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+                    # Skip CT images
+                    if hasattr(dcm, 'Modality') and dcm.Modality.upper() == 'CT':
+                        continue
+                    # Check that necessary fields exist
+                    if not (hasattr(dcm, 'ImageOrientationPatient') and hasattr(dcm, 'ImagePositionPatient')):
+                        continue
+                    return True  # Valid image found
+                except Exception:
+                    continue
+            return False
     def __len__(self):
         """
         Now, dataset length = number of patients. We do NOT multiply by num_samples;
@@ -154,23 +222,31 @@ class HCCDicomDataset(Dataset):
         # --- File search based on dataset type ---
         if self.dataset_type == "TCGA":
             dcm_files = []
-            for root, dirs, files in os.walk(dicom_dir):
-                for fname in files:
-                    if fname.endswith('.dcm'):
-                        file_path = os.path.join(root, fname)
+
+            # Step 1: Traverse only top-level series folders (e.g., MRI-AbdomenPelvis...)
+            for top_folder in os.listdir(dicom_dir):
+                
+                top_folder_path = os.path.join(dicom_dir, top_folder)
+
+                if "MR" not in top_folder.upper():
+                    continue
+                
+                for subfolder in os.listdir(top_folder_path):
+                    subfolder_path = os.path.join(top_folder_path, subfolder)
+
+                    # Step 3: Read DICOM files inside these subfolders
+                    for fname in os.listdir(subfolder_path):
+                        if not fname.endswith(".dcm"):
+                            continue
+                        file_path = os.path.join(subfolder_path, fname)
                         try:
                             dcm = pydicom.dcmread(file_path, stop_before_pixels=True)
-                            if not (hasattr(dcm, 'Modality') and dcm.Modality.upper() == 'MR'):
-                                continue
+                            dcm_files.append(file_path)
                         except Exception as e:
-                            if DEBUG:
-                                print(f"[DEBUG] Error reading {file_path}: {e}")
+                            print(f"Error reading DICOM file {file_path}: {e}")
                             continue
-                        dcm_files.append(file_path)
-
-            # For TCGA, ignore axial filtering: use all files (that aren’t CT)
             selected_files = dcm_files
-        else:  # NYU or default: apply axial filtering
+        else:  # NYU
             dcm_files = [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
             series_dict = defaultdict(list)
             for dcm_path in dcm_files:
@@ -193,22 +269,6 @@ class HCCDicomDataset(Dataset):
             for orient, dcm_paths in series_dict.items():
                 if self.is_axial(orient):
                     selected_files.extend(dcm_paths)
-
-        if not selected_files:
-            raise ValueError(f"No non-CT DICOM slices found in {dicom_dir}")
-
-        # Sort slices by z-position
-        def get_slice_position(dcm_path):
-            try:
-                dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
-                if hasattr(dcm, 'SliceLocation'):
-                    return float(dcm.SliceLocation)
-                else:
-                    return float(dcm.ImagePositionPatient[2])
-            except:
-                return 0.0
-
-        selected_files.sort(key=get_slice_position)
 
         if DEBUG:
             print(f"[DEBUG] load_axial_series {patient_id}: {len(selected_files)} slices found.")
@@ -304,8 +364,6 @@ class HCCDicomDataset(Dataset):
 
         return tensor_img
 
-
-
 class HCCDataModule:
     def __init__(
         self,
@@ -318,21 +376,10 @@ class HCCDataModule:
         num_slices=20,
         num_samples=1,
         num_workers=2,
-        preprocessed_root=None
+        preprocessed_root=None,
+        eval_batch_size=None,
+        use_validation=True  # New parameter to control validation
     ):
-        """
-        Args:
-            train_csv_file (str): Path to CSV file for training (to be further split into train and val).
-            test_csv_file (str): Path to CSV file for testing.
-            train_dicom_root (str): Root directory for training patients’ DICOM folders.
-            test_dicom_root (str): Root directory for testing patients’ DICOM folders.
-            model_type (str): 'linear' or 'time_to_event'.
-            batch_size (int): Batch size for DataLoader.
-            num_slices (int): Number of slices per sub-sample.
-            num_samples (int): Number of sub-samples per patient.
-            num_workers (int): Number of DataLoader workers.
-            preprocessed_root (str): Directory to save/load preprocessed tensors.
-        """
         self.train_csv_file = train_csv_file
         self.test_csv_file = test_csv_file
         self.train_dicom_root = train_dicom_root
@@ -343,6 +390,8 @@ class HCCDataModule:
         self.num_samples = num_samples
         self.num_workers = num_workers
         self.preprocessed_root = preprocessed_root
+        self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
+        self.use_validation = use_validation
 
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
@@ -361,25 +410,30 @@ class HCCDataModule:
         else:
             test_df = pd.read_csv(self.test_csv_file)
 
-        if self.model_type == "linear":
-            stratify_col = train_df_full['event']
+        stratify_col = train_df_full['event']
+
+        if self.use_validation:
+            train_df, val_df = train_test_split(
+                train_df_full,
+                test_size=0.2,
+                random_state=42,
+                stratify=stratify_col
+            )
         else:
-            stratify_col = train_df_full['event']
+            train_df = train_df_full
+            val_df = None
 
-        train_df, val_df = train_test_split(
-            train_df_full,
-            test_size=0.2,
-            random_state=42,
-            stratify=stratify_col
-        )
+        print(f"Train: {len(train_df)} patients, Test: {len(test_df)} patients")
+        print(f"Positive cases - Train: {(train_df['event'] == 1).sum()}, Test: {(test_df['event'] == 1).sum()}")
+        if self.use_validation:
+            print(f"Val: {len(val_df)} patients, Positive Val: {(val_df['event'] == 1).sum()}")
 
-        print(f"Train: {len(train_df)} patients, Val: {len(val_df)} patients, Test: {len(test_df)} patients")
-        pos_train = (train_df['event'] == 1).sum()
-        pos_val = (val_df['event'] == 1).sum()
-        pos_test = (test_df['event'] == 1).sum()
-        print(f"Positive cases - Train: {pos_train}, Val: {pos_val}, Test: {pos_test}")
+        train_dataset_type = infer_dataset_type(self.train_csv_file)
+        test_dataset_type = infer_dataset_type(self.test_csv_file)
 
-        # For training and validation, use the "TCGA" dataset type (with extra series folder)
+        print(f"Train dataset type: {train_dataset_type}")
+        print(f"Test dataset type: {test_dataset_type}")
+
         self.train_dataset = HCCDicomDataset(
             csv_file=train_df,
             dicom_root=self.train_dicom_root,
@@ -388,21 +442,21 @@ class HCCDataModule:
             num_slices=self.num_slices,
             num_samples=self.num_samples,
             preprocessed_root=self.preprocessed_root,
-            dataset_type="TCGA"  # <== using the TCGA file structure
+            dataset_type=train_dataset_type
         )
 
-        self.val_dataset = HCCDicomDataset(
-            csv_file=val_df,
-            dicom_root=self.train_dicom_root,  # Validation comes from the same directory as training
-            model_type=self.model_type,
-            transform=self.transform,
-            num_slices=self.num_slices,
-            num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root,
-            dataset_type="TCGA"  # <== using the TCGA file structure
-        )
+        if self.use_validation:
+            self.val_dataset = HCCDicomDataset(
+                csv_file=val_df,
+                dicom_root=self.train_dicom_root,
+                model_type=self.model_type,
+                transform=self.transform,
+                num_slices=self.num_slices,
+                num_samples=self.num_samples,
+                preprocessed_root=self.preprocessed_root,
+                dataset_type=train_dataset_type
+            )
 
-        # For testing, use the NYU dataset type (current implementation)
         self.test_dataset = HCCDicomDataset(
             csv_file=test_df,
             dicom_root=self.test_dicom_root,
@@ -411,7 +465,7 @@ class HCCDataModule:
             num_slices=self.num_slices,
             num_samples=self.num_samples,
             preprocessed_root=self.preprocessed_root,
-            dataset_type="NYU"  # <== current structure remains
+            dataset_type=test_dataset_type
         )
 
     def train_dataloader(self):
@@ -424,21 +478,25 @@ class HCCDataModule:
         )
 
     def val_dataloader(self):
+        if not self.use_validation:
+            raise ValueError("Validation is disabled in this configuration.")
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            drop_last=False
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            drop_last=False
         )
 
     def train_collate_fn(self, batch):

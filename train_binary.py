@@ -117,7 +117,6 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     torch.manual_seed(42)
     
     # Instantiate the data module.
-    # Here we pass the CSVs (or DataFrames) directly to the data module.
     data_module = HCCDataModule(
         train_csv_file=train_csv,
         test_csv_file=val_csv,  # when in CV mode, this is the fold test DataFrame/CSV
@@ -139,10 +138,8 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     dino_model.eval()
     dino_model.register_forward_hook(lambda m, i, o: None)
     
-    # Use the training dataloader for feature extraction on training data.
+    # Get dataloaders
     train_loader = data_module.train_dataloader()
-    # For evaluation, if in CV mode, use the test dataloader (which is built from the fold test CSV)
-    # otherwise, use the val_dataloader.
     if args.cross_validation:
         eval_loader = data_module.test_dataloader()
     else:
@@ -152,7 +149,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     x_train, y_train_durations, y_train_events = extract_features(train_loader, dino_model, device)
     x_eval, y_eval_durations, y_eval_events = extract_features(eval_loader, dino_model, device)
     
-    # Average across samples (for each patient) if needed
+    # Average across samples (for each patient)
     x_train = x_train.mean(axis=1)
     x_eval = x_eval.mean(axis=1)
     
@@ -191,20 +188,20 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
     
     in_features = x_train_std.shape[1]
     
-    # For classification, replace the survival model with a single linear layer.
+    # For direct event prediction, create a two-class output layer.
     from torch import nn
-    net = nn.Linear(in_features, 1)
+    net = nn.Linear(in_features, 2)  # two outputs: class 0 and class 1
     net.to(device)
     
-    # Define optimizer and loss function
+    # Define optimizer and loss function (using CrossEntropyLoss for classification)
     optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = torch.nn.CrossEntropyLoss()
     
     # Prepare training and evaluation tensors
     train_tensor_x = torch.tensor(x_train_std, dtype=torch.float32).to(device)
-    train_tensor_y = torch.tensor(y_train_events.astype(np.float32), dtype=torch.float32).to(device)
+    train_tensor_y = torch.tensor(y_train_events.astype(np.int64), dtype=torch.long).to(device)
     eval_tensor_x = torch.tensor(x_eval_std, dtype=torch.float32).to(device)
-    eval_tensor_y = torch.tensor(y_eval_events.astype(np.float32), dtype=torch.float32).to(device)
+    eval_tensor_y = torch.tensor(y_eval_events.astype(np.int64), dtype=torch.long).to(device)
     
     train_dataset = torch.utils.data.TensorDataset(train_tensor_x, train_tensor_y)
     eval_dataset = torch.utils.data.TensorDataset(eval_tensor_x, eval_tensor_y)
@@ -221,7 +218,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
         train_losses = []
         for batch_x, batch_y in train_loader_cls:
             optimizer.zero_grad()
-            outputs = net(batch_x).squeeze()  # shape: (batch_size)
+            outputs = net(batch_x)  # shape: (batch_size, 2)
             loss = criterion(outputs, batch_y)
             loss.backward()
             if args.gradient_clip > 0:
@@ -236,14 +233,13 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
         all_eval_preds = []
         with torch.no_grad():
             for batch_x, batch_y in eval_loader_cls:
-                outputs = net(batch_x).squeeze()
+                outputs = net(batch_x)
                 loss = criterion(outputs, batch_y)
                 eval_losses.append(loss.item())
                 all_eval_preds.append(outputs)
         avg_eval_loss = np.mean(eval_losses)
-        all_eval_preds = torch.cat(all_eval_preds)
-        eval_probs = torch.sigmoid(all_eval_preds)
-        eval_pred_labels = (eval_probs >= 0.5).float()
+        all_eval_preds = torch.cat(all_eval_preds, dim=0)
+        eval_pred_labels = all_eval_preds.argmax(dim=1)
         eval_accuracy = (eval_pred_labels.cpu().numpy() == eval_tensor_y.cpu().numpy()).mean()
         
         print(f"[Fold {fold_id}] Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_train_loss:.4f} - Eval Loss: {avg_eval_loss:.4f} - Eval Accuracy: {eval_accuracy:.4f}")
@@ -258,17 +254,16 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
                     print(f"[Fold {fold_id}] Early stopping triggered at epoch {epoch+1}")
                     break
                     
-    # After training, evaluate on the full evaluation set
+    # After training, final evaluation on the full evaluation set
     net.eval()
     with torch.no_grad():
-        outputs = net(eval_tensor_x).squeeze()
-        eval_probs = torch.sigmoid(outputs).cpu().numpy()
-        eval_pred_labels = (eval_probs >= 0.5).astype(int)
+        outputs = net(eval_tensor_x)
+        eval_pred_labels = outputs.argmax(dim=1).cpu().numpy()
         eval_accuracy = (eval_pred_labels == y_eval_events).mean()
     
     if return_predictions:
-        # Return predicted probabilities along with durations and events.
-        return eval_probs, y_eval_durations, y_eval_events
+        # Return predicted event labels along with durations and events.
+        return eval_pred_labels, y_eval_durations, y_eval_events
     else:
         print(f"[Fold {fold_id}] Accuracy: {eval_accuracy:.4f}")
         if final_eval and not return_predictions:
@@ -279,6 +274,7 @@ def train_and_evaluate(args, train_csv, val_csv, hyperparams, fold_id="", final_
 
 
 
+
 def upsample_df(df, target_column='event'):
     df_majority = df[df[target_column] == 0]
     df_minority = df[df[target_column] == 1]
@@ -286,7 +282,6 @@ def upsample_df(df, target_column='event'):
         return df
     df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=1)
     return pd.concat([df_majority, df_minority_upsampled]).reset_index(drop=True)
-
 def cross_validation_mode(args):
     """
     For each fold, we create training and test DataFrames,
@@ -343,7 +338,6 @@ def cross_validation_mode(args):
             df_fold_test['source'] = 'test'
 
         # Instead of writing temporary CSV files, we pass the DataFrames directly.
-        # (Alternatively, you can save them as CSVs and pass the file paths.)
         fold_train_csv = df_fold_train  # DataFrame
         fold_test_csv = df_fold_test    # DataFrame
 
@@ -382,11 +376,25 @@ def cross_validation_mode(args):
     final_predictions.to_csv(final_csv_path, index=False)
     print(f"Final predictions CSV saved to {final_csv_path}")
 
-    # Compute overall accuracy from aggregated predictions.
+    # Compute overall evaluation metrics from aggregated predictions.
     all_predicted_risk_scores = np.array(all_predicted_risk_scores)
     all_event_indicators = np.array(all_event_indicators)
     overall_accuracy = np.mean((all_predicted_risk_scores >= 0.5).astype(int) == all_event_indicators)
     print(f"\nOverall Accuracy from aggregated CV predictions: {overall_accuracy:.4f}")
+
+    from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score, f1_score
+    roc_auc = roc_auc_score(all_event_indicators, all_predicted_risk_scores)
+    aupr = average_precision_score(all_event_indicators, all_predicted_risk_scores)
+    binary_predictions = (all_predicted_risk_scores >= 0.5).astype(int)
+    precision = precision_score(all_event_indicators, binary_predictions)
+    recall = recall_score(all_event_indicators, binary_predictions)
+    f1 = f1_score(all_event_indicators, binary_predictions)
+    print("\nOverall Evaluation Metrics:")
+    print(f"ROC AUC: {roc_auc:.4f}")
+    print(f"Area Under Precision-Recall Curve (AUPR): {aupr:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
 
     # Print summary stats for per-fold accuracies.
     mean_accuracy = np.mean(fold_accuracies)
@@ -399,7 +407,7 @@ def cross_validation_mode(args):
     print(f"Minimum: {min_accuracy:.4f}")
     print(f"Maximum: {max_accuracy:.4f}")
 
-    # Optionally, report separate accuracies if the original test CSV was provided.
+    # Optionally, report separate metrics if the original test CSV was provided.
     if df_test_full is not None:
         all_sources = np.array(all_sources)
         test_indices = np.where(all_sources == 'test')[0]
@@ -410,6 +418,20 @@ def cross_validation_mode(args):
             train_event_indicators = all_event_indicators[train_indices]
             train_accuracy = np.mean((train_risk_scores >= 0.5).astype(int) == train_event_indicators)
             print(f"\nTraining CSV Only Accuracy: {train_accuracy:.4f}")
+
+            # Compute training-only evaluation metrics.
+            train_roc_auc = roc_auc_score(train_event_indicators, train_risk_scores)
+            train_aupr = average_precision_score(train_event_indicators, train_risk_scores)
+            train_binary_predictions = (train_risk_scores >= 0.5).astype(int)
+            train_precision = precision_score(train_event_indicators, train_binary_predictions)
+            train_recall = recall_score(train_event_indicators, train_binary_predictions)
+            train_f1 = f1_score(train_event_indicators, train_binary_predictions)
+            print("Training CSV Only Metrics:")
+            print(f"ROC AUC: {train_roc_auc:.4f}")
+            print(f"Area Under Precision-Recall Curve (AUPR): {train_aupr:.4f}")
+            print(f"Precision: {train_precision:.4f}")
+            print(f"Recall: {train_recall:.4f}")
+            print(f"F1 Score: {train_f1:.4f}")
         else:
             print("\nNo training CSV samples found in the CV folds.")
 
@@ -417,9 +439,24 @@ def cross_validation_mode(args):
             test_risk_scores = all_predicted_risk_scores[test_indices]
             test_event_indicators = all_event_indicators[test_indices]
             test_accuracy = np.mean((test_risk_scores >= 0.5).astype(int) == test_event_indicators)
-            print(f"Test CSV Only Accuracy: {test_accuracy:.4f}")
+            print(f"\nTest CSV Only Accuracy: {test_accuracy:.4f}")
+
+            # Compute test-only evaluation metrics.
+            test_roc_auc = roc_auc_score(test_event_indicators, test_risk_scores)
+            test_aupr = average_precision_score(test_event_indicators, test_risk_scores)
+            test_binary_predictions = (test_risk_scores >= 0.5).astype(int)
+            test_precision = precision_score(test_event_indicators, test_binary_predictions)
+            test_recall = recall_score(test_event_indicators, test_binary_predictions)
+            test_f1 = f1_score(test_event_indicators, test_binary_predictions)
+            print("Test CSV Only Metrics:")
+            print(f"ROC AUC: {test_roc_auc:.4f}")
+            print(f"Area Under Precision-Recall Curve (AUPR): {test_aupr:.4f}")
+            print(f"Precision: {test_precision:.4f}")
+            print(f"Recall: {test_recall:.4f}")
+            print(f"F1 Score: {test_f1:.4f}")
         else:
             print("No test CSV samples found in the CV folds.")
+
 
 def main(args):
     if args.cross_validation:
@@ -451,7 +488,7 @@ if __name__ == "__main__":
                          help="Path to the testing DICOM directory.")
     parser.add_argument("--train_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
                          help="Path to the training CSV file.")
-    parser.add_argument("--test_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv",
+    parser.add_argument("--test_csv_file", type=str, default="",
                          help="Path to the testing CSV file. If not provided, a train-test split will be performed on the training dataset.")
     parser.add_argument('--preprocessed_root', type=str, default=None, 
                          help='Directory to store/load preprocessed image tensors')
@@ -489,7 +526,7 @@ if __name__ == "__main__":
                         help="If set, early stopping will be used during training")
     parser.add_argument('--cross_validation', action='store_true',
                         help="Enable cross validation mode")
-    parser.add_argument('--cv_folds', type=int, default=2,
+    parser.add_argument('--cv_folds', type=int, default=10,
                         help="Number of cross validation folds")
     parser.add_argument('--leave_one_out', action='store_true',
                         help="Enable leave-one-out cross validation mode (combines CSVs and uses LOOCV)")

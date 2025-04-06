@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p a100_short,radiology,a100_dev
+#SBATCH -p a100_short,radiology,a100_long,a100_dev
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,8 +22,8 @@ conda activate dinov2
 srun python train_binary.py \
     --train_dicom_root  /gpfs/data/mankowskilab/HCC_Recurrence/dicom \
     --test_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
-    --train_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --test_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
+    --train_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --batch_size 32 \
     --num_slices  32\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
@@ -31,8 +31,9 @@ srun python train_binary.py \
     --num_samples_per_patient 1\
     --upsampling \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 10 \
+    --epochs 1000 \
     --cross_validation \
+
 
 
 
