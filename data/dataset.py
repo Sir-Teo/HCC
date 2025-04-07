@@ -25,7 +25,7 @@ def infer_dataset_type(csv_input):
                     return "TCGA"
                 elif "nyu" in cell_lower:
                     return "NYU"
-    return "NYU"
+    return "TCGA"
 
 def nan_hook(module, input, output):
     if torch.isnan(output).any() and DEBUG:
@@ -378,8 +378,17 @@ class HCCDataModule:
         num_workers=2,
         preprocessed_root=None,
         eval_batch_size=None,
-        use_validation=True  # New parameter to control validation
+        use_validation=True,
+        cross_validation=False,
+        cv_folds=10,
+        leave_one_out=False,
+        random_state=42
     ):
+        if not isinstance(train_csv_file, str):
+            raise ValueError("train_csv_file must be a string path to a CSV file")
+        if test_csv_file is not None and not isinstance(test_csv_file, str):
+            raise ValueError("test_csv_file must be a string path to a CSV file or None")
+
         self.train_csv_file = train_csv_file
         self.test_csv_file = test_csv_file
         self.train_dicom_root = train_dicom_root
@@ -392,6 +401,10 @@ class HCCDataModule:
         self.preprocessed_root = preprocessed_root
         self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
         self.use_validation = use_validation
+        self.cross_validation = cross_validation
+        self.cv_folds = cv_folds
+        self.leave_one_out = leave_one_out
+        self.random_state = random_state
 
         self.transform = T.Compose([
             T.Resize((224, 224), antialias=True),
@@ -399,55 +412,145 @@ class HCCDataModule:
                         std=[0.229, 0.224, 0.225])
         ])
 
-    def setup(self):
-        if isinstance(self.train_csv_file, pd.DataFrame):
-            train_df_full = self.train_csv_file.copy()
-        else:
-            train_df_full = pd.read_csv(self.train_csv_file)
+    def _load_and_filter_dataset(self, csv_file, dicom_root, dataset_type):
+        """Load and filter a dataset, returning the filtered DataFrame"""
+        df = pd.read_csv(csv_file)
+        df['source'] = 'train' if csv_file == self.train_csv_file else 'test'
+        df['dicom_root'] = dicom_root
 
-        if isinstance(self.test_csv_file, pd.DataFrame):
-            test_df = self.test_csv_file.copy()
-        else:
-            test_df = pd.read_csv(self.test_csv_file)
-
-        stratify_col = train_df_full['event']
-
-        if self.use_validation:
-            train_df, val_df = train_test_split(
-                train_df_full,
-                test_size=0.2,
-                random_state=42,
-                stratify=stratify_col
-            )
-        else:
-            train_df = train_df_full
-            val_df = None
-
-        print(f"Train: {len(train_df)} patients, Test: {len(test_df)} patients")
-        print(f"Positive cases - Train: {(train_df['event'] == 1).sum()}, Test: {(test_df['event'] == 1).sum()}")
-        if self.use_validation:
-            print(f"Val: {len(val_df)} patients, Positive Val: {(val_df['event'] == 1).sum()}")
-
-        train_dataset_type = infer_dataset_type(self.train_csv_file)
-        test_dataset_type = infer_dataset_type(self.test_csv_file)
-
-        print(f"Train dataset type: {train_dataset_type}")
-        print(f"Test dataset type: {test_dataset_type}")
-
-        self.train_dataset = HCCDicomDataset(
-            csv_file=train_df,
-            dicom_root=self.train_dicom_root,
+        # Create temporary dataset to filter out invalid patients
+        temp_dataset = HCCDicomDataset(
+            csv_file=df,
+            dicom_root=dicom_root,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
             preprocessed_root=self.preprocessed_root,
-            dataset_type=train_dataset_type
+            dataset_type=dataset_type
         )
 
-        if self.use_validation:
-            self.val_dataset = HCCDicomDataset(
-                csv_file=val_df,
+        # Get the filtered patient IDs
+        valid_patient_ids = [entry['patient_id'] for entry in temp_dataset.patient_data]
+        filtered_df = df[df['Pre op MRI Accession number'].astype(str).isin(valid_patient_ids)].copy()
+        
+        print(f"Original patients: {len(df)}, Valid patients after filtering: {len(filtered_df)}")
+        return filtered_df
+
+    def setup(self):
+        # Determine dataset types based on CSV file paths
+        if 'tcga' in self.train_csv_file.lower():
+            train_dataset_type = 'TCGA'
+        elif 'nyu' in self.train_csv_file.lower():
+            train_dataset_type = 'NYU'
+        else:
+            raise ValueError(f"Unknown dataset type: {self.train_csv_file}")
+
+        if self.test_csv_file:
+            if 'tcga' in self.test_csv_file.lower():
+                test_dataset_type = 'TCGA'
+            elif 'nyu' in self.test_csv_file.lower():
+                test_dataset_type = 'NYU'
+            else:
+                raise ValueError(f"Unknown dataset type: {self.test_csv_file}")
+        else:
+            test_dataset_type = train_dataset_type
+
+        print(f"Train dataset type: {train_dataset_type}")
+        print(f"Test dataset type: {test_dataset_type}")
+
+        # Load and filter training data
+        train_df_full = self._load_and_filter_dataset(
+            self.train_csv_file, 
+            self.train_dicom_root, 
+            train_dataset_type
+        )
+
+        # Load and filter test data if provided
+        test_df = None
+        if self.test_csv_file:
+            test_df = self._load_and_filter_dataset(
+                self.test_csv_file, 
+                self.test_dicom_root, 
+                test_dataset_type
+            )
+
+        if self.cross_validation:
+            if self.test_csv_file:
+                # If both CSVs are present, combine them for cross-validation
+                print("Both train and test CSVs present - combining for cross-validation")
+                df_all = pd.concat([train_df_full, test_df], ignore_index=True)
+                # Create cross-validation splits
+                if self.leave_one_out:
+                    from sklearn.model_selection import LeaveOneOut
+                    self.cv_splits = list(LeaveOneOut().split(df_all))
+                else:
+                    from sklearn.model_selection import StratifiedKFold
+                    skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                    self.cv_splits = list(skf.split(df_all, df_all['event']))
+                
+                self.df_all = df_all
+                self.current_fold = 0
+                self._setup_fold(0)  # Setup first fold
+            else:
+                # If only train CSV, do regular train/val/test split
+                print("Only train CSV present - using regular train/val/test split")
+                stratify_col = train_df_full['event']
+                train_df, val_df = train_test_split(
+                    train_df_full,
+                    test_size=0.2,
+                    random_state=self.random_state,
+                    stratify=stratify_col
+                )
+
+                print(f"Train: {len(train_df)} patients, Positive cases: {(train_df['event'] == 1).sum()}")
+                print(f"Val: {len(val_df)} patients, Positive cases: {(val_df['event'] == 1).sum()}")
+
+                self.train_dataset = HCCDicomDataset(
+                    csv_file=train_df,
+                    dicom_root=self.train_dicom_root,
+                    model_type=self.model_type,
+                    transform=self.transform,
+                    num_slices=self.num_slices,
+                    num_samples=self.num_samples,
+                    preprocessed_root=self.preprocessed_root,
+                    dataset_type=train_dataset_type
+                )
+
+                self.val_dataset = HCCDicomDataset(
+                    csv_file=val_df,
+                    dicom_root=self.train_dicom_root,
+                    model_type=self.model_type,
+                    transform=self.transform,
+                    num_slices=self.num_slices,
+                    num_samples=self.num_samples,
+                    preprocessed_root=self.preprocessed_root,
+                    dataset_type=train_dataset_type
+                )
+
+                self.test_dataset = None
+        else:
+            # Regular train/val/test split
+            stratify_col = train_df_full['event']
+            if self.use_validation:
+                train_df, val_df = train_test_split(
+                    train_df_full,
+                    test_size=0.2,
+                    random_state=self.random_state,
+                    stratify=stratify_col
+                )
+            else:
+                train_df = train_df_full
+                val_df = None
+
+            print(f"Train: {len(train_df)} patients, Positive cases: {(train_df['event'] == 1).sum()}")
+            if test_df is not None:
+                print(f"Test: {len(test_df)} patients, Positive cases: {(test_df['event'] == 1).sum()}")
+            if self.use_validation:
+                print(f"Val: {len(val_df)} patients, Positive cases: {(val_df['event'] == 1).sum()}")
+
+            self.train_dataset = HCCDicomDataset(
+                csv_file=train_df,
                 dicom_root=self.train_dicom_root,
                 model_type=self.model_type,
                 transform=self.transform,
@@ -457,16 +560,111 @@ class HCCDataModule:
                 dataset_type=train_dataset_type
             )
 
+            if self.use_validation:
+                self.val_dataset = HCCDicomDataset(
+                    csv_file=val_df,
+                    dicom_root=self.train_dicom_root,
+                    model_type=self.model_type,
+                    transform=self.transform,
+                    num_slices=self.num_slices,
+                    num_samples=self.num_samples,
+                    preprocessed_root=self.preprocessed_root,
+                    dataset_type=train_dataset_type
+                )
+
+            if test_df is not None:
+                self.test_dataset = HCCDicomDataset(
+                    csv_file=test_df,
+                    dicom_root=self.test_dicom_root,
+                    model_type=self.model_type,
+                    transform=self.transform,
+                    num_slices=self.num_slices,
+                    num_samples=self.num_samples,
+                    preprocessed_root=self.preprocessed_root,
+                    dataset_type=test_dataset_type
+                )
+            else:
+                self.test_dataset = None
+
+    def _setup_fold(self, fold_idx):
+        """Setup datasets for a specific cross-validation fold"""
+        train_idx, test_idx = self.cv_splits[fold_idx]
+        df_fold_all = self.df_all.iloc[train_idx].reset_index(drop=True)
+        df_fold_test = self.df_all.iloc[test_idx].reset_index(drop=True)
+
+        # Split training data into train and validation sets
+        from sklearn.model_selection import train_test_split
+        df_fold_train, df_fold_val = train_test_split(
+            df_fold_all,
+            test_size=0.2,
+            random_state=self.random_state,
+            stratify=df_fold_all['event']
+        )
+
+        # Determine dataset type for this fold
+        if 'tcga' in self.train_csv_file.lower():
+            dataset_type = 'TCGA'
+        else:
+            dataset_type = 'NYU'
+
+        # Create datasets for this fold
+        self.train_dataset = HCCDicomDataset(
+            csv_file=df_fold_train,
+            dicom_root=self.train_dicom_root,
+            model_type=self.model_type,
+            transform=self.transform,
+            num_slices=self.num_slices,
+            num_samples=self.num_samples,
+            preprocessed_root=self.preprocessed_root,
+            dataset_type=dataset_type
+        )
+
+        self.val_dataset = HCCDicomDataset(
+            csv_file=df_fold_val,
+            dicom_root=self.train_dicom_root,
+            model_type=self.model_type,
+            transform=self.transform,
+            num_slices=self.num_slices,
+            num_samples=self.num_samples,
+            preprocessed_root=self.preprocessed_root,
+            dataset_type=dataset_type
+        )
+
         self.test_dataset = HCCDicomDataset(
-            csv_file=test_df,
+            csv_file=df_fold_test,
             dicom_root=self.test_dicom_root,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
             preprocessed_root=self.preprocessed_root,
-            dataset_type=test_dataset_type
+            dataset_type=dataset_type
         )
+
+        # Print actual patient counts after filtering
+        print(f"[CV Fold {fold_idx}] Train: {len(self.train_dataset)} patients, Positive events: {df_fold_train['event'].sum()}")
+        print(f"[CV Fold {fold_idx}] Val: {len(self.val_dataset)} patients, Positive events: {df_fold_val['event'].sum()}")
+        print(f"[CV Fold {fold_idx}] Test: {len(self.test_dataset)} patients, Positive events: {df_fold_test['event'].sum()}")
+
+    def next_fold(self):
+        """Move to the next cross-validation fold"""
+        if not self.cross_validation:
+            raise ValueError("Cross-validation is not enabled")
+        
+        self.current_fold += 1
+        if self.current_fold >= len(self.cv_splits):
+            return False
+        
+        self._setup_fold(self.current_fold)
+        return True
+
+    def get_current_fold(self):
+        """Get the current fold index"""
+        return self.current_fold
+
+    def get_total_folds(self):
+        """Get the total number of folds"""
+        return len(self.cv_splits) if self.cross_validation else 1
 
     def train_dataloader(self):
         return DataLoader(
