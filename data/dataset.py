@@ -9,23 +9,9 @@ import torchvision.transforms as T
 import pydicom
 from torch.utils.data import Dataset, DataLoader, default_collate
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm # Added for progress bar
 
-DEBUG = True
-
-def infer_dataset_type(csv_input):
-    # If csv_input is a file path string, use the file name to infer dataset type.
-    if isinstance(csv_input, pd.DataFrame):
-        # Use the second row if available, otherwise fallback to the first row.
-        row_idx = 1 if len(csv_input) > 1 else 0
-        row_data = csv_input.iloc[row_idx]
-        for cell in row_data:
-            if isinstance(cell, str):
-                cell_lower = cell.lower()
-                if "tcga" in cell_lower:
-                    return "TCGA"
-                elif "nyu" in cell_lower:
-                    return "NYU"
-    return "TCGA"
+DEBUG = False 
 
 def nan_hook(module, input, output):
     if torch.isnan(output).any() and DEBUG:
@@ -34,91 +20,50 @@ def nan_hook(module, input, output):
 class HCCDicomDataset(Dataset):
     def __init__(
         self,
-        csv_file,
-        dicom_root,
+        patient_data_list, # Changed from csv_file/dicom_root to list of dicts
         model_type="linear",
         transform=None,
         num_slices=10,
         num_samples=1,
-        preprocessed_root=None,
-        dataset_type="NYU"
+        preprocessed_root=None
     ):
         """
         Args:
-            csv_file (str or pd.DataFrame): Path to CSV or already loaded DataFrame.
-            dicom_root (str): Root directory where patient DICOM folders are stored.
+            patient_data_list (list): List of dictionaries, each containing patient info.
             model_type (str): Either 'linear' or 'time_to_event'.
             transform (callable): Torchvision transforms to apply on each slice.
             num_slices (int): Number of slices per sub-sample.
             num_samples (int): Number of sub-samples to extract from each patient's stack.
-            preprocessed_root (str): Directory for caching/loading preprocessed tensors.
-            dataset_type (str): Either "TCGA" or "NYU".
+            preprocessed_root (str): Base directory for caching/loading preprocessed tensors.
         """
-        self.dicom_root = dicom_root
         self.transform = transform
         self.model_type = model_type
         self.num_slices = num_slices
         self.num_samples = num_samples
         self.preprocessed_root = preprocessed_root
-        self.dataset_type = dataset_type  # store the dataset type
-
-        # Build the patient_data list from CSV
-        if isinstance(csv_file, str):
-            df = pd.read_csv(csv_file)
-        else:
-            df = csv_file.copy()
-
-        self.patient_data = []
-        for _, row in df.iterrows():
-            patient_id = str(row['Pre op MRI Accession number'])
-            # Use the dicom root from the CSV row if available; otherwise fall back
-            if 'dicom_root' in row:
-                dicom_dir = os.path.join(row['dicom_root'], patient_id)
-            else:
-                dicom_dir = os.path.join(dicom_root, patient_id)
-            if os.path.exists(dicom_dir):
-                data_entry = {
-                    'patient_id': patient_id,
-                    'dicom_dir': dicom_dir
-                }
-                if self.model_type == "linear":
-                    data_entry['label'] = row['event']
-                elif self.model_type == "time_to_event":
-                    data_entry['time'] = row['time']
-                    data_entry['event'] = row['event']
-                
-                self.patient_data.append(data_entry)
-        print(f"[DEBUG] Found {len(self.patient_data)} patients in the dataset.")
-
-        # --- Filtering out patients with no valid images ---
-        filtered_patient_data = []
-        for entry in self.patient_data:
-            if self._has_valid_images(entry['dicom_dir']):
-                filtered_patient_data.append(entry)
-            else:
-                if DEBUG:
-                    print(f"[DEBUG] Filtering out patient {entry['patient_id']} due to no valid images.")
-        self.patient_data = filtered_patient_data
+        self.patient_data = patient_data_list # Directly use the provided list
 
         if DEBUG:
-            print(f"[DEBUG] HCCDicomDataset ({self.dataset_type}) initialized with {len(self.patient_data)} patients.")
+            print(f"[DEBUG] HCCDicomDataset initialized with {len(self.patient_data)} patients.")
 
-    def _has_valid_images(self, dicom_dir):
+    def _has_valid_images(self, dicom_dir, dataset_type): # Added dataset_type argument
         """
         Checks if the DICOM directory contains at least one valid image.
-        For TCGA, traverse the top-level series folders.
-        For NYU, look for .dcm files and check header fields.
+        Uses dataset_type to determine traversal logic.
         """
         if not os.path.exists(dicom_dir):
             return False
 
-        if self.dataset_type == "TCGA":
+        if dataset_type == "TCGA": # Use passed dataset_type
             for top_folder in os.listdir(dicom_dir):
                 top_folder_path = os.path.join(dicom_dir, top_folder)
-                if "MR" not in top_folder.upper():
+                # Loosened check for flexibility
+                if not os.path.isdir(top_folder_path): continue 
+                if "MR" not in top_folder.upper(): 
                     continue
                 for subfolder in os.listdir(top_folder_path):
                     subfolder_path = os.path.join(top_folder_path, subfolder)
+                    if not os.path.isdir(subfolder_path): continue
                     for fname in os.listdir(subfolder_path):
                         if not fname.endswith(".dcm"):
                             continue
@@ -130,7 +75,7 @@ class HCCDicomDataset(Dataset):
                         except Exception:
                             continue
             return False
-        else:  # NYU
+        else:  # NYU or other types handled similarly
             dcm_files = [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
             for dcm_path in dcm_files:
                 try:
@@ -145,6 +90,7 @@ class HCCDicomDataset(Dataset):
                 except Exception:
                     continue
             return False
+            
     def __len__(self):
         """
         Now, dataset length = number of patients. We do NOT multiply by num_samples;
@@ -157,16 +103,24 @@ class HCCDicomDataset(Dataset):
         Returns:
             - A 5D tensor of shape [num_samples, num_slices, C, H, W]
             - label (linear) or (time, event) (time_to_event)
+          Or returns None if the patient has no valid image data after loading.
         """
         patient = self.patient_data[idx]
         dicom_dir = patient['dicom_dir']
         patient_id = patient['patient_id']
+        dataset_type = patient['dataset_type'] # Get type for this patient
 
         # Load the entire axial series (as a single 4D tensor: [total_slices, C, H, W]).
-        full_stack = self.load_axial_series(dicom_dir)
+        full_stack = self.load_axial_series(dicom_dir, patient_id, dataset_type)
+
+        # --- Check for empty stack --- 
+        if full_stack.size(0) == 0:
+             if DEBUG:
+                 print(f"[DEBUG] Skipping patient {patient_id} ({dataset_type}) in __getitem__ due to empty full_stack.")
+             return None # Signal to collate_fn to skip this sample
 
         if DEBUG:
-            print(f"[DEBUG] __getitem__ for patient {patient_id} - full stack shape: {full_stack.shape}")
+            print(f"[DEBUG] __getitem__ for patient {patient_id} ({dataset_type}) - full stack shape: {full_stack.shape}")
 
         # Generate num_samples 3D sub-stacks (each with num_slices).
         sub_stacks = []
@@ -191,62 +145,81 @@ class HCCDicomDataset(Dataset):
 
         # Return according to model type
         if self.model_type == "linear":
-            label = torch.tensor(patient['label'], dtype=torch.float32)
+            label = torch.tensor(patient['event'], dtype=torch.float32) # Assuming binary uses 'event'
             return sub_stacks, label
         elif self.model_type == "time_to_event":
             time_ = torch.tensor(patient['time'], dtype=torch.float32)
             event_ = torch.tensor(patient['event'], dtype=torch.float32)
             return sub_stacks, time_, event_
 
-    def load_axial_series(self, dicom_dir):
+    def load_axial_series(self, dicom_dir, patient_id, dataset_type):
         """
         Loads (or retrieves from cache) all axial slices as a 4D tensor:
         [num_total_slices, 3, H, W].
 
-        For the "TCGA" dataset, we ignore axial filtering and load all DICOM slices,
-        whereas for "NYU" we only load slices that pass the axial filter.
+        Uses the patient's dataset_type for path traversal and preprocessing path.
         
         If preprocessed_root is specified, tries to load from a .pt file to speed up.
         """
-        patient_id = os.path.basename(dicom_dir)
+        # patient_id = os.path.basename(dicom_dir) # Already have patient_id
 
         # If we have preprocessed data, just load that
         if self.preprocessed_root:
-            preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
+            # Path includes dataset type: preprocessed_root/dataset_type/patient_id.pt
+            preprocessed_dir = os.path.join(self.preprocessed_root, dataset_type.lower())
+            preprocessed_path = os.path.join(preprocessed_dir, f"{patient_id}.pt")
             if os.path.exists(preprocessed_path):
                 if DEBUG:
-                    print(f"[DEBUG] Loading preprocessed tensor for patient {patient_id} from {preprocessed_path}")
-                image_stack = torch.load(preprocessed_path)
-                return image_stack  # shape: [num_slices, C, H, W]
+                    print(f"[DEBUG] Loading preprocessed tensor for patient {patient_id} ({dataset_type}) from {preprocessed_path}")
+                try:
+                    image_stack = torch.load(preprocessed_path)
+                    if image_stack.nelement() == 0: # Check for empty tensor saved previously
+                         if DEBUG: print(f"[DEBUG] Loaded empty tensor for {patient_id}. Will re-process.")
+                    else:
+                         return image_stack  # shape: [num_slices, C, H, W]
+                except Exception as e:
+                     print(f"[WARN] Error loading preprocessed file {preprocessed_path}, will re-process. Error: {e}")
+                     # Fall through to re-process
 
-        # --- File search based on dataset type ---
-        if self.dataset_type == "TCGA":
+        # --- File search based on dataset type --- 
+        # Ensure directory exists before listing contents
+        if not os.path.isdir(dicom_dir):
+            print(f"[WARN] DICOM directory not found for patient {patient_id}: {dicom_dir}")
+            image_stack = torch.zeros((0, 3, 224, 224))
+            # Save empty tensor if preprocessing is enabled
+            if self.preprocessed_root:
+                preprocessed_dir = os.path.join(self.preprocessed_root, dataset_type.lower())
+                os.makedirs(preprocessed_dir, exist_ok=True)
+                preprocessed_path = os.path.join(preprocessed_dir, f"{patient_id}.pt")
+                torch.save(image_stack, preprocessed_path)
+                if DEBUG: print(f"[DEBUG] Saved empty preprocessed tensor for missing dir patient {patient_id} to {preprocessed_path}")
+            return image_stack
+            
+        if dataset_type == "TCGA": # Use patient's dataset_type
             dcm_files = []
-
             # Step 1: Traverse only top-level series folders (e.g., MRI-AbdomenPelvis...)
             for top_folder in os.listdir(dicom_dir):
-                
                 top_folder_path = os.path.join(dicom_dir, top_folder)
-
-                if "MR" not in top_folder.upper():
-                    continue
-                
+                if not os.path.isdir(top_folder_path): continue
+                # if "MR" not in top_folder.upper(): 
+                #     continue
                 for subfolder in os.listdir(top_folder_path):
                     subfolder_path = os.path.join(top_folder_path, subfolder)
-
+                    if not os.path.isdir(subfolder_path): continue
                     # Step 3: Read DICOM files inside these subfolders
                     for fname in os.listdir(subfolder_path):
                         if not fname.endswith(".dcm"):
                             continue
                         file_path = os.path.join(subfolder_path, fname)
                         try:
-                            dcm = pydicom.dcmread(file_path, stop_before_pixels=True)
+                            # Read header first to potentially skip faster
+                            dcm_hdr = pydicom.dcmread(file_path, stop_before_pixels=True) 
                             dcm_files.append(file_path)
                         except Exception as e:
-                            print(f"Error reading DICOM file {file_path}: {e}")
+                            # print(f"Minor error reading DICOM header {file_path}: {e}")
                             continue
             selected_files = dcm_files
-        else:  # NYU
+        else:  # NYU or other types
             dcm_files = [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')]
             series_dict = defaultdict(list)
             for dcm_path in dcm_files:
@@ -261,7 +234,7 @@ class HCCDicomDataset(Dataset):
                     orientation_tuple = tuple(orientation.flatten())
                     series_dict[orientation_tuple].append(dcm_path)
                 except Exception as e:
-                    print(f"Error reading DICOM file {dcm_path}: {e}")
+                    # print(f"Minor error reading DICOM header {dcm_path}: {e}")
                     continue
 
             selected_files = []
@@ -271,7 +244,7 @@ class HCCDicomDataset(Dataset):
                     selected_files.extend(dcm_paths)
 
         if DEBUG:
-            print(f"[DEBUG] load_axial_series {patient_id}: {len(selected_files)} slices found.")
+            print(f"[DEBUG] load_axial_series {patient_id} ({dataset_type}): {len(selected_files)} axial slices found.")
 
         image_stack = []
         for dcm_path in selected_files:
@@ -288,19 +261,19 @@ class HCCDicomDataset(Dataset):
             image_stack = torch.stack(image_stack, dim=0)
         else:
             # No valid images => return empty
+            if DEBUG: print(f"[DEBUG] No valid axial slices found for patient {patient_id} ({dataset_type}). Returning empty tensor.")
             image_stack = torch.zeros((0, 3, 224, 224))
 
         # Save preprocessed if requested
         if self.preprocessed_root:
-            os.makedirs(self.preprocessed_root, exist_ok=True)
-            preprocessed_path = os.path.join(self.preprocessed_root, f"{patient_id}.pt")
+            preprocessed_dir = os.path.join(self.preprocessed_root, dataset_type.lower())
+            os.makedirs(preprocessed_dir, exist_ok=True)
+            preprocessed_path = os.path.join(preprocessed_dir, f"{patient_id}.pt")
             torch.save(image_stack, preprocessed_path)
             if DEBUG:
-                print(f"[DEBUG] Saved preprocessed tensor for patient {patient_id} to {preprocessed_path}")
+                print(f"[DEBUG] Saved preprocessed tensor ({image_stack.shape}) for patient {patient_id} ({dataset_type}) to {preprocessed_path}")
 
         return image_stack  # shape: [num_slices, C, H, W]
-
-
 
     def sample_sub_stack(self, full_stack):
         """
@@ -309,8 +282,8 @@ class HCCDicomDataset(Dataset):
         Returns a 4D tensor: [num_slices, C, H, W].
         """
         total_slices = full_stack.size(0)
-        if DEBUG:
-            print(f"[DEBUG] sample_sub_stack - total slices: {total_slices}, needed: {self.num_slices}")
+        # if DEBUG:
+            # print(f"[DEBUG] sample_sub_stack - total slices: {total_slices}, needed: {self.num_slices}")
 
         if total_slices == 0:
             # Edge case: no slices at all
@@ -323,9 +296,11 @@ class HCCDicomDataset(Dataset):
             sub_stack = torch.cat([full_stack, padding], dim=0)
         else:
             # Randomly select self.num_slices among total_slices
-            selected_indices = torch.randperm(total_slices)[:self.num_slices]
-            selected_indices, _ = torch.sort(selected_indices)
-            sub_stack = full_stack[selected_indices]
+            start_index = random.randint(0, total_slices - self.num_slices) # Select contiguous block
+            sub_stack = full_stack[start_index : start_index + self.num_slices]
+            # selected_indices = torch.randperm(total_slices)[:self.num_slices]
+            # selected_indices, _ = torch.sort(selected_indices)
+            # sub_stack = full_stack[selected_indices]
 
         return sub_stack
 
@@ -351,26 +326,37 @@ class HCCDicomDataset(Dataset):
     def dicom_to_tensor(self, dcm):
         img = dcm.pixel_array.astype(np.float32)
         img_min, img_max = img.min(), img.max()
-        img = (img - img_min) / (img_max - img_min + 1e-6)
+        # Normalize to [0, 1]
+        if img_max > img_min:
+             img = (img - img_min) / (img_max - img_min)
+        else:
+             img = np.zeros_like(img) # Handle case of constant image
 
         if img.ndim == 2:
             img = np.repeat(img[..., np.newaxis], 3, axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 1: # Handle grayscale with channel dim
+             img = np.repeat(img, 3, axis=-1)
+        elif img.ndim == 3 and img.shape[2] != 3: # Unexpected channel count
+             print(f"[WARN] Unexpected channel count {img.shape[2]}, taking first channel.")
+             img = img[:,:,0:1] # Take the first channel
+             img = np.repeat(img, 3, axis=-1) # Repeat it to make 3 channels
 
         tensor_img = torch.from_numpy(img).permute(2, 0, 1)
         # Resize tensor_img to (3, 224, 224) using torch.nn.functional.interpolate:
-        tensor_img = tensor_img.unsqueeze(0)  # add batch dim for interpolate
-        tensor_img = torch.nn.functional.interpolate(tensor_img, size=(224, 224), mode='bilinear', align_corners=False)
-        tensor_img = tensor_img.squeeze(0)  # remove batch dim
+        if tensor_img.shape[1:] != (224, 224):
+            tensor_img = tensor_img.unsqueeze(0)  # add batch dim for interpolate
+            tensor_img = torch.nn.functional.interpolate(tensor_img, size=(224, 224), mode='bilinear', align_corners=False)
+            tensor_img = tensor_img.squeeze(0)  # remove batch dim
 
         return tensor_img
 
 class HCCDataModule:
     def __init__(
         self,
-        train_csv_file,
-        test_csv_file,
-        train_dicom_root,
-        test_dicom_root,
+        train_csv_file, # Should be TCGA csv
+        test_csv_file,  # Should be NYU csv
+        train_dicom_root, # TCGA root
+        test_dicom_root,  # NYU root
         model_type="linear",
         batch_size=2,
         num_slices=20,
@@ -384,21 +370,22 @@ class HCCDataModule:
         leave_one_out=False,
         random_state=42
     ):
+        # Renamed args for clarity when combining datasets
         if not isinstance(train_csv_file, str):
-            raise ValueError("train_csv_file must be a string path to a CSV file")
+            raise ValueError("train_csv_file (TCGA) must be a string path to a CSV file")
         if test_csv_file is not None and not isinstance(test_csv_file, str):
-            raise ValueError("test_csv_file must be a string path to a CSV file or None")
+            raise ValueError("test_csv_file (NYU) must be a string path to a CSV file or None")
 
-        self.train_csv_file = train_csv_file
-        self.test_csv_file = test_csv_file
-        self.train_dicom_root = train_dicom_root
-        self.test_dicom_root = test_dicom_root
+        self.tcga_csv_file = train_csv_file
+        self.nyu_csv_file = test_csv_file
+        self.tcga_dicom_root = train_dicom_root
+        self.nyu_dicom_root = test_dicom_root
         self.batch_size = batch_size
         self.model_type = model_type
         self.num_slices = num_slices
         self.num_samples = num_samples
         self.num_workers = num_workers
-        self.preprocessed_root = preprocessed_root
+        self.preprocessed_root = preprocessed_root # Base directory
         self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
         self.use_validation = use_validation
         self.cross_validation = cross_validation
@@ -407,244 +394,232 @@ class HCCDataModule:
         self.random_state = random_state
 
         self.transform = T.Compose([
-            T.Resize((224, 224), antialias=True),
+            # Resize is now handled in dicom_to_tensor if needed
+            # T.Resize((224, 224), antialias=True),
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225])
         ])
 
-    def _load_and_filter_dataset(self, csv_file, dicom_root, dataset_type):
-        """Load and filter a dataset, returning the filtered DataFrame"""
+    def _build_patient_list(self, csv_file, dicom_root, dataset_type):
+        """Builds the list of patient data dictionaries from a CSV."""
+        if not csv_file or not os.path.exists(csv_file):
+             print(f"[WARN] CSV file not found or not provided: {csv_file}")
+             return []
+             
         df = pd.read_csv(csv_file)
-        df['source'] = 'train' if csv_file == self.train_csv_file else 'test'
-        df['dicom_root'] = dicom_root
+        patient_list = []
+        required_cols = ['Pre op MRI Accession number', 'time', 'event']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in {csv_file}: {missing_cols}")
 
-        # Create temporary dataset to filter out invalid patients
-        temp_dataset = HCCDicomDataset(
-            csv_file=df,
-            dicom_root=dicom_root,
-            model_type=self.model_type,
-            transform=self.transform,
-            num_slices=self.num_slices,
-            num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root,
-            dataset_type=dataset_type
-        )
+        for _, row in df.iterrows():
+            patient_id = str(row['Pre op MRI Accession number'])
+            pat_dicom_dir = os.path.join(dicom_root, patient_id)
+            
+            # Basic check if directory exists
+            # More thorough check happens in HCCDicomDataset._has_valid_images
+            # if not os.path.exists(pat_dicom_dir): 
+            #      if DEBUG: print(f"[DEBUG] Skipping patient {patient_id} from {dataset_type}, directory not found: {pat_dicom_dir}")
+            #      continue
+                 
+            data_entry = {
+                'patient_id': patient_id,
+                'dicom_dir': pat_dicom_dir, # Specific dicom dir for this patient
+                'dataset_type': dataset_type, # TCGA or NYU
+                'source': dataset_type # Use dataset_type as source identifier
+            }
+            if self.model_type == "linear":
+                data_entry['event'] = row['event'] # Use event as label for binary
+            elif self.model_type == "time_to_event":
+                data_entry['time'] = row['time']
+                data_entry['event'] = row['event']
+            
+            patient_list.append(data_entry)
+        print(f"Found {len(patient_list)} initial patient entries in {dataset_type} ({csv_file})")
+        return patient_list
 
-        # Get the filtered patient IDs
-        valid_patient_ids = [entry['patient_id'] for entry in temp_dataset.patient_data]
-        filtered_df = df[df['Pre op MRI Accession number'].astype(str).isin(valid_patient_ids)].copy()
-        
-        print(f"Original patients: {len(df)}, Valid patients after filtering: {len(filtered_df)}")
-        return filtered_df
+    def _filter_patient_list(self, patient_list):
+         """Filters a list of patient data based on image validity."""
+         filtered_list = []
+         print(f"Filtering {len(patient_list)} patients for valid images...")
+         # Use a dummy dataset instance just for the filtering method
+         temp_ds = HCCDicomDataset([], transform=self.transform) 
+         for entry in tqdm(patient_list, desc="Filtering Patients"):
+             if temp_ds._has_valid_images(entry['dicom_dir'], entry['dataset_type']):
+                 filtered_list.append(entry)
+             else:
+                 if DEBUG:
+                     print(f"[DEBUG] Filtering out patient {entry['patient_id']} ({entry['dataset_type']}) due to no valid images.")
+         print(f"Retained {len(filtered_list)} patients after filtering.")
+         return filtered_list
 
     def setup(self):
-        # Determine dataset types based on CSV file paths
-        if 'tcga' in self.train_csv_file.lower():
-            train_dataset_type = 'TCGA'
-        elif 'nyu' in self.train_csv_file.lower():
-            train_dataset_type = 'NYU'
-        else:
-            raise ValueError(f"Unknown dataset type: {self.train_csv_file}")
+        # Build initial patient lists for TCGA and NYU
+        tcga_patients = self._build_patient_list(self.tcga_csv_file, self.tcga_dicom_root, "TCGA")
+        nyu_patients = self._build_patient_list(self.nyu_csv_file, self.nyu_dicom_root, "NYU")
+        
+        # Filter patient lists based on image validity
+        tcga_patients_filtered = self._filter_patient_list(tcga_patients)
+        nyu_patients_filtered = self._filter_patient_list(nyu_patients)
 
-        if self.test_csv_file:
-            if 'tcga' in self.test_csv_file.lower():
-                test_dataset_type = 'TCGA'
-            elif 'nyu' in self.test_csv_file.lower():
-                test_dataset_type = 'NYU'
-            else:
-                raise ValueError(f"Unknown dataset type: {self.test_csv_file}")
-        else:
-            test_dataset_type = train_dataset_type
+        # Combine filtered lists
+        self.all_patients = tcga_patients_filtered + nyu_patients_filtered
+        random.shuffle(self.all_patients) # Shuffle the combined list
+        print(f"Total combined patients after filtering: {len(self.all_patients)}")
 
-        print(f"Train dataset type: {train_dataset_type}")
-        print(f"Test dataset type: {test_dataset_type}")
+        if not self.all_patients:
+             raise ValueError("No valid patients found in either dataset after filtering.")
 
-        # Load and filter training data
-        train_df_full = self._load_and_filter_dataset(
-            self.train_csv_file, 
-            self.train_dicom_root, 
-            train_dataset_type
-        )
-
-        # Load and filter test data if provided
-        test_df = None
-        if self.test_csv_file:
-            test_df = self._load_and_filter_dataset(
-                self.test_csv_file, 
-                self.test_dicom_root, 
-                test_dataset_type
+        # Preprocess all patients if requested
+        if self.preprocessed_root:
+            print(f"Preprocessing all {len(self.all_patients)} combined patients...")
+            # Create a temporary dataset with all patients
+            temp_all_dataset = HCCDicomDataset(
+                patient_data_list=self.all_patients,
+                model_type=self.model_type,
+                transform=self.transform, # Pass transform for resizing during preprocessing
+                num_slices=self.num_slices, # Needed for dummy call
+                num_samples=self.num_samples, # Needed for dummy call
+                preprocessed_root=self.preprocessed_root
             )
+            # Force preprocessing by accessing each patient via __getitem__
+            # which calls load_axial_series -> dicom_to_tensor -> save
+            for i in tqdm(range(len(temp_all_dataset)), desc="Preprocessing All Patients"):
+                try:
+                    _ = temp_all_dataset[i] # This triggers loading and saving
+                except Exception as e:
+                     print(f"[WARN] Error during preprocessing patient index {i}: {e}")
+            print("Preprocessing complete.")
 
         if self.cross_validation:
-            if self.test_csv_file:
-                # If both CSVs are present, combine them for cross-validation
-                print("Both train and test CSVs present - combining for cross-validation")
-                df_all = pd.concat([train_df_full, test_df], ignore_index=True)
-                # Create cross-validation splits
-                if self.leave_one_out:
-                    from sklearn.model_selection import LeaveOneOut
-                    self.cv_splits = list(LeaveOneOut().split(df_all))
+            # Create cross-validation splits on the combined list of patient dicts
+            patient_indices = list(range(len(self.all_patients)))
+            patient_events = [p['event'] for p in self.all_patients]
+
+            if self.leave_one_out:
+                from sklearn.model_selection import LeaveOneOut
+                self.cv_splitter = LeaveOneOut()
+                self.cv_splits = list(self.cv_splitter.split(patient_indices))
+            else:
+                from sklearn.model_selection import StratifiedKFold
+                skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                # Check if there are enough samples for stratification
+                if len(np.unique(patient_events)) < 2:
+                     print("[WARN] Only one class present in the combined dataset. Using KFold instead of StratifiedKFold.")
+                     from sklearn.model_selection import KFold
+                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                     self.cv_splits = list(kf.split(patient_indices))
+                elif any(np.bincount(patient_events) < self.cv_folds):
+                     print(f"[WARN] The least populated class has {min(np.bincount(patient_events))} members, which is less than n_splits={self.cv_folds}. Using KFold instead.")
+                     from sklearn.model_selection import KFold
+                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                     self.cv_splits = list(kf.split(patient_indices))
                 else:
-                    from sklearn.model_selection import StratifiedKFold
-                    skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                    self.cv_splits = list(skf.split(df_all, df_all['event']))
-                
-                self.df_all = df_all
-                self.current_fold = 0
-                self._setup_fold(0)  # Setup first fold
-            else:
-                # If only train CSV, do regular train/val/test split
-                print("Only train CSV present - using regular train/val/test split")
-                stratify_col = train_df_full['event']
-                train_df, val_df = train_test_split(
-                    train_df_full,
-                    test_size=0.2,
+                     self.cv_splits = list(skf.split(patient_indices, patient_events))
+            
+            print(f"Total patients for cross-validation: {len(self.all_patients)}")
+            print(f"Number of folds: {len(self.cv_splits)}")
+            
+            self.current_fold = 0
+            self._setup_fold(0)  # Setup first fold
+            
+        else: # Regular train/val/test split (on combined data)
+            if self.use_validation:
+                train_patients, test_patients = train_test_split(
+                    self.all_patients,
+                    test_size=0.2, # Or adjust as needed
                     random_state=self.random_state,
-                    stratify=stratify_col
+                    stratify=[p['event'] for p in self.all_patients]
                 )
-
-                print(f"Train: {len(train_df)} patients, Positive cases: {(train_df['event'] == 1).sum()}")
-                print(f"Val: {len(val_df)} patients, Positive cases: {(val_df['event'] == 1).sum()}")
-
-                self.train_dataset = HCCDicomDataset(
-                    csv_file=train_df,
-                    dicom_root=self.train_dicom_root,
-                    model_type=self.model_type,
-                    transform=self.transform,
-                    num_slices=self.num_slices,
-                    num_samples=self.num_samples,
-                    preprocessed_root=self.preprocessed_root,
-                    dataset_type=train_dataset_type
-                )
-
-                self.val_dataset = HCCDicomDataset(
-                    csv_file=val_df,
-                    dicom_root=self.train_dicom_root,
-                    model_type=self.model_type,
-                    transform=self.transform,
-                    num_slices=self.num_slices,
-                    num_samples=self.num_samples,
-                    preprocessed_root=self.preprocessed_root,
-                    dataset_type=train_dataset_type
-                )
-
-                self.test_dataset = None
-        else:
-            # Regular train/val/test split
-            stratify_col = train_df_full['event']
-            if self.use_validation:
-                train_df, val_df = train_test_split(
-                    train_df_full,
-                    test_size=0.2,
+                train_patients, val_patients = train_test_split(
+                    train_patients,
+                    test_size=0.25, # 0.25 * 0.8 = 0.2
                     random_state=self.random_state,
-                    stratify=stratify_col
+                    stratify=[p['event'] for p in train_patients]
                 )
             else:
-                train_df = train_df_full
-                val_df = None
-
-            print(f"Train: {len(train_df)} patients, Positive cases: {(train_df['event'] == 1).sum()}")
-            if test_df is not None:
-                print(f"Test: {len(test_df)} patients, Positive cases: {(test_df['event'] == 1).sum()}")
-            if self.use_validation:
-                print(f"Val: {len(val_df)} patients, Positive cases: {(val_df['event'] == 1).sum()}")
-
-            self.train_dataset = HCCDicomDataset(
-                csv_file=train_df,
-                dicom_root=self.train_dicom_root,
-                model_type=self.model_type,
-                transform=self.transform,
-                num_slices=self.num_slices,
-                num_samples=self.num_samples,
-                preprocessed_root=self.preprocessed_root,
-                dataset_type=train_dataset_type
-            )
-
-            if self.use_validation:
-                self.val_dataset = HCCDicomDataset(
-                    csv_file=val_df,
-                    dicom_root=self.train_dicom_root,
-                    model_type=self.model_type,
-                    transform=self.transform,
-                    num_slices=self.num_slices,
-                    num_samples=self.num_samples,
-                    preprocessed_root=self.preprocessed_root,
-                    dataset_type=train_dataset_type
+                train_patients, test_patients = train_test_split(
+                    self.all_patients,
+                    test_size=0.2, # Or adjust as needed
+                    random_state=self.random_state,
+                    stratify=[p['event'] for p in self.all_patients]
                 )
+                val_patients = [] # No validation set
 
-            if test_df is not None:
-                self.test_dataset = HCCDicomDataset(
-                    csv_file=test_df,
-                    dicom_root=self.test_dicom_root,
-                    model_type=self.model_type,
-                    transform=self.transform,
-                    num_slices=self.num_slices,
-                    num_samples=self.num_samples,
-                    preprocessed_root=self.preprocessed_root,
-                    dataset_type=test_dataset_type
-                )
-            else:
-                self.test_dataset = None
+            print(f"Train: {len(train_patients)} patients, Positive cases: {sum(p['event'] for p in train_patients)}")
+            print(f"Val: {len(val_patients)} patients, Positive cases: {sum(p['event'] for p in val_patients)}")
+            print(f"Test: {len(test_patients)} patients, Positive cases: {sum(p['event'] for p in test_patients)}")
+
+            self.train_dataset = HCCDicomDataset(train_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
+            self.val_dataset = HCCDicomDataset(val_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root) if val_patients else None
+            self.test_dataset = HCCDicomDataset(test_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
 
     def _setup_fold(self, fold_idx):
-        """Setup datasets for a specific cross-validation fold"""
-        train_idx, test_idx = self.cv_splits[fold_idx]
-        df_fold_all = self.df_all.iloc[train_idx].reset_index(drop=True)
-        df_fold_test = self.df_all.iloc[test_idx].reset_index(drop=True)
+        """Setup datasets for a specific cross-validation fold using the combined patient list."""
+        train_indices, test_indices = self.cv_splits[fold_idx]
+        
+        # Get the patient data dictionaries for this fold
+        fold_train_val_patients = [self.all_patients[i] for i in train_indices]
+        fold_test_patients = [self.all_patients[i] for i in test_indices]
 
         # Split training data into train and validation sets
-        from sklearn.model_selection import train_test_split
-        df_fold_train, df_fold_val = train_test_split(
-            df_fold_all,
-            test_size=0.2,
-            random_state=self.random_state,
-            stratify=df_fold_all['event']
-        )
-
-        # Determine dataset type for this fold
-        if 'tcga' in self.train_csv_file.lower():
-            dataset_type = 'TCGA'
+        if len(fold_train_val_patients) > 1 and self.use_validation:
+             try:
+                 fold_train_patients, fold_val_patients = train_test_split(
+                     fold_train_val_patients,
+                     test_size=0.2,
+                     random_state=self.random_state,
+                     stratify=[p['event'] for p in fold_train_val_patients]
+                 )
+             except ValueError as e:
+                 # Handle cases where stratification isn't possible (e.g., only one class in split)
+                 print(f"[WARN] Stratification failed for fold {fold_idx} validation split: {e}. Splitting without stratification.")
+                 fold_train_patients, fold_val_patients = train_test_split(
+                     fold_train_val_patients,
+                     test_size=0.2,
+                     random_state=self.random_state
+                 )
         else:
-            dataset_type = 'NYU'
+             fold_train_patients = fold_train_val_patients
+             fold_val_patients = [] # No validation split if only 1 sample or validation disabled
 
-        # Create datasets for this fold
+        # Create datasets for this fold using the patient lists
         self.train_dataset = HCCDicomDataset(
-            csv_file=df_fold_train,
-            dicom_root=self.train_dicom_root,
+            patient_data_list=fold_train_patients,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root,
-            dataset_type=dataset_type
+            preprocessed_root=self.preprocessed_root
         )
 
         self.val_dataset = HCCDicomDataset(
-            csv_file=df_fold_val,
-            dicom_root=self.train_dicom_root,
+            patient_data_list=fold_val_patients,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root,
-            dataset_type=dataset_type
-        )
+            preprocessed_root=self.preprocessed_root
+        ) if fold_val_patients else None # Create only if val set exists
 
         self.test_dataset = HCCDicomDataset(
-            csv_file=df_fold_test,
-            dicom_root=self.test_dicom_root,
+            patient_data_list=fold_test_patients,
             model_type=self.model_type,
             transform=self.transform,
             num_slices=self.num_slices,
             num_samples=self.num_samples,
-            preprocessed_root=self.preprocessed_root,
-            dataset_type=dataset_type
+            preprocessed_root=self.preprocessed_root
         )
 
         # Print actual patient counts after filtering
-        print(f"[CV Fold {fold_idx}] Train: {len(self.train_dataset)} patients, Positive events: {df_fold_train['event'].sum()}")
-        print(f"[CV Fold {fold_idx}] Val: {len(self.val_dataset)} patients, Positive events: {df_fold_val['event'].sum()}")
-        print(f"[CV Fold {fold_idx}] Test: {len(self.test_dataset)} patients, Positive events: {df_fold_test['event'].sum()}")
+        train_events = sum(p['event'] for p in fold_train_patients)
+        val_events = sum(p['event'] for p in fold_val_patients) if fold_val_patients else 0
+        test_events = sum(p['event'] for p in fold_test_patients)
+        print(f"[CV Fold {fold_idx+1}] Train: {len(self.train_dataset)} patients ({train_events} positive)")
+        if self.val_dataset:
+             print(f"[CV Fold {fold_idx+1}] Val:   {len(self.val_dataset)} patients ({val_events} positive)")
+        print(f"[CV Fold {fold_idx+1}] Test:  {len(self.test_dataset)} patients ({test_events} positive)")
 
     def next_fold(self):
         """Move to the next cross-validation fold"""
@@ -667,38 +642,77 @@ class HCCDataModule:
         return len(self.cv_splits) if self.cross_validation else 1
 
     def train_dataloader(self):
+        if not self.train_dataset:
+            raise ValueError("Train dataset not setup.")
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=self.train_collate_fn
+            collate_fn=self.skip_none_collate, # Use custom collate
+            pin_memory=True
         )
 
     def val_dataloader(self):
         if not self.use_validation:
-            raise ValueError("Validation is disabled in this configuration.")
+            return None 
+        if not self.val_dataset:
+            print("[WARN] Validation dataset is empty for this fold.")
+            return None 
         return DataLoader(
             self.val_dataset,
             batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=self.collate_fn,
-            drop_last=False
+            collate_fn=self.skip_none_collate, # Use custom collate
+            drop_last=False,
+            pin_memory=True
         )
 
     def test_dataloader(self):
+        if not self.test_dataset:
+            raise ValueError("Test dataset not setup.")
         return DataLoader(
             self.test_dataset,
             batch_size=self.eval_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=self.collate_fn,
-            drop_last=False
+            collate_fn=self.skip_none_collate, # Use custom collate
+            drop_last=False,
+            pin_memory=True
         )
 
+    def skip_none_collate(self, batch):
+        """A collate function that filters out None values returned by dataset.__getitem__."""
+        # Filter out None samples
+        original_len = len(batch)
+        batch = [x for x in batch if x is not None]
+        filtered_len = len(batch)
+        skipped_count = original_len - filtered_len
+        if skipped_count > 0 and DEBUG:
+            print(f"[DEBUG] Collate: Skipped {skipped_count}/{original_len} samples due to loading errors.")
+        
+        # If all samples in the batch were None, return None or empty tensors
+        if not batch:
+            # Depending on what the training loop expects, 
+            # returning None might be simplest, or return appropriately shaped empty tensors.
+            # Let's try returning None and handle it in the training loop if necessary.
+             print("[WARN] Collate: Entire batch was skipped.")
+             return None # Or potentially (torch.empty(0,...), torch.empty(0,...))
+            
+        # Use the default collate function on the filtered batch
+        try:
+            return default_collate(batch)
+        except Exception as e:
+            print(f"[ERROR] Error in default_collate after filtering Nones: {e}")
+            # You might want to investigate the structure of items in `batch` here
+            # For now, returning None to avoid crashing the training loop
+            return None
+
+    # Keep train_collate_fn and collate_fn in case they are referenced elsewhere,
+    # but point them to the new function or make them aliases.
     def train_collate_fn(self, batch):
-        return default_collate(batch)
+        return self.skip_none_collate(batch)
 
     def collate_fn(self, batch):
-        return default_collate(batch)
+        return self.skip_none_collate(batch)
