@@ -197,6 +197,7 @@ def cross_validation_mode(args):
         preprocessed_root=args.preprocessed_root,
         cross_validation=True,
         cv_folds=args.cv_folds,
+        cv_mode=args.cv_mode,
         leave_one_out=args.leave_one_out,
         random_state=42,
         use_validation=True # Use validation set within folds
@@ -582,6 +583,8 @@ if __name__ == "__main__":
                         help="Enable cross validation mode (combines TCGA/NYU)")
     parser.add_argument('--cv_folds', type=int, default=10,
                         help="Number of cross validation folds")
+    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
+                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
     parser.add_argument('--leave_one_out', action='store_true',
                         help="Enable leave-one-out cross validation mode (overrides cv_folds)")
     
@@ -591,7 +594,8 @@ if __name__ == "__main__":
     # Create a unique subdirectory for each run using a timestamp
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     # Add more info to run name if desired (e.g., learning rate, batch size)
-    run_name = f"run_{timestamp}_lr{args.learning_rate}_bs{args.batch_size}_slices{args.num_slices}"
+    # Include cv_mode in run name
+    run_name = f"run_{timestamp}_mode{args.cv_mode}_lr{args.learning_rate}_bs{args.batch_size}_slices{args.num_slices}" 
     if args.upsampling: run_name += "_upsampled"
     if args.leave_one_out: run_name += "_loocv"
     else: run_name += f"_{args.cv_folds}fold"

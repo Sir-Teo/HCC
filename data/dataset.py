@@ -367,14 +367,16 @@ class HCCDataModule:
         use_validation=True,
         cross_validation=False,
         cv_folds=10,
+        cv_mode='combined', # Added: 'combined', 'tcga', 'nyu'
         leave_one_out=False,
         random_state=42
     ):
         # Renamed args for clarity when combining datasets
-        if not isinstance(train_csv_file, str):
-            raise ValueError("train_csv_file (TCGA) must be a string path to a CSV file")
-        if test_csv_file is not None and not isinstance(test_csv_file, str):
-            raise ValueError("test_csv_file (NYU) must be a string path to a CSV file or None")
+        # Basic validation, more specific checks happen later
+        # if not isinstance(train_csv_file, str):
+        #     raise ValueError("train_csv_file (TCGA) must be a string path to a CSV file")
+        # if test_csv_file is not None and not isinstance(test_csv_file, str):
+        #     raise ValueError("test_csv_file (NYU) must be a string path to a CSV file or None")
 
         self.tcga_csv_file = train_csv_file
         self.nyu_csv_file = test_csv_file
@@ -390,8 +392,12 @@ class HCCDataModule:
         self.use_validation = use_validation
         self.cross_validation = cross_validation
         self.cv_folds = cv_folds
+        self.cv_mode = cv_mode # Store the CV mode
         self.leave_one_out = leave_one_out
         self.random_state = random_state
+        
+        if self.cv_mode not in ['combined', 'tcga', 'nyu']:
+             raise ValueError(f"Invalid cv_mode: {self.cv_mode}. Choose from 'combined', 'tcga', 'nyu'.")
 
         self.transform = T.Compose([
             # Resize is now handled in dicom_to_tensor if needed
@@ -455,45 +461,65 @@ class HCCDataModule:
          return filtered_list
 
     def setup(self):
-        # Build initial patient lists for TCGA and NYU
-        tcga_patients = self._build_patient_list(self.tcga_csv_file, self.tcga_dicom_root, "TCGA")
-        nyu_patients = self._build_patient_list(self.nyu_csv_file, self.nyu_dicom_root, "NYU")
+        # Build initial patient lists based on requested mode
+        tcga_patients = []
+        nyu_patients = []
         
-        # Filter patient lists based on image validity
-        tcga_patients_filtered = self._filter_patient_list(tcga_patients)
-        nyu_patients_filtered = self._filter_patient_list(nyu_patients)
-
-        # Combine filtered lists
-        self.all_patients = tcga_patients_filtered + nyu_patients_filtered
-        random.shuffle(self.all_patients) # Shuffle the combined list
-        print(f"Total combined patients after filtering: {len(self.all_patients)}")
+        if self.cv_mode in ['combined', 'tcga']:
+            if not self.tcga_csv_file or not os.path.exists(self.tcga_csv_file):
+                 print(f"[WARN] TCGA CSV file not found or not provided: {self.tcga_csv_file}. Skipping TCGA data.")
+            else:
+                 tcga_patients = self._build_patient_list(self.tcga_csv_file, self.tcga_dicom_root, "TCGA")
+                 tcga_patients = self._filter_patient_list(tcga_patients)
+        
+        if self.cv_mode in ['combined', 'nyu']:
+             if not self.nyu_csv_file or not os.path.exists(self.nyu_csv_file):
+                  print(f"[WARN] NYU CSV file not found or not provided: {self.nyu_csv_file}. Skipping NYU data.")
+             else:
+                  nyu_patients = self._build_patient_list(self.nyu_csv_file, self.nyu_dicom_root, "NYU")
+                  nyu_patients = self._filter_patient_list(nyu_patients)
+        
+        # Combine lists based on mode
+        if self.cv_mode == 'combined':
+             self.all_patients = tcga_patients + nyu_patients
+             print(f"Running in COMBINED mode.")
+        elif self.cv_mode == 'tcga':
+             self.all_patients = tcga_patients
+             print(f"Running in TCGA ONLY mode.")
+        elif self.cv_mode == 'nyu':
+             self.all_patients = nyu_patients
+             print(f"Running in NYU ONLY mode.")
+        else: # Should not happen due to init check
+             raise ValueError(f"Invalid cv_mode: {self.cv_mode}")
+             
+        random.shuffle(self.all_patients) # Shuffle the selected list
+        print(f"Total patients selected for mode '{self.cv_mode}': {len(self.all_patients)}")
 
         if not self.all_patients:
-             raise ValueError("No valid patients found in either dataset after filtering.")
+             raise ValueError(f"No valid patients found for mode '{self.cv_mode}' after filtering.")
 
-        # Preprocess all patients if requested
+        # Preprocess the selected patients if requested
+        # The preprocessing saves to tcga/ or nyu/ subfolders based on patient's dataset_type
         if self.preprocessed_root:
-            print(f"Preprocessing all {len(self.all_patients)} combined patients...")
-            # Create a temporary dataset with all patients
+            print(f"Preprocessing {len(self.all_patients)} patients for mode '{self.cv_mode}'...")
             temp_all_dataset = HCCDicomDataset(
-                patient_data_list=self.all_patients,
+                patient_data_list=self.all_patients, # Use the list for the current mode
                 model_type=self.model_type,
-                transform=self.transform, # Pass transform for resizing during preprocessing
-                num_slices=self.num_slices, # Needed for dummy call
-                num_samples=self.num_samples, # Needed for dummy call
+                transform=self.transform, 
+                num_slices=self.num_slices, 
+                num_samples=self.num_samples, 
                 preprocessed_root=self.preprocessed_root
             )
-            # Force preprocessing by accessing each patient via __getitem__
-            # which calls load_axial_series -> dicom_to_tensor -> save
-            for i in tqdm(range(len(temp_all_dataset)), desc="Preprocessing All Patients"):
+            for i in tqdm(range(len(temp_all_dataset)), desc=f"Preprocessing Mode '{self.cv_mode}'"):
                 try:
-                    _ = temp_all_dataset[i] # This triggers loading and saving
+                    _ = temp_all_dataset[i] # Triggers loading and saving
                 except Exception as e:
-                     print(f"[WARN] Error during preprocessing patient index {i}: {e}")
+                     print(f"[WARN] Error during preprocessing patient index {i} (ID: {self.all_patients[i]['patient_id']}): {e}")
             print("Preprocessing complete.")
 
+        # Setup splits based on whether cross_validation is enabled
         if self.cross_validation:
-            # Create cross-validation splits on the combined list of patient dicts
+            # Create cross-validation splits on the selected patient list (self.all_patients)
             patient_indices = list(range(len(self.all_patients)))
             patient_events = [p['event'] for p in self.all_patients]
 
@@ -518,13 +544,13 @@ class HCCDataModule:
                 else:
                      self.cv_splits = list(skf.split(patient_indices, patient_events))
             
-            print(f"Total patients for cross-validation: {len(self.all_patients)}")
+            print(f"Total patients for cross-validation (mode '{self.cv_mode}'): {len(self.all_patients)}")
             print(f"Number of folds: {len(self.cv_splits)}")
             
             self.current_fold = 0
             self._setup_fold(0)  # Setup first fold
             
-        else: # Regular train/val/test split (on combined data)
+        else: # Regular train/val/test split (on the selected data)
             if self.use_validation:
                 train_patients, test_patients = train_test_split(
                     self.all_patients,

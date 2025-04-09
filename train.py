@@ -190,9 +190,10 @@ def cross_validation_mode(args):
         preprocessed_root=args.preprocessed_root,
         cross_validation=True,
         cv_folds=args.cv_folds,
+        cv_mode=args.cv_mode,
         leave_one_out=args.leave_one_out,
         random_state=42,
-        use_validation=True # Enable intra-fold validation
+        use_validation=True # Use validation set within folds
     )
     data_module.setup() # Combines, filters, preprocesses, splits
 
@@ -214,6 +215,7 @@ def cross_validation_mode(args):
         current_fold += 1
         print(f"\n===== Processing Fold {current_fold + 1}/{data_module.get_total_folds()} =====")
 
+        # Get dataloaders for current fold 
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader() # Can be None
         test_loader = data_module.test_dataloader()
@@ -281,7 +283,7 @@ def cross_validation_mode(args):
         x_train_reshaped = x_train.reshape(-1, n_train_f)
         x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
         x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
-
+        
         if has_validation_data:
             n_val_p, n_val_s, n_val_f = x_val.shape
             x_val_reshaped = x_val.reshape(-1, n_val_f)
@@ -302,11 +304,11 @@ def cross_validation_mode(args):
         
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
-        # --- Survival Model Training --- 
+        # --- Survival Model Training --- (Corrected Indentation Starts Here)
         in_features = x_train_final.shape[1]
         out_features = 1 # Cox model has 1 output (log hazard ratio)
-        
-        # Build the network based on hyperparameters
+    
+        # Build the network based on hyperparameters 
         if hyperparams['coxph_net'] == 'mlp':
             net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
         elif hyperparams['coxph_net'] == 'linear':
@@ -318,32 +320,26 @@ def cross_validation_mode(args):
         if args.center_risk:
             net = CenteredModel(net) # Wrap if centering is enabled
         
-        # Instantiate the CoxPH model with L1/L2 regularization
+        # Instantiate the CoxPH model with L1/L2 regularization 
         # Use Adam optimizer by default from pycox
-        model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma']) 
+        model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
         model.optimizer.set_lr(hyperparams['learning_rate'])
-        # Note: pycox Adam usually doesn't use weight_decay directly, regularization is via alpha/gamma
-        # model.optimizer.param_groups[0]['weight_decay'] = 1e-4 
-        
-        # Prepare validation data tuple for pycox fit method
+        # Note: pycox Adam usually doesn't use weight_decay directly
+            
+        # Prepare validation data tuple for pycox fit method 
         val_data_pycox = None
         if has_validation_data:
-             val_data_pycox = (x_val_final, (y_val_durations, y_val_events))
-             # Need to ensure val data is suitable (e.g., enough samples)
-             if len(y_val_durations) < args.batch_size:
-                  print(f"[WARN] Fold {current_fold + 1}: Validation set size ({len(y_val_durations)}) is smaller than batch size ({args.batch_size}). Validation loss might be noisy.")
+            val_data_pycox = (x_val_final, (y_val_durations, y_val_events))
+            if len(y_val_durations) < args.batch_size:
+                print(f"[WARN] Fold {current_fold + 1}: Validation set size ({len(y_val_durations)}) is smaller than batch size ({args.batch_size}). Validation loss might be noisy.")
 
-        # Define callbacks for pycox fit method
-        callbacks = []#[LossLogger(), ParamCheckerCallback()] # Add custom callbacks if needed
+        # Define callbacks for pycox fit method 
+        callbacks = []
         if use_early_stopping_fold:
-             # Use pycox's EarlyStopping callback, monitors validation loss by default
-             callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience))
-        # Gradient clipping needs to be applied manually if not using torchtuples fit loop
-        # pycox's fit doesn't directly support a gradient clipping callback easily.
-        # Manual training loop would be needed for precise grad clipping.
+            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience))
         
         print(f"[INFO] Fold {current_fold + 1}: Training the CoxPH model...")
-        # Fit the model
+        # Fit the model 
         log = model.fit(
             x_train_final,
             (y_train_durations, y_train_events),
@@ -355,7 +351,7 @@ def cross_validation_mode(args):
             val_batch_size=args.batch_size # Use same batch size for validation
         )
 
-        # --- Post-Training: Load Best Model (if early stopping used) ---
+        # --- Post-Training: Load Best Model (if early stopping used) --- 
         if use_early_stopping_fold and hasattr(model, 'load_model_weights'):
             try:
                 print(f"[INFO] Fold {current_fold + 1}: Loading best model weights based on validation loss.")
@@ -378,10 +374,21 @@ def cross_validation_mode(args):
         y_test_true_durations = y_test_durations
         y_test_true_events = y_test_events
         
-        # Calculate test C-index for this fold
-        fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
-        fold_test_cindices.append(fold_cindex)
-        print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
+        # Calculate test C-index for this fold ONLY IF NOT in LOOCV mode
+        if not args.leave_one_out:
+            try:
+                fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
+                fold_test_cindices.append(fold_cindex)
+                print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
+            except ZeroDivisionError:
+                 print(f"[WARN] Fold {current_fold + 1}: Could not calculate Concordance Index (likely too few comparable pairs in test set).")
+                 fold_test_cindices.append(np.nan) # Record NaN if calculation fails
+        else:
+            # In LOOCV mode, we don't calculate C-index per fold
+            print(f"[Fold {current_fold + 1}] LOOCV Fold Complete. Storing prediction.")
+            # We still need to append something or handle the list later
+            # Let's append NaN so the list structure is maintained, but filter later
+            fold_test_cindices.append(np.nan) 
 
         # --- Store Fold Results --- 
         for i in range(len(test_patient_info)):
@@ -457,19 +464,22 @@ def cross_validation_mode(args):
                                   nyu_df["event_indicator"].values, 
                                   "NYU Test Set (Aggregated)")
 
-    # --- Per-Fold C-Index Summary --- 
-    if fold_test_cindices:
-        mean_cindex = np.mean(fold_test_cindices)
-        std_cindex = np.std(fold_test_cindices)
-        min_cindex = np.min(fold_test_cindices)
-        max_cindex = np.max(fold_test_cindices)
+    # --- Per-Fold C-Index Summary (Only if not LOOCV) --- 
+    valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
+    if not args.leave_one_out and valid_fold_cindices:
+        mean_cindex = np.mean(valid_fold_cindices)
+        std_cindex = np.std(valid_fold_cindices)
+        min_cindex = np.min(valid_fold_cindices)
+        max_cindex = np.max(valid_fold_cindices)
         print("\n--- Cross Validation C-Index Statistics (Per-Fold Test Set C-Indices) ---")
         print(f"Mean: {mean_cindex:.4f}")
         print(f"Standard Deviation: {std_cindex:.4f}")
         print(f"Minimum: {min_cindex:.4f}")
         print(f"Maximum: {max_cindex:.4f}")
-    else:
-         print("\n--- No per-fold C-indices recorded ---")
+        print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
+    elif not args.leave_one_out:
+         print("\n--- No valid per-fold C-indices recorded ---")
+    # No per-fold summary needed for LOOCV
          
     # --- Optional: Plotting on Aggregated Results ---
     # Add calls to plotting functions here if desired, passing the aggregated df
@@ -516,6 +526,8 @@ if __name__ == "__main__":
     parser.add_argument('--early_stopping_patience', type=int, default=10, help="Patience epochs for early stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable combined cross validation mode")
     parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds")
+    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
+                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
     
     args = parser.parse_args()
@@ -532,7 +544,8 @@ if __name__ == "__main__":
 
     # Create unique output directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{timestamp}_lr{args.learning_rate}_bs{args.batch_size}_net{args.coxph_net}"
+    # Include cv_mode in the run name
+    run_name = f"run_{timestamp}_mode{args.cv_mode}_lr{args.learning_rate}_bs{args.batch_size}_net{args.coxph_net}"
     if args.upsampling: run_name += "_upsampled"
     if args.leave_one_out: run_name += "_loocv"
     else: run_name += f"_{args.cv_folds}fold"

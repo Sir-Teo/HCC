@@ -12,6 +12,34 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import datetime
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import umap.umap_ as umap
+
+def plot_embedding(embedding, title, filename, sources, event_labels, output_dir):
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(
+        x=embedding[:, 0],
+        y=embedding[:, 1],
+        hue=sources,
+        style=event_labels,
+        palette="Set2",  # Better color palette
+        s=100,
+        alpha=0.75,
+        edgecolor="k"
+    )
+    plt.title(title)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend(title="Source / Event", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, filename)
+    plt.savefig(plot_path)
+    print(f"{title} saved to {plot_path}")
+    plt.show()
+
 # Custom module imports (adjust your PYTHONPATH accordingly)
 from data.dataset import HCCDataModule
 from models.dino import load_dinov2_model
@@ -129,33 +157,49 @@ def main(args):
     test_embeddings = test_features.mean(axis=1)    # shape: (num_test_patients, feature_dim)
 
     # Combine embeddings and create corresponding source labels
+        # Combine embeddings and create corresponding source labels
     embeddings = np.concatenate([train_embeddings, test_embeddings], axis=0)
     sources = np.array(['train'] * train_embeddings.shape[0] + ['test'] * test_embeddings.shape[0])
-
-    # Optionally standardize embeddings before PCA
     
+    # Instead of using the CSV directly, extract event labels from the dataset's filtered patient_data.
+    # For model_type "linear", the label is stored under 'label';
+    # for "time_to_event", it is stored under 'event'.
+    train_events = np.array([
+        patient.get('event', patient.get('label')) 
+        for patient in data_module.train_dataset.patient_data
+    ])
+    test_events = np.array([
+        patient.get('event', patient.get('label')) 
+        for patient in data_module.test_dataset.patient_data
+    ])
+    events = np.concatenate([train_events, test_events], axis=0)
+    
+    # Convert numeric events (0/1) into string labels for better legend readability
+    event_labels = np.array(['positive' if e == 1 else 'negative' for e in events])
+    
+    # Optionally standardize embeddings before PCA
     embeddings_2d = embeddings.mean(axis=1)  # Collapse the slice dimension by averaging
     print(len(embeddings_2d), len(embeddings_2d[0]))
     scaler = StandardScaler()
     embeddings_scaled = scaler.fit_transform(embeddings_2d)
 
-    # Perform PCA to reduce to 2 dimensions
+    # PCA
     pca = PCA(n_components=2)
     embeddings_pca = pca.fit_transform(embeddings_scaled)
     print(f"PCA explained variance ratios: {pca.explained_variance_ratio_}")
+    plot_embedding(embeddings_pca, "PCA of DINOv2 Embeddings", "dino_embeddings_pca.png", sources, event_labels, args.output_dir)
 
-    # Create a scatter plot with points colored by dataset source
-    plt.figure(figsize=(10, 8))
-    sns.scatterplot(x=embeddings_pca[:, 0], y=embeddings_pca[:, 1],
-                    hue=sources, palette="viridis", s=100, alpha=0.7)
-    plt.title("PCA of DINOv2 Embeddings (per patient)")
-    plt.xlabel("Principal Component 1")
-    plt.ylabel("Principal Component 2")
-    plt.legend(title="Source")
-    plot_file = os.path.join(args.output_dir, "dino_embeddings_pca.png")
-    plt.savefig(plot_file)
-    print(f"PCA plot saved to {plot_file}")
-    plt.show()
+    # t-SNE
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    embeddings_tsne = tsne.fit_transform(embeddings_scaled)
+    plot_embedding(embeddings_tsne, "t-SNE of DINOv2 Embeddings", "dino_embeddings_tsne.png", sources, event_labels, args.output_dir)
+
+    # UMAP
+    umap_model = umap.UMAP(n_components=2, random_state=42)
+    embeddings_umap = umap_model.fit_transform(embeddings_scaled)
+    plot_embedding(embeddings_umap, "UMAP of DINOv2 Embeddings", "dino_embeddings_umap.png", sources, event_labels, args.output_dir)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize DINOv2 Embeddings with PCA")
@@ -169,7 +213,7 @@ if __name__ == "__main__":
                          help="Path to the testing CSV file. If not provided, a train-test split will be performed on the training dataset.")
     parser.add_argument("--dinov2_weights", type=str, default="/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_99999/teacher_checkpoint.pth",
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
-    parser.add_argument('--preprocessed_root', type=str, default='', 
+    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', 
                         help="Directory to store/load preprocessed image tensors")
     parser.add_argument('--batch_size', type=int, default=32,
                         help="Batch size for data loaders")
