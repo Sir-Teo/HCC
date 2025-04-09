@@ -170,9 +170,7 @@ def upsample_df(df, target_column='event'): # Keep this utility? Maybe not neede
 
 def cross_validation_mode(args):
     """
-    Perform cross-validation on the combined TCGA and NYU dataset.
-    Train on combined data within each fold.
-    Aggregate and report test metrics separately for TCGA and NYU sources.
+    Perform cross-validation (combined, tcga, or nyu based on args.cv_mode).
     """
     # Hyperparameters for training
     hyperparams = {
@@ -204,7 +202,7 @@ def cross_validation_mode(args):
     )
     # Setup does the combining, filtering, preprocessing, and splitting
     data_module.setup()
-
+    
     # --- Model Setup --- 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -228,7 +226,7 @@ def cross_validation_mode(args):
 
         # Get dataloaders for current fold
         # These now use the combined, pre-split data for the fold
-        train_loader = data_module.train_dataloader()
+    train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader() # Can be None
         test_loader = data_module.test_dataloader()
 
@@ -259,7 +257,7 @@ def cross_validation_mode(args):
 
         # --- Feature Preprocessing --- 
         # Average across samples dimension -> [patients, slices, features]
-        x_train = x_train.mean(axis=1)
+    x_train = x_train.mean(axis=1)
         if has_validation_data: x_val = x_val.mean(axis=1)
         x_test = x_test.mean(axis=1)
 
@@ -281,7 +279,7 @@ def cross_validation_mode(args):
              print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found in training set.")
 
         # Upsampling (optional, on training data only)
-        if args.upsampling:
+    if args.upsampling:
             print(f"[INFO] Fold {current_fold + 1}: Performing upsampling on training data...")
             # Reshape train features before upsampling if needed, or adapt upsampling function
             # Assuming upsample works on [patients, ...] shape
@@ -293,9 +291,9 @@ def cross_validation_mode(args):
 
         # Standardize features (fit on train, transform train/val/test)
         # Reshape needed for StandardScaler: [patients * slices, features]
-        x_mapper = StandardScaler()
+    x_mapper = StandardScaler()
         x_train_reshaped = x_train.reshape(-1, n_train_f)
-        x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
+    x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
         x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
 
         if has_validation_data:
@@ -321,9 +319,9 @@ def cross_validation_mode(args):
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
         net = nn.Linear(in_features, 1) # Single output for BCEWithLogitsLoss
-        net.to(device)
-        
-        optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
+    net.to(device)
+    
+    optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
         # Use BCEWithLogitsLoss for binary classification with single output neuron
         criterion = torch.nn.BCEWithLogitsLoss()
 
@@ -339,14 +337,14 @@ def cross_validation_mode(args):
         test_tensor_y = torch.tensor(y_test_events, dtype=torch.float32).unsqueeze(1).to(device) # Ground truth for test
 
         # Training loop with progress display and early stopping
-        best_val_loss = float('inf')
+    best_val_loss = float('inf')
         best_model_state = None
         patience = args.early_stopping_patience # Use arg for patience
-        epochs_no_improve = 0
+    epochs_no_improve = 0
         
-        for epoch in range(args.epochs):
+    for epoch in range(args.epochs):
             # --- Training Phase --- 
-            net.train()
+        net.train()
             optimizer.zero_grad()
             outputs = net(train_tensor_x) # Raw logits, shape [batch, 1]
             loss = criterion(outputs, train_tensor_y)
@@ -355,13 +353,13 @@ def cross_validation_mode(args):
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.gradient_clip)
             optimizer.step()
             train_loss_epoch = loss.item()
-
+        
             # --- Validation Phase --- 
             val_loss_epoch = None
             val_accuracy_epoch = None
             if has_validation_data and val_tensor_x is not None:
-                net.eval()
-                with torch.no_grad():
+        net.eval()
+        with torch.no_grad():
                     val_outputs = net(val_tensor_x) # Raw logits
                     val_loss = criterion(val_outputs, val_tensor_y)
                     val_loss_epoch = val_loss.item()
@@ -386,13 +384,13 @@ def cross_validation_mode(args):
                  if current_loss_for_stopping < best_val_loss:
                      best_val_loss = current_loss_for_stopping
                      best_model_state = net.state_dict().copy() # Save best model
-                     epochs_no_improve = 0
+                epochs_no_improve = 0
                      print(f"[Fold {current_fold + 1}] New best validation loss: {best_val_loss:.4f}. Saving model.")
-                 else:
-                     epochs_no_improve += 1
-                     if epochs_no_improve >= patience:
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
                          print(f"[Fold {current_fold + 1}] Early stopping triggered at epoch {epoch+1} after {patience} epochs with no improvement.")
-                         break
+                    break
             elif not args.early_stopping: 
                  # If not early stopping, save the last model state
                  best_model_state = net.state_dict().copy()
@@ -407,8 +405,8 @@ def cross_validation_mode(args):
              net.eval() 
 
         # --- Final Evaluation on Test Set --- 
-        net.eval()
-        with torch.no_grad():
+    net.eval()
+    with torch.no_grad():
             test_outputs = net(test_tensor_x) # Raw logits [n_test, 1]
             test_probs = torch.sigmoid(test_outputs).cpu().numpy().flatten() # Probabilities [n_test,]
             test_pred_labels = (test_probs >= 0.5).astype(int) # Predicted labels [n_test,]
@@ -524,81 +522,360 @@ def cross_validation_mode(args):
     else:
          print("\n--- No per-fold accuracies recorded (likely due to errors or no completed folds) ---")
 
-def main(args):
-    if args.cross_validation:
-        cross_validation_mode(args)
+def cross_prediction_mode(args):
+    """
+    Train on one dataset (NYU or TCGA) and test on the other.
+    Uses a validation split from the training set for early stopping.
+    """
+    hyperparams = {
+        'learning_rate': args.learning_rate,
+    }
+
+    # Determine train/test datasets based on mode
+    if args.run_mode == 'cp_nyu_tcga': # Train NYU, Test TCGA
+        train_csv = args.nyu_csv_file
+        train_root = args.nyu_dicom_root
+        test_csv = args.tcga_csv_file
+        test_root = args.tcga_dicom_root
+        train_source_name = "NYU"
+        test_source_name = "TCGA"
+        print("--- Running Cross Prediction: Train on NYU, Test on TCGA ---")
+    elif args.run_mode == 'cp_tcga_nyu': # Train TCGA, Test NYU
+        train_csv = args.tcga_csv_file
+        train_root = args.tcga_dicom_root
+        test_csv = args.nyu_csv_file
+        test_root = args.nyu_dicom_root
+        train_source_name = "TCGA"
+        test_source_name = "NYU"
+        print("--- Running Cross Prediction: Train on TCGA, Test on NYU ---")
     else:
-        # Standard train/val/test split mode (using the combined setup from DataModule)
-        print("Running in standard train/val/test mode (not cross-validation)")
-        # This part needs to be implemented if non-CV mode is desired
-        # It would involve calling data_module.setup() with cross_validation=False
-        # Then getting train/val/test loaders and running a single training loop
-        # Similar logic to the inside of the CV loop but without fold iteration
-        print("[WARN] Standard train/val/test mode not fully implemented yet.")
-        # Example call structure (needs full implementation):
-        # score = train_single_split(args, hyperparams={'learning_rate': args.learning_rate})
-        # print(f"Final Test Accuracy: {score:.4f}")
+        raise ValueError(f"Invalid run_mode for cross_prediction: {args.run_mode}")
+
+    # --- Data Module Setup (No CV) ---
+    data_module = HCCDataModule(
+        train_csv_file=train_csv,
+        test_csv_file=test_csv,
+        train_dicom_root=train_root,
+        test_dicom_root=test_root,
+        model_type="linear",
+        batch_size=args.batch_size,
+        num_slices=args.num_slices,
+        num_samples=args.num_samples_per_patient,
+        num_workers=args.num_workers,
+        preprocessed_root=args.preprocessed_root,
+        cross_validation=False, # IMPORTANT: Not doing CV splitting here
+        use_validation=True    # IMPORTANT: Enable train/val split of the training data
+        # cv_mode, cv_folds, leave_one_out, random_state are ignored when cross_validation=False
+    )
+    try:
+        data_module.setup() 
+    except ValueError as e:
+        print(f"[ERROR] Failed to setup DataModule: {e}. Check dataset paths and integrity.")
+        return
+
+    # --- Model Setup --- 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    dino_model = load_dinov2_model(args.dinov2_weights)
+    dino_model = dino_model.to(device)
+    dino_model.eval()
+    for param in dino_model.parameters(): param.requires_grad = False
+
+    # --- Get Dataloaders ---
+    try:
+        train_loader = data_module.train_dataloader()
+        val_loader = data_module.val_dataloader() 
+        test_loader = data_module.test_dataloader()
+    except ValueError as e:
+         print(f"[ERROR] Failed to get dataloaders: {e}. Ensure datasets were setup correctly.")
+         return
+
+    if val_loader is None:
+        print("[WARN] Validation loader is None. Early stopping will be disabled.")
+        use_early_stopping_run = False
+    else:
+        use_early_stopping_run = args.early_stopping
+
+    # --- Feature Extraction --- 
+    print(f"Extracting features for {train_source_name} training set...")
+    x_train, y_train_events, _ = extract_features(train_loader, dino_model, device)
+    print(f"Extracting features for {train_source_name} validation set...")
+    x_val, y_val_events, _ = extract_features(val_loader, dino_model, device) 
+    print(f"Extracting features for {test_source_name} test set...")
+    x_test, y_test_events, test_patient_info = extract_features(test_loader, dino_model, device)
+
+    # --- Basic Data Checks ---
+    if x_train.size == 0:
+         print(f"[ERROR] No training data extracted for {train_source_name}. Cannot proceed.")
+         return
+    if x_test.size == 0:
+         print(f"[ERROR] No test data extracted for {test_source_name}. Cannot proceed.")
+         return
+    has_validation_data = x_val.size > 0
+    if not has_validation_data:
+         print(f"[INFO] No validation data available or extracted for {train_source_name}.")
+         use_early_stopping_run = False # Override if needed
+
+    # --- Feature Preprocessing (as in CV mode) ---
+    # Average across samples -> [patients, slices, features]
+    x_train = x_train.mean(axis=1)
+    if has_validation_data: x_val = x_val.mean(axis=1)
+    x_test = x_test.mean(axis=1)
+
+    # Remove zero-variance features (fit on train)
+    n_train_p, n_train_s, n_train_f = x_train.shape
+    x_train_flat_var = x_train.reshape(-1, n_train_f)
+    variances = np.var(x_train_flat_var, axis=0)
+    zero_var_indices = np.where(variances == 0)[0]
+    if len(zero_var_indices) > 0:
+        print(f"[INFO] Removing {len(zero_var_indices)} zero-variance features.")
+        non_zero_var_indices = np.where(variances != 0)[0]
+        x_train = x_train[:, :, non_zero_var_indices]
+        if has_validation_data: x_val = x_val[:, :, non_zero_var_indices]
+        x_test = x_test[:, :, non_zero_var_indices]
+        n_train_f = x_train.shape[2]
+    else:
+         print(f"[INFO] No zero-variance features found.")
+
+    # Upsampling (optional, on training data)
+        if args.upsampling:
+        print(f"[INFO] Upsampling {train_source_name} training data...")
+        x_train, y_train_events = upsample_training_data(x_train, y_train_events)
+        n_train_p, n_train_s, n_train_f = x_train.shape # Update shape
+
+    # Standardize features (fit on train, transform all)
+    x_mapper = StandardScaler()
+    x_train_reshaped = x_train.reshape(-1, n_train_f)
+    x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
+    x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
+
+    if has_validation_data:
+        n_val_p, n_val_s, n_val_f = x_val.shape
+        x_val_reshaped = x_val.reshape(-1, n_val_f)
+        x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
+        x_val_scaled = x_val_scaled.reshape(n_val_p, n_val_s, n_val_f)
+    else:
+        x_val_scaled = np.array([]) 
+
+    n_test_p, n_test_s, n_test_f = x_test.shape
+    x_test_reshaped = x_test.reshape(-1, n_test_f)
+    x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
+    x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
+
+    # Collapse slice dimension by averaging -> [patients, features]
+    x_train_final = x_train_scaled.mean(axis=1)
+    x_val_final = x_val_scaled.mean(axis=1) if has_validation_data else np.array([])
+    x_test_final = x_test_scaled.mean(axis=1)
+    
+    print(f"[INFO] Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
+
+    # --- Binary Classification Model Training (similar to CV mode training loop) --- 
+    in_features = x_train_final.shape[1]
+    net = nn.Linear(in_features, 1) # Single output for BCEWithLogitsLoss
+    net.to(device)
+    
+    optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    # Prepare tensors
+    train_tensor_x = torch.tensor(x_train_final, dtype=torch.float32).to(device)
+    train_tensor_y = torch.tensor(y_train_events, dtype=torch.float32).unsqueeze(1).to(device)
+    val_tensor_x = torch.tensor(x_val_final, dtype=torch.float32).to(device) if has_validation_data else None
+    val_tensor_y = torch.tensor(y_val_events, dtype=torch.float32).unsqueeze(1).to(device) if has_validation_data else None
+    test_tensor_x = torch.tensor(x_test_final, dtype=torch.float32).to(device)
+    test_tensor_y = torch.tensor(y_test_events, dtype=torch.float32).unsqueeze(1).to(device)
+
+    # Training loop
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience = args.early_stopping_patience
+    epochs_no_improve = 0
+    
+    for epoch in range(args.epochs):
+        net.train()
+        optimizer.zero_grad()
+        outputs = net(train_tensor_x) 
+        loss = criterion(outputs, train_tensor_y)
+        loss.backward()
+        if args.gradient_clip > 0: torch.nn.utils.clip_grad_norm_(net.parameters(), args.gradient_clip)
+        optimizer.step()
+        train_loss_epoch = loss.item()
+
+        val_loss_epoch, val_accuracy_epoch = None, None
+        if has_validation_data and val_tensor_x is not None:
+            net.eval()
+            with torch.no_grad():
+                val_outputs = net(val_tensor_x) 
+                val_loss = criterion(val_outputs, val_tensor_y)
+                val_loss_epoch = val_loss.item()
+                val_probs = torch.sigmoid(val_outputs) 
+                val_pred_labels = (val_probs >= 0.5).float() 
+                val_accuracy_epoch = accuracy_score(val_tensor_y.cpu().numpy(), val_pred_labels.cpu().numpy())
+            net.train() 
+
+        log_msg = f"Epoch {epoch+1}/{args.epochs} - Train Loss: {train_loss_epoch:.4f}"
+        if val_loss_epoch is not None: log_msg += f" - Val Loss: {val_loss_epoch:.4f}"
+        if val_accuracy_epoch is not None: log_msg += f" - Val Acc: {val_accuracy_epoch:.4f}"
+        print(log_msg)
+
+        if use_early_stopping_run and has_validation_data:
+             current_loss_for_stopping = val_loss_epoch
+             if current_loss_for_stopping < best_val_loss:
+                 best_val_loss = current_loss_for_stopping
+                 best_model_state = net.state_dict().copy() 
+                 epochs_no_improve = 0
+                 print(f"New best validation loss: {best_val_loss:.4f}. Saving model.")
+             else:
+                 epochs_no_improve += 1
+                 if epochs_no_improve >= patience:
+                     print(f"Early stopping triggered at epoch {epoch+1}.")
+                     break
+        elif not use_early_stopping_run: 
+             best_model_state = net.state_dict().copy()
+
+    # --- Load Best Model --- 
+    if best_model_state is not None:
+        print("Loading best model state for final evaluation.")
+        net.load_state_dict(best_model_state)
+        else:
+         print("[WARN] No best model state found. Using last state.")
+         net.eval() 
+
+    # --- Final Evaluation on Test Set ({test_source_name}) --- 
+    net.eval()
+    with torch.no_grad():
+        test_outputs = net(test_tensor_x) 
+        test_probs = torch.sigmoid(test_outputs).cpu().numpy().flatten()
+        test_pred_labels = (test_probs >= 0.5).astype(int) 
+        y_test_true = y_test_events
+    
+    print(f"\n--- Evaluating model on {test_source_name} test set --- ")
+    def calculate_binary_metrics(y_true, y_pred_scores, y_pred_labels, description):
+        # Reusing the function from cross_validation_mode
+        print(f"\n--- {description} Metrics --- ")
+        if len(y_true) == 0:
+             print("No samples found.")
+             return
+        try:
+            accuracy = accuracy_score(y_true, y_pred_labels)
+            precision = precision_score(y_true, y_pred_labels, zero_division=0)
+            recall = recall_score(y_true, y_pred_labels, zero_division=0)
+            f1 = f1_score(y_true, y_pred_labels, zero_division=0)
+            roc_auc = np.nan
+            if len(np.unique(y_true)) > 1:
+                 roc_auc = roc_auc_score(y_true, y_pred_scores)
+                 print(f"ROC AUC:   {roc_auc:.4f}")
+        else:
+                 print("ROC AUC:   Not defined (only one class present)")
+            print(f"Accuracy:  {accuracy:.4f}")
+            print(f"Precision: {precision:.4f}")
+            print(f"Recall:    {recall:.4f}")
+            print(f"F1 Score:  {f1:.4f}")
+            print(f"Positive Class Samples: {int(sum(y_true))}/{len(y_true)}")
+            return {'roc_auc': roc_auc, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
+        except Exception as e:
+            print(f"Error calculating metrics for {description}: {e}")
+            return None
+            
+    test_metrics = calculate_binary_metrics(y_test_true, test_probs, test_pred_labels, f"Test Set ({test_source_name})")
+         
+    # --- Save Predictions --- 
+    predictions_data = []
+    for i in range(len(test_patient_info)):
+        patient_meta = test_patient_info[i]
+        predictions_data.append({
+            "patient_id": patient_meta['patient_id'],
+            "predicted_risk_score": test_probs[i],
+            "predicted_label": test_pred_labels[i],
+            "event_indicator": int(y_test_true[i]),
+            "dataset_type": patient_meta['dataset_type'] 
+        })
+    
+    pred_df = pd.DataFrame(predictions_data)
+    pred_csv_path = os.path.join(args.output_dir, f"cross_predict_results_{test_source_name}_test.csv")
+    pred_df.sort_values(by="patient_id", inplace=True)
+    pred_df.to_csv(pred_csv_path, index=False)
+    print(f"Test set predictions saved to {pred_csv_path}")
+
+def main(args):
+    # Dispatch based on run mode
+    if args.run_mode == 'cv':
+        cross_validation_mode(args)
+    elif args.run_mode in ['cp_nyu_tcga', 'cp_tcga_nyu']:
+        cross_prediction_mode(args)
+    else:
+        print(f"[ERROR] Unknown run_mode '{args.run_mode}'. Exiting.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train binary classification model with DINOv2 features using combined datasets and cross-validation")
+    parser = argparse.ArgumentParser(description="Train binary classification model with DINOv2 features")
     
-    # Changed arguments to reflect TCGA/NYU specifics
-    parser.add_argument("--tcga_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC",
-                         help="Path to the TCGA DICOM root directory.")
-    parser.add_argument("--nyu_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom",
-                         help="Path to the NYU DICOM root directory.")
-    parser.add_argument("--tcga_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv",
-                         help="Path to the TCGA CSV metadata file.")
-    parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/nyu_recurrence.csv", # Example path, adjust as needed
-                         help="Path to the NYU CSV metadata file.")
-    
-    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', 
-                         help='Base directory to store/load preprocessed image tensors (will have tcga/ and nyu/ subfolders).')
-    parser.add_argument('--batch_size', type=int, default=16, # Reduced default maybe
-                        help='Batch size for data loaders')
-    parser.add_argument('--num_slices', type=int, default=32, # Reduced default maybe
-                        help='Number of slices per patient sample')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of workers for data loaders')
-    parser.add_argument('--epochs', type=int, default=100, # Reduced default maybe
-                        help='Maximum number of training epochs per fold')
-    parser.add_argument('--output_dir', type=str, default='checkpoints_combined_cv',
-                        help='Base directory to save outputs and models')
-    parser.add_argument('--learning_rate', type=float, default=1e-5,
-                        help='Learning rate for the classification model')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, # Adjusted default maybe
-                        help='Gradient clipping threshold. Set 0 to disable.')
-    parser.add_argument('--num_samples_per_patient', type=int, default=1,
-                        help='Number of times to sample slices from each patient series')
-    parser.add_argument('--dinov2_weights', type=str, required=True,
-                        help="Path to your local DINOv2 state dict file (.pth or .pt).")
-    parser.add_argument('--upsampling', action='store_true',
-                        help="If set, perform upsampling of the minority class in the training data for each fold")
-    parser.add_argument('--early_stopping', action='store_true',
-                        help="If set, early stopping will be used based on validation loss within each fold")
-    parser.add_argument('--early_stopping_patience', type=int, default=10, 
-                        help="Number of epochs with no improvement to wait before stopping.")
-    parser.add_argument('--cross_validation', action='store_true', default=True, # Defaulting to CV mode
-                        help="Enable cross validation mode (combines TCGA/NYU)")
-    parser.add_argument('--cv_folds', type=int, default=10,
-                        help="Number of cross validation folds")
+    # --- Arguments --- 
+    # Data Paths
+    parser.add_argument("--tcga_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC", help="Path to TCGA DICOM root.")
+    parser.add_argument("--nyu_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom", help="Path to NYU DICOM root.")
+    parser.add_argument("--tcga_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv", help="Path to TCGA CSV.")
+    parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/nyu_recurrence.csv", help="Path to NYU CSV.") 
+    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory for preprocessed tensors. Set to None or empty to disable.')
+
+    # Run Mode
+    parser.add_argument('--run_mode', type=str, default='cv', choices=['cv', 'cp_nyu_tcga', 'cp_tcga_nyu'],
+                        help="Execution mode: 'cv' (cross-validation), 'cp_nyu_tcga' (train NYU, test TCGA), 'cp_tcga_nyu' (train TCGA, test NYU)")
+
+    # Data Loading & Preprocessing
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--num_slices', type=int, default=32, help='Slices per sample')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
+    parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Slice samples per patient series')
+    parser.add_argument('--upsampling', action='store_true', help="Upsample minority class in training data")
+
+    # Model & Training
+    parser.add_argument('--epochs', type=int, default=100, help='Max epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
+    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
+    parser.add_argument('--dinov2_weights', type=str, required=True, help="Path to DINOv2 weights.")
+    parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
+    parser.add_argument('--early_stopping_patience', type=int, default=10, help="Patience for early stopping.")
+
+    # Cross-Validation Specific (used only if run_mode='cv')
+    # parser.add_argument('--cross_validation', action='store_true', default=True, # Replaced by run_mode
+    #                     help="Enable cross validation mode (combines TCGA/NYU)")
+    parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds (if run_mode='cv')")
     parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
-                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
-    parser.add_argument('--leave_one_out', action='store_true',
-                        help="Enable leave-one-out cross validation mode (overrides cv_folds)")
+                        help="Dataset mode for cross-validation (if run_mode='cv')")
+    parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (if run_mode='cv', overrides cv_folds)")
+    
+    # Output
+    parser.add_argument('--output_dir', type=str, default='checkpoints_binary', help='Base output directory') # Updated default
     
     args = parser.parse_args()
 
-    # --- Output Directory Setup --- 
-    # Create a unique subdirectory for each run using a timestamp
+    # Handle empty string for preprocessed_root
+    if isinstance(args.preprocessed_root, str) and not args.preprocessed_root.strip():
+        args.preprocessed_root = None
+        print("Preprocessing disabled (preprocessed_root is empty).")
+    elif args.preprocessed_root:
+         print(f"Using preprocessed root: {args.preprocessed_root}")
+    else:
+         print("Preprocessing disabled (preprocessed_root is None).")
+
+    # Create unique output directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Add more info to run name if desired (e.g., learning rate, batch size)
-    # Include cv_mode in run name
-    run_name = f"run_{timestamp}_mode{args.cv_mode}_lr{args.learning_rate}_bs{args.batch_size}_slices{args.num_slices}" 
+    # Base run name on the execution mode
+    if args.run_mode == 'cv':
+        run_name = f"run_{timestamp}_cv_mode-{args.cv_mode}"
+        if args.leave_one_out: run_name += "_loocv"
+        else: run_name += f"_{args.cv_folds}fold"
+    elif args.run_mode == 'cp_nyu_tcga':
+        run_name = f"run_{timestamp}_cp-nyu-on-tcga"
+    elif args.run_mode == 'cp_tcga_nyu':
+        run_name = f"run_{timestamp}_cp-tcga-on-nyu"
+    else: # Fallback
+        run_name = f"run_{timestamp}_{args.run_mode}"
+        
+    # Add common flags to run name
     if args.upsampling: run_name += "_upsampled"
-    if args.leave_one_out: run_name += "_loocv"
-    else: run_name += f"_{args.cv_folds}fold"
+    run_name += f"_lr{args.learning_rate}_bs{args.batch_size}"
         
     args.output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)
