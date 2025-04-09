@@ -164,10 +164,9 @@ def validate_survival_data(durations, events):
 
 def cross_validation_mode(args):
     """
-    Perform cross-validation or cross-prediction based on args.cv_mode.
-    For CV modes (combined, tcga, nyu): Train/Test within folds of the specified dataset.
-    For Cross-Prediction modes: Train on one dataset, test on the other.
-    Aggregate and report test metrics (C-index) separately for TCGA and NYU sources if applicable.
+    Perform cross-validation on the combined TCGA and NYU dataset for survival analysis.
+    Train on combined data within each fold.
+    Aggregate and report test metrics (C-index) separately for TCGA and NYU sources.
     """
     hyperparams = {
         'learning_rate': args.learning_rate,
@@ -178,7 +177,6 @@ def cross_validation_mode(args):
     }
 
     # --- Data Module Setup --- 
-    # The setup method now handles loading data based on cv_mode
     data_module = HCCDataModule(
         train_csv_file=args.tcga_csv_file, # TCGA csv
         test_csv_file=args.nyu_csv_file,   # NYU csv
@@ -190,15 +188,14 @@ def cross_validation_mode(args):
         num_samples=args.num_samples_per_patient,
         num_workers=args.num_workers,
         preprocessed_root=args.preprocessed_root,
-        # Pass cross_validation=True only if it's a CV splitting mode
-        cross_validation=(args.cv_mode in ['combined', 'tcga', 'nyu']),
+        cross_validation=True,
         cv_folds=args.cv_folds,
         cv_mode=args.cv_mode,
         leave_one_out=args.leave_one_out,
         random_state=42,
-        use_validation=True # Enable intra-fold/train-set validation
+        use_validation=True # Use validation set within folds
     )
-    data_module.setup() # Loads data and sets up splits or direct datasets
+    data_module.setup() # Combines, filters, preprocesses, splits
 
     # --- Model Setup --- 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -209,35 +206,24 @@ def cross_validation_mode(args):
     for param in dino_model.parameters(): param.requires_grad = False
 
     # --- Results Storage --- 
-    all_test_results = [] # Store results dict for each test patient (from folds or single run)
-    fold_test_cindices = [] # Store C-index per fold (only for CV modes)
+    all_fold_results = [] # Store results dict for each test patient
+    fold_test_cindices = [] # Store C-index per fold
 
-    # --- Training & Evaluation Logic --- 
-    
-    # Determine if we are running a single train/test cycle (cross-prediction modes)
-    # or iterating through folds (CV modes)
-    is_single_run = args.cv_mode in ['nyu-train_tcga-test', 'tcga-train_nyu-test']
-    num_cycles = 1 if is_single_run else data_module.get_total_folds()
-    
-    for cycle_idx in range(num_cycles):
-        current_fold = cycle_idx # Use cycle_idx as fold number for consistency in naming/logging
-        if not is_single_run:
-             print(f"\n===== Processing Fold {current_fold + 1}/{num_cycles} =====")
-        else:
-             print(f"\n===== Processing Cross-Prediction Run (Mode: {args.cv_mode}) =====")
+    # --- Cross-Validation Loop --- 
+    current_fold = -1 
+    while True:
+        current_fold += 1
+        print(f"\n===== Processing Fold {current_fold + 1}/{data_module.get_total_folds()} =====")
 
-        # Get dataloaders
-        # For CV modes, these are fold-specific via data_module internal state
-        # For cross-prediction, these are the fixed train/val/test sets
+        # Get dataloaders for current fold 
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader() # Can be None
         test_loader = data_module.test_dataloader()
 
-        # Add fold index for logging within feature extraction
-        if not is_single_run:
-             if hasattr(train_loader.dataset, '__fold_idx__'): train_loader.dataset.__fold_idx__ = current_fold
-             if val_loader and hasattr(val_loader.dataset, '__fold_idx__'): val_loader.dataset.__fold_idx__ = current_fold
-             if hasattr(test_loader.dataset, '__fold_idx__'): test_loader.dataset.__fold_idx__ = current_fold
+        # Add fold index to dataset for description
+        if hasattr(train_loader.dataset, '__fold_idx__'): train_loader.dataset.__fold_idx__ = current_fold
+        if val_loader and hasattr(val_loader.dataset, '__fold_idx__'): val_loader.dataset.__fold_idx__ = current_fold
+        if hasattr(test_loader.dataset, '__fold_idx__'): test_loader.dataset.__fold_idx__ = current_fold
 
         # --- Feature Extraction --- 
         x_train, y_train_durations, y_train_events, _ = extract_features(train_loader, dino_model, device)
@@ -246,16 +232,25 @@ def cross_validation_mode(args):
 
         # Handle empty datasets after extraction
         if x_train.size == 0 or y_train_durations.size == 0:
-             print(f"[WARN] Cycle {current_fold + 1}: No training data extracted. Skipping cycle.")
-             if not is_single_run and not data_module.next_fold(): break
-             else: continue # Skip to next fold or end if single run
+            print(f"[WARN] Fold {current_fold + 1}: No training data extracted. Skipping fold.")
+            if not data_module.next_fold():
+                break
+            else:
+                continue
         if x_test.size == 0 or y_test_durations.size == 0:
-             print(f"[WARN] Cycle {current_fold + 1}: No test data extracted. Skipping cycle.")
-             if not is_single_run and not data_module.next_fold(): break
-             else: continue # Skip to next fold or end if single run
+            print(f"[WARN] Fold {current_fold + 1}: No test data extracted. Skipping fold.")
+            if not data_module.next_fold():
+                break
+            else:
+                continue
         has_validation_data = x_val.size > 0 and y_val_durations.size > 0
-        use_early_stopping_cycle = args.early_stopping and has_validation_data
-        validate_survival_data(y_val_durations, y_val_events) # Validate val data
+        if not has_validation_data:
+            print(f"[INFO] Fold {current_fold + 1}: No validation data available or extracted.")
+            # Disable early stopping if no validation data
+            use_early_stopping_fold = False
+        else:
+            use_early_stopping_fold = args.early_stopping
+            validate_survival_data(y_val_durations, y_val_events) # Validate val data
 
         # Validate train data
         validate_survival_data(y_train_durations, y_train_events)
@@ -263,7 +258,8 @@ def cross_validation_mode(args):
         # --- Feature Preprocessing --- 
         # Average across samples -> [patients, slices, features]
         x_train = x_train.mean(axis=1)
-        if has_validation_data: x_val = x_val.mean(axis=1)
+        if has_validation_data:
+            x_val = x_val.mean(axis=1)
         x_test = x_test.mean(axis=1)
 
         # Remove zero-variance features (fit on train)
@@ -272,18 +268,19 @@ def cross_validation_mode(args):
         variances = np.var(x_train_flat_var, axis=0)
         zero_var_indices = np.where(variances == 0)[0]
         if len(zero_var_indices) > 0:
-            print(f"[INFO] Cycle {current_fold + 1}: Removing {len(zero_var_indices)} zero-variance features.")
+            print(f"[INFO] Fold {current_fold + 1}: Removing {len(zero_var_indices)} zero-variance features.")
             non_zero_var_indices = np.where(variances != 0)[0]
             x_train = x_train[:, :, non_zero_var_indices]
-            if has_validation_data: x_val = x_val[:, :, non_zero_var_indices]
+            if has_validation_data:
+                x_val = x_val[:, :, non_zero_var_indices]
             x_test = x_test[:, :, non_zero_var_indices]
             n_train_f = x_train.shape[2]
         else:
-             print(f"[INFO] Cycle {current_fold + 1}: No zero-variance features found.")
+            print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found.")
 
         # Upsampling (optional, on training data)
         if args.upsampling:
-            print(f"[INFO] Cycle {current_fold + 1}: Upsampling training data...")
+            print(f"[INFO] Fold {current_fold + 1}: Upsampling training data...")
             x_train, y_train_durations, y_train_events = upsample_training_data(x_train, y_train_durations, y_train_events)
             n_train_p, n_train_s, n_train_f = x_train.shape # Update shape after upsampling
 
@@ -292,7 +289,7 @@ def cross_validation_mode(args):
         x_train_reshaped = x_train.reshape(-1, n_train_f)
         x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
         x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
-        
+
         if has_validation_data:
             n_val_p, n_val_s, n_val_f = x_val.shape
             x_val_reshaped = x_val.reshape(-1, n_val_f)
@@ -310,12 +307,14 @@ def cross_validation_mode(args):
         x_train_final = x_train_scaled.mean(axis=1)
         x_val_final = x_val_scaled.mean(axis=1) if has_validation_data else np.array([])
         x_test_final = x_test_scaled.mean(axis=1)
-        
-        print(f"[INFO] Cycle {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
-        # --- Survival Model Training --- 
+        print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
+
+        # --- Survival Model Training --- (Corrected Indentation Starts Here)
         in_features = x_train_final.shape[1]
-        out_features = 1 
+        out_features = 1 # Cox model has 1 output (log hazard ratio)
+
+        # Build the network based on hyperparameters
         if hyperparams['coxph_net'] == 'mlp':
             net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
         elif hyperparams['coxph_net'] == 'linear':
@@ -323,107 +322,113 @@ def cross_validation_mode(args):
             net = nn.Linear(in_features, out_features, bias=False) # Usually no bias in Cox
         else:
             raise ValueError("Unknown coxph_net option. Choose 'mlp' or 'linear'.")
-        
+
         if args.center_risk:
-            net = CenteredModel(net)
+            net = CenteredModel(net) # Wrap if centering is enabled
+
+        # Instantiate the CoxPH model with L1/L2 regularization
+        # Use Adam optimizer by default from pycox
         model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
         model.optimizer.set_lr(hyperparams['learning_rate'])
-        
-        val_data_pycox = (x_val_final, (y_val_durations, y_val_events)) if has_validation_data else None
+        # Note: pycox Adam usually doesn't use weight_decay directly
 
-        # Callbacks & Model Saving Path (Adapted for cycle)
+        # Prepare validation data tuple for pycox fit method 
+        val_data_pycox = None
+        if has_validation_data:
+            val_data_pycox = (x_val_final, (y_val_durations, y_val_events))
+            if len(y_val_durations) < args.batch_size:
+                print(f"[WARN] Fold {current_fold + 1}: Validation set size ({len(y_val_durations)}) is smaller than batch size ({args.batch_size}). Validation loss might be noisy.")
+
+        # Define callbacks for pycox fit method 
         callbacks = []
-        best_model_path = None
-        if use_early_stopping_cycle:
-            cycle_label = f"fold_{current_fold+1}" if not is_single_run else "run"
-            best_model_path = os.path.join(args.output_dir, f"{cycle_label}_best_model.pt")
-            print(f"[INFO] Cycle {current_fold + 1}: Early stopping enabled. Best model -> {best_model_path}")
-            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience, filepath=best_model_path))
-        
-        print(f"[INFO] Cycle {current_fold + 1}: Training the CoxPH model...")
+        if use_early_stopping_fold:
+            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience))
+
+        print(f"[INFO] Fold {current_fold + 1}: Training the CoxPH model...")
+        # Fit the model 
         log = model.fit(
-            x_train_final, (y_train_durations, y_train_events),
-            batch_size=args.batch_size, epochs=args.epochs, callbacks=callbacks,
-            verbose=True, val_data=val_data_pycox, val_batch_size=args.batch_size
+            x_train_final,
+            (y_train_durations, y_train_events),
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            callbacks=callbacks,
+            verbose=True, # Prints epoch loss
+            val_data=val_data_pycox,
+            val_batch_size=args.batch_size # Use same batch size for validation
         )
 
-        # Load Best Model (Adapted for cycle)
-        if use_early_stopping_cycle and best_model_path and os.path.exists(best_model_path):
-             try:
-                 print(f"[INFO] Cycle {current_fold + 1}: Loading best model from {best_model_path}.")
-                 model.load_model_weights(best_model_path) 
-             except Exception as e:
-                 print(f"[WARN] Cycle {current_fold + 1}: Failed loading best model: {e}. Using last state.")
+        # --- Post-Training: Load Best Model (if early stopping used) --- 
+        if use_early_stopping_fold and hasattr(model, 'load_model_weights'):
+            try:
+                print(f"[INFO] Fold {current_fold + 1}: Loading best model weights based on validation loss.")
+                model.load_model_weights() # pycox EarlyStopping saves best weights internally
+            except Exception as e:
+                print(f"[WARN] Fold {current_fold + 1}: Could not load best model weights: {e}. Using last state.")
         else:
-             print(f"[INFO] Cycle {current_fold + 1}: Using model state from the last epoch.")
+            print(f"[INFO] Fold {current_fold + 1}: Using model state from the last epoch.")
 
         # --- Final Evaluation on Test Set --- 
+        # Compute baseline hazards AFTER loading best model (if applicable)
         try:
-            model.compute_baseline_hazards()
+            model.compute_baseline_hazards() # Needed for survival predictions
         except Exception as e:
-            print(f"[WARN] Cycle {current_fold + 1}: Error computing baseline hazards: {e}")
-            continue # Skip evaluation for this cycle if baseline fails
+            print(f"[WARN] Fold {current_fold + 1}: Error computing baseline hazards: {e}. Survival predictions might fail.")
 
-        test_risk_scores = -model.predict(x_test_final).reshape(-1) 
+        # Predict risk scores (negative log partial hazard)
+        # Ensure model is in eval mode (usually handled by pycox predict)
+        test_risk_scores = -model.predict(x_test_final).reshape(-1) # Higher score = higher risk
         y_test_true_durations = y_test_durations
         y_test_true_events = y_test_events
-        
-        # Calculate & Store C-index (Conditionally per fold for CV modes)
-        cycle_cindex = np.nan # Default to NaN
-        try:
-             cycle_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
-             print(f"[Cycle {current_fold + 1}] Test Concordance Index: {cycle_cindex:.4f}")
-        except ZeroDivisionError:
-             print(f"[WARN] Cycle {current_fold + 1}: Could not calculate Concordance Index (no comparable pairs).")
-        except Exception as e:
-             print(f"[WARN] Cycle {current_fold + 1}: Error calculating C-index: {e}")
-             
-        # Only store per-fold index if it's a CV split mode and not LOOCV
-        if data_module.is_cv_split_mode and not args.leave_one_out:
-            fold_test_cindices.append(cycle_cindex)
 
-        # --- Store Test Results (for all modes) --- 
+        # Calculate test C-index for this fold ONLY IF NOT in LOOCV mode
+        if not args.leave_one_out:
+            try:
+                fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
+                fold_test_cindices.append(fold_cindex)
+                print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
+            except ZeroDivisionError:
+                print(f"[WARN] Fold {current_fold + 1}: Could not calculate Concordance Index (likely too few comparable pairs in test set).")
+                fold_test_cindices.append(np.nan) # Record NaN if calculation fails
+        else:
+            # In LOOCV mode, we don't calculate C-index per fold
+            print(f"[Fold {current_fold + 1}] LOOCV Fold Complete. Storing prediction.")
+            # We still need to append something or handle the list later
+            # Let's append NaN so the list structure is maintained, but filter later
+            fold_test_cindices.append(np.nan) 
+
+        # --- Store Fold Results --- 
         for i in range(len(test_patient_info)):
             patient_meta = test_patient_info[i]
             fold_results = {
                 "patient_id": patient_meta['patient_id'],
-                "fold": current_fold + 1, # Use cycle index as fold number
+                "fold": current_fold + 1,
                 "predicted_risk_score": test_risk_scores[i],
                 "duration": y_test_true_durations[i],
                 "event_indicator": int(y_test_true_events[i]),
                 "dataset_type": patient_meta['dataset_type'] # TCGA or NYU
             }
-            all_test_results.append(fold_results)
+            all_fold_results.append(fold_results)
 
-        # --- Move to Next Fold (Only for CV modes) --- 
-        if data_module.is_cv_split_mode:
-            if not data_module.next_fold():
-                print("\n===== Finished all CV folds =====")
-                break
-        # For single run modes, the loop finishes after one iteration
+        # --- Move to Next Fold --- 
+        if not data_module.next_fold():
+            print("\n===== Finished all folds =====")
+            break
 
     # --- Aggregation and Final Reporting --- 
-    if not all_test_results:
-         print("[ERROR] No test results collected. Exiting.")
-         return
-         
-    final_predictions_df = pd.DataFrame(all_test_results)
-    
-    # Check row count consistency (only really makes sense for CV modes)
-    if data_module.is_cv_split_mode:
-        total_patients_expected = len(data_module.all_patients)
-        if len(final_predictions_df) != total_patients_expected:
-             print(f"[WARN] Final predictions DF has {len(final_predictions_df)} rows, expected {total_patients_expected} for CV mode '{args.cv_mode}'.")
-        else:
-             print(f"Final predictions DF contains results for all {len(final_predictions_df)} patients in CV mode '{args.cv_mode}'.")
+    if not all_fold_results:
+        print("[ERROR] No results collected. Exiting.")
+        return
+
+    final_predictions_df = pd.DataFrame(all_fold_results)
+
+    total_patients_expected = len(data_module.all_patients)
+    if len(final_predictions_df) != total_patients_expected:
+        print(f"[WARN] Final predictions DF has {len(final_predictions_df)} rows, expected {total_patients_expected}. Check patient processing.")
     else:
-         # For cross-prediction, the length is just the size of the test set
-         print(f"Final predictions DF contains results for {len(final_predictions_df)} patients in the test set.")
-         
+        print(f"Final predictions DF contains results for all {len(final_predictions_df)} patients.")
+
     # --- Save Final Predictions --- 
-    # Adjust filename based on mode
-    mode_suffix = args.cv_mode.replace('-', '_') # e.g., nyu_train_tcga_test
-    final_csv_path = os.path.join(args.output_dir, f"final_predictions_survival_{mode_suffix}.csv")
+    final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_survival.csv")
     final_predictions_df.sort_values(by=["dataset_type", "patient_id"], inplace=True)
     final_predictions_df.to_csv(final_csv_path, index=False)
     print(f"Final aggregated survival predictions CSV saved to {final_csv_path}")
@@ -436,8 +441,8 @@ def cross_validation_mode(args):
     def calculate_cindex(durations, scores, events, description):
         print(f"\n--- {description} Metrics --- ")
         if len(durations) == 0:
-             print("No samples found for this subset.")
-             return np.nan
+            print("No samples found for this subset.")
+            return np.nan
         try:
             c_index = concordance_index(durations, scores, event_observed=events)
             print(f"Concordance Index: {c_index:.4f}")
@@ -448,51 +453,38 @@ def cross_validation_mode(args):
             print(f"Error calculating C-index for {description}: {e}")
             return np.nan
 
-    # Overall C-Index (using all results in the dataframe)
+    # Overall C-Index
     overall_cindex = calculate_cindex(y_durations_all, y_pred_scores_all, y_events_all, "Overall Test Set (Aggregated)")
 
-    # TCGA C-Index (if TCGA data is present in the results)
+    # TCGA C-Index
     tcga_df = final_predictions_df[final_predictions_df["dataset_type"] == "TCGA"]
-    if not tcga_df.empty:
-        tcga_cindex = calculate_cindex(tcga_df["duration"].values, 
-                                       tcga_df["predicted_risk_score"].values, 
-                                       tcga_df["event_indicator"].values, 
-                                       "TCGA Subset Metrics")
-    else:
-        print("\n--- No TCGA results found in the final predictions. ---")
+    tcga_cindex = calculate_cindex(tcga_df["duration"].values, 
+                                   tcga_df["predicted_risk_score"].values, 
+                                   tcga_df["event_indicator"].values, 
+                                   "TCGA Test Set (Aggregated)")
 
-    # NYU C-Index (if NYU data is present in the results)
+    # NYU C-Index
     nyu_df = final_predictions_df[final_predictions_df["dataset_type"] == "NYU"]
-    if not nyu_df.empty:
-        nyu_cindex = calculate_cindex(nyu_df["duration"].values, 
-                                      nyu_df["predicted_risk_score"].values, 
-                                      nyu_df["event_indicator"].values, 
-                                      "NYU Subset Metrics")
-    else:
-        print("\n--- No NYU results found in the final predictions. ---")
+    nyu_cindex = calculate_cindex(nyu_df["duration"].values, 
+                                  nyu_df["predicted_risk_score"].values, 
+                                  nyu_df["event_indicator"].values, 
+                                  "NYU Test Set (Aggregated)")
 
-    # --- Per-Fold C-Index Summary (Only for CV split modes, not LOOCV) --- 
-    if data_module.is_cv_split_mode and not args.leave_one_out:
-        valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
-        if valid_fold_cindices:
-            mean_cindex = np.mean(valid_fold_cindices)
-            std_cindex = np.std(valid_fold_cindices)
-            min_cindex = np.min(valid_fold_cindices)
-            max_cindex = np.max(valid_fold_cindices)
-            print("\n--- Cross Validation C-Index Statistics (Per-Fold Test Set C-Indices) ---")
-            print(f"Mean: {mean_cindex:.4f}")
-            print(f"Standard Deviation: {std_cindex:.4f}")
-            print(f"Minimum: {min_cindex:.4f}")
-            print(f"Maximum: {max_cindex:.4f}")
-            print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
-        else:
-            print("\n--- No valid per-fold C-indices recorded for CV mode ---")
-             
-    # --- Optional: Plotting on Aggregated Results ---
-    # Add calls to plotting functions here if desired, passing the aggregated df
-    # e.g., plot_cv_metrics(y_pred_scores_all, y_durations_all, y_events_all, args.output_dir)
-    # Or plot separately for TCGA/NYU using tcga_df, nyu_df
-    print("\nPlotting is currently disabled in this refactored script. Re-enable if needed.")
+    # --- Per-Fold C-Index Summary (Only if not LOOCV) --- 
+    valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
+    if not args.leave_one_out and valid_fold_cindices:
+        mean_cindex = np.mean(valid_fold_cindices)
+        std_cindex = np.std(valid_fold_cindices)
+        min_cindex = np.min(valid_fold_cindices)
+        max_cindex = np.max(valid_fold_cindices)
+        print("\n--- Cross Validation C-Index Statistics (Per-Fold Test Set C-Indices) ---")
+        print(f"Mean: {mean_cindex:.4f}")
+        print(f"Standard Deviation: {std_cindex:.4f}")
+        print(f"Minimum: {min_cindex:.4f}")
+        print(f"Maximum: {max_cindex:.4f}")
+        print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
+    elif not args.leave_one_out:
+        print("\n--- No valid per-fold C-indices recorded ---")
 
 def main(args):
     if args.cross_validation:
@@ -505,7 +497,7 @@ def main(args):
         # get loaders, run single training/evaluation pass similar to inside CV loop.
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CoxPH survival model with DINOv2 features")
+    parser = argparse.ArgumentParser(description="Train CoxPH survival model with DINOv2 features using combined datasets and cross-validation")
     
     # Updated arguments for combined dataset handling
     parser.add_argument("--tcga_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC", help="Path to the TCGA DICOM root directory.")
@@ -513,7 +505,7 @@ if __name__ == "__main__":
     parser.add_argument("--tcga_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv", help="Path to the TCGA CSV metadata file.")
     parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/nyu_recurrence.csv", help="Path to the NYU CSV metadata file.") # Adjust default NYU path
     
-    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory to store/load preprocessed tensors. Set to None or empty string to disable.')
+    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory to store/load preprocessed tensors (will have tcga/ and nyu/ subfolders). Set to None or empty string to disable.')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--num_slices', type=int, default=32, help='Number of slices per patient sample')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
@@ -528,16 +520,14 @@ if __name__ == "__main__":
     parser.add_argument('--dinov2_weights', type=str, required=True, help="Path to DINOv2 weights (.pth or .pt).")
     parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
     parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
-    parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data")
+    parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
     parser.add_argument('--early_stopping_patience', type=int, default=10, help="Patience epochs for early stopping.")
-    
-    # Updated CV args
-    parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable cross validation or cross-prediction mode (based on cv_mode)")
-    parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds (if not LOOCV and cv_mode is combined/tcga/nyu)")
-    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu', 'nyu-train_tcga-test', 'tcga-train_nyu-test'], 
-                        help="Dataset mode: 'combined'(CV), 'tcga'(CV), 'nyu'(CV), 'nyu-train_tcga-test'(Predict), 'tcga-train_nyu-test'(Predict)")
-    parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (if cv_mode is combined/tcga/nyu)")
+    parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable combined cross validation mode")
+    parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds")
+    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
+                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
+    parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
     
     args = parser.parse_args()
 

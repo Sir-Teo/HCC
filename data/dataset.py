@@ -365,9 +365,9 @@ class HCCDataModule:
         preprocessed_root=None,
         eval_batch_size=None,
         use_validation=True,
-        cross_validation=False, # Note: This flag determines if CV splitting occurs
+        cross_validation=False,
         cv_folds=10,
-        cv_mode='combined', # Added: 'combined', 'tcga', 'nyu', 'nyu-train_tcga-test', 'tcga-train_nyu-test'
+        cv_mode='combined', # Added: 'combined', 'tcga', 'nyu'
         leave_one_out=False,
         random_state=42
     ):
@@ -390,19 +390,14 @@ class HCCDataModule:
         self.preprocessed_root = preprocessed_root # Base directory
         self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
         self.use_validation = use_validation
-        self.cross_validation = cross_validation # Keep track if CV splitting is needed
+        self.cross_validation = cross_validation
         self.cv_folds = cv_folds
-        self.cv_mode = cv_mode # Store the overall mode
+        self.cv_mode = cv_mode # Store the CV mode
         self.leave_one_out = leave_one_out
         self.random_state = random_state
         
-        # Extended mode validation
-        valid_modes = ['combined', 'tcga', 'nyu', 'nyu-train_tcga-test', 'tcga-train_nyu-test']
-        if self.cv_mode not in valid_modes:
-             raise ValueError(f"Invalid cv_mode: {self.cv_mode}. Choose from {valid_modes}.")
-        
-        # Determine if this mode involves cross-validation splitting
-        self.is_cv_split_mode = self.cross_validation and self.cv_mode in ['combined', 'tcga', 'nyu']
+        if self.cv_mode not in ['combined', 'tcga', 'nyu']:
+             raise ValueError(f"Invalid cv_mode: {self.cv_mode}. Choose from 'combined', 'tcga', 'nyu'.")
 
         self.transform = T.Compose([
             # Resize is now handled in dicom_to_tensor if needed
@@ -465,175 +460,126 @@ class HCCDataModule:
          print(f"Retained {len(filtered_list)} patients after filtering.")
          return filtered_list
 
-    def _preprocess_patient_list(self, patient_list, description="Preprocessing"):
-         """Helper to preprocess a list of patients."""
-         if not self.preprocessed_root or not patient_list:
-              return # Nothing to preprocess
-              
-         print(f"Preprocessing {len(patient_list)} patients ({description})...")
-         temp_dataset = HCCDicomDataset(
-              patient_data_list=patient_list,
-              model_type=self.model_type,
-              transform=self.transform, 
-              num_slices=self.num_slices, 
-              num_samples=self.num_samples, 
-              preprocessed_root=self.preprocessed_root
-         )
-         for i in tqdm(range(len(temp_dataset)), desc=description):
-              try:
-                   _ = temp_dataset[i] # Triggers loading and saving
-              except Exception as e:
-                   print(f"[WARN] Error during preprocessing patient index {i} (ID: {patient_list[i]['patient_id']}): {e}")
-         print(f"Preprocessing ({description}) complete.")
-
     def setup(self):
-        # Always load and filter both potential datasets initially
+        # Build initial patient lists based on requested mode
         tcga_patients = []
         nyu_patients = []
         
-        if not self.tcga_csv_file or not os.path.exists(self.tcga_csv_file):
-            print(f"[WARN] TCGA CSV file not found or not provided: {self.tcga_csv_file}. Skipping TCGA data.")
-        else:
-            tcga_patients = self._build_patient_list(self.tcga_csv_file, self.tcga_dicom_root, "TCGA")
-            tcga_patients = self._filter_patient_list(tcga_patients)
+        if self.cv_mode in ['combined', 'tcga']:
+            if not self.tcga_csv_file or not os.path.exists(self.tcga_csv_file):
+                 print(f"[WARN] TCGA CSV file not found or not provided: {self.tcga_csv_file}. Skipping TCGA data.")
+            else:
+                 tcga_patients = self._build_patient_list(self.tcga_csv_file, self.tcga_dicom_root, "TCGA")
+                 tcga_patients = self._filter_patient_list(tcga_patients)
         
-        if not self.nyu_csv_file or not os.path.exists(self.nyu_csv_file):
-             print(f"[WARN] NYU CSV file not found or not provided: {self.nyu_csv_file}. Skipping NYU data.")
-        else:
-             nyu_patients = self._build_patient_list(self.nyu_csv_file, self.nyu_dicom_root, "NYU")
-             nyu_patients = self._filter_patient_list(nyu_patients)
+        if self.cv_mode in ['combined', 'nyu']:
+             if not self.nyu_csv_file or not os.path.exists(self.nyu_csv_file):
+                  print(f"[WARN] NYU CSV file not found or not provided: {self.nyu_csv_file}. Skipping NYU data.")
+             else:
+                  nyu_patients = self._build_patient_list(self.nyu_csv_file, self.nyu_dicom_root, "NYU")
+                  nyu_patients = self._filter_patient_list(nyu_patients)
+        
+        # Combine lists based on mode
+        if self.cv_mode == 'combined':
+             self.all_patients = tcga_patients + nyu_patients
+             print(f"Running in COMBINED mode.")
+        elif self.cv_mode == 'tcga':
+             self.all_patients = tcga_patients
+             print(f"Running in TCGA ONLY mode.")
+        elif self.cv_mode == 'nyu':
+             self.all_patients = nyu_patients
+             print(f"Running in NYU ONLY mode.")
+        else: # Should not happen due to init check
+             raise ValueError(f"Invalid cv_mode: {self.cv_mode}")
+             
+        random.shuffle(self.all_patients) # Shuffle the selected list
+        print(f"Total patients selected for mode '{self.cv_mode}': {len(self.all_patients)}")
 
-        # Preprocess required datasets if enabled
+        if not self.all_patients:
+             raise ValueError(f"No valid patients found for mode '{self.cv_mode}' after filtering.")
+
+        # Preprocess the selected patients if requested
+        # The preprocessing saves to tcga/ or nyu/ subfolders based on patient's dataset_type
         if self.preprocessed_root:
-             if self.cv_mode in ['combined', 'tcga', 'tcga-train_nyu-test', 'nyu-train_tcga-test']:
-                  self._preprocess_patient_list(tcga_patients, description="TCGA Data")
-             if self.cv_mode in ['combined', 'nyu', 'tcga-train_nyu-test', 'nyu-train_tcga-test']:
-                  self._preprocess_patient_list(nyu_patients, description="NYU Data")
+            print(f"Preprocessing {len(self.all_patients)} patients for mode '{self.cv_mode}'...")
+            temp_all_dataset = HCCDicomDataset(
+                patient_data_list=self.all_patients, # Use the list for the current mode
+                model_type=self.model_type,
+                transform=self.transform, 
+                num_slices=self.num_slices, 
+                num_samples=self.num_samples, 
+                preprocessed_root=self.preprocessed_root
+            )
+            for i in tqdm(range(len(temp_all_dataset)), desc=f"Preprocessing Mode '{self.cv_mode}'"):
+                try:
+                    _ = temp_all_dataset[i] # Triggers loading and saving
+                except Exception as e:
+                     print(f"[WARN] Error during preprocessing patient index {i} (ID: {self.all_patients[i]['patient_id']}): {e}")
+            print("Preprocessing complete.")
 
-        # Assign patients and set up splits/datasets based on mode
-        train_patients, val_patients, test_patients = [], [], []
-        self.all_patients = [] # Keep track of all patients involved in this run
-
-        if self.is_cv_split_mode: # CV modes: combined, tcga, nyu
-            if self.cv_mode == 'combined':
-                self.all_patients = tcga_patients + nyu_patients
-                print(f"Running in Cross-Validation Mode: COMBINED")
-            elif self.cv_mode == 'tcga':
-                self.all_patients = tcga_patients
-                print(f"Running in Cross-Validation Mode: TCGA ONLY")
-            elif self.cv_mode == 'nyu':
-                self.all_patients = nyu_patients
-                print(f"Running in Cross-Validation Mode: NYU ONLY")
-            
-            random.shuffle(self.all_patients)
-            if not self.all_patients:
-                 raise ValueError(f"No valid patients found for CV mode '{self.cv_mode}'.")
-                 
-            print(f"Total patients for cross-validation (mode '{self.cv_mode}'): {len(self.all_patients)}")
-            # Create cross-validation splits on the selected patient list 
+        # Setup splits based on whether cross_validation is enabled
+        if self.cross_validation:
+            # Create cross-validation splits on the selected patient list (self.all_patients)
             patient_indices = list(range(len(self.all_patients)))
             patient_events = [p['event'] for p in self.all_patients]
-            # ... (CV split logic: LOOCV or KFold/StratifiedKFold)
+
             if self.leave_one_out:
                 from sklearn.model_selection import LeaveOneOut
                 self.cv_splitter = LeaveOneOut()
                 self.cv_splits = list(self.cv_splitter.split(patient_indices))
             else:
-                # ... (StratifiedKFold/KFold logic remains the same) ...
-                from sklearn.model_selection import StratifiedKFold, KFold # Ensure KFold is imported
-                # Check if stratification is possible
-                unique_events, counts = np.unique(patient_events, return_counts=True)
-                if len(unique_events) < 2:
-                     print("[WARN] Only one class present. Using KFold instead of StratifiedKFold.")
-                     splitter = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                     self.cv_splits = list(splitter.split(patient_indices))
-                elif any(counts < self.cv_folds):
-                     minority_count = min(counts)
-                     print(f"[WARN] The least populated class has {minority_count} members, which is less than n_splits={self.cv_folds}. Using KFold instead.")
-                     splitter = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                     self.cv_splits = list(splitter.split(patient_indices))
+                from sklearn.model_selection import StratifiedKFold
+                skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                # Check if there are enough samples for stratification
+                if len(np.unique(patient_events)) < 2:
+                     print("[WARN] Only one class present in the combined dataset. Using KFold instead of StratifiedKFold.")
+                     from sklearn.model_selection import KFold
+                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                     self.cv_splits = list(kf.split(patient_indices))
+                elif any(np.bincount(patient_events) < self.cv_folds):
+                     print(f"[WARN] The least populated class has {min(np.bincount(patient_events))} members, which is less than n_splits={self.cv_folds}. Using KFold instead.")
+                     from sklearn.model_selection import KFold
+                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                     self.cv_splits = list(kf.split(patient_indices))
                 else:
-                     splitter = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                     self.cv_splits = list(splitter.split(patient_indices, patient_events))
+                     self.cv_splits = list(skf.split(patient_indices, patient_events))
             
+            print(f"Total patients for cross-validation (mode '{self.cv_mode}'): {len(self.all_patients)}")
             print(f"Number of folds: {len(self.cv_splits)}")
+            
             self.current_fold = 0
             self._setup_fold(0)  # Setup first fold
-
-        elif self.cv_mode == 'nyu-train_tcga-test':
-             print(f"Running in Cross-Prediction Mode: Train on NYU, Test on TCGA")
-             if not nyu_patients: raise ValueError("NYU data requested for training but none found/valid.")
-             if not tcga_patients: raise ValueError("TCGA data requested for testing but none found/valid.")
-             
-             self.all_patients = nyu_patients + tcga_patients # For reference
-             train_val_patients = nyu_patients
-             test_patients = tcga_patients
-             
-             if self.use_validation:
-                  train_patients, val_patients = train_test_split(train_val_patients, test_size=0.2, random_state=self.random_state, stratify=[p['event'] for p in train_val_patients])
-             else:
-                  train_patients = train_val_patients
-                  val_patients = []
-             self._create_datasets(train_patients, val_patients, test_patients)
-             
-        elif self.cv_mode == 'tcga-train_nyu-test':
-             print(f"Running in Cross-Prediction Mode: Train on TCGA, Test on NYU")
-             if not tcga_patients: raise ValueError("TCGA data requested for training but none found/valid.")
-             if not nyu_patients: raise ValueError("NYU data requested for testing but none found/valid.")
-
-             self.all_patients = tcga_patients + nyu_patients # For reference
-             train_val_patients = tcga_patients
-             test_patients = nyu_patients
-             
-             if self.use_validation:
-                  # Stratify split of TCGA for train/val
-                  unique_events, counts = np.unique([p['event'] for p in train_val_patients], return_counts=True)
-                  min_samples = counts.min() if len(counts) > 1 else counts[0]
-                  val_size = 0.2
-                  required_for_stratify = 2 # Need at least 2 per class for stratified split
-                  
-                  if len(unique_events) < 2 or min_samples < required_for_stratify:
-                       print(f"[WARN] Cannot stratify TCGA train/val split (min class samples: {min_samples}). Performing regular split.")
-                       train_patients, val_patients = train_test_split(train_val_patients, test_size=val_size, random_state=self.random_state)
-                  else:
-                       try:
-                           train_patients, val_patients = train_test_split(train_val_patients, test_size=val_size, random_state=self.random_state, stratify=[p['event'] for p in train_val_patients])
-                       except ValueError as e:
-                           print(f"[WARN] Stratify failed during TCGA train/val split: {e}. Performing regular split.")
-                           train_patients, val_patients = train_test_split(train_val_patients, test_size=val_size, random_state=self.random_state)
-             else:
-                  train_patients = train_val_patients
-                  val_patients = []
-             self._create_datasets(train_patients, val_patients, test_patients)
-             
-        else: # Standard train/val/test split (can be added here if needed)
-            print("[WARN] Standard train/val/test split mode not explicitly handled in setup.")
-            # Fallback or raise error?
-            # Assuming we use combined for now if not CV or Cross-Prediction
-            self.all_patients = tcga_patients + nyu_patients
-            if not self.all_patients:
-                 raise ValueError("No valid patients found for standard split.")
-                 
-            # Perform standard split
+            
+        else: # Regular train/val/test split (on the selected data)
             if self.use_validation:
-                train_val_patients, test_patients = train_test_split(self.all_patients, test_size=0.2, random_state=self.random_state, stratify=[p['event'] for p in self.all_patients])
-                train_patients, val_patients = train_test_split(train_val_patients, test_size=0.25, random_state=self.random_state, stratify=[p['event'] for p in train_val_patients])
+                train_patients, test_patients = train_test_split(
+                    self.all_patients,
+                    test_size=0.2, # Or adjust as needed
+                    random_state=self.random_state,
+                    stratify=[p['event'] for p in self.all_patients]
+                )
+                train_patients, val_patients = train_test_split(
+                    train_patients,
+                    test_size=0.25, # 0.25 * 0.8 = 0.2
+                    random_state=self.random_state,
+                    stratify=[p['event'] for p in train_patients]
+                )
             else:
-                train_patients, test_patients = train_test_split(self.all_patients, test_size=0.2, random_state=self.random_state, stratify=[p['event'] for p in self.all_patients])
-                val_patients = []
-            self._create_datasets(train_patients, val_patients, test_patients)
+                train_patients, test_patients = train_test_split(
+                    self.all_patients,
+                    test_size=0.2, # Or adjust as needed
+                    random_state=self.random_state,
+                    stratify=[p['event'] for p in self.all_patients]
+                )
+                val_patients = [] # No validation set
 
-    def _create_datasets(self, train_patients, val_patients, test_patients):
-         """Helper to create dataset instances from patient lists."""
-         self.train_dataset = HCCDicomDataset(train_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
-         self.val_dataset = HCCDicomDataset(val_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root) if val_patients else None
-         self.test_dataset = HCCDicomDataset(test_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
-         
-         print(f"Dataset Setup: Train={len(self.train_dataset)}, Val={len(self.val_dataset) if self.val_dataset else 0}, Test={len(self.test_dataset)}")
-         train_events = sum(p['event'] for p in train_patients)
-         val_events = sum(p['event'] for p in val_patients) if val_patients else 0
-         test_events = sum(p['event'] for p in test_patients)
-         print(f"Event Counts: Train={train_events}, Val={val_events}, Test={test_events}")
+            print(f"Train: {len(train_patients)} patients, Positive cases: {sum(p['event'] for p in train_patients)}")
+            print(f"Val: {len(val_patients)} patients, Positive cases: {sum(p['event'] for p in val_patients)}")
+            print(f"Test: {len(test_patients)} patients, Positive cases: {sum(p['event'] for p in test_patients)}")
+
+            self.train_dataset = HCCDicomDataset(train_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
+            self.val_dataset = HCCDicomDataset(val_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root) if val_patients else None
+            self.test_dataset = HCCDicomDataset(test_patients, self.model_type, self.transform, self.num_slices, self.num_samples, self.preprocessed_root)
 
     def _setup_fold(self, fold_idx):
         """Setup datasets for a specific cross-validation fold using the combined patient list."""

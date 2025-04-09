@@ -170,35 +170,39 @@ def upsample_df(df, target_column='event'): # Keep this utility? Maybe not neede
 
 def cross_validation_mode(args):
     """
-    Perform cross-validation or cross-prediction based on args.cv_mode.
-    For CV modes (combined, tcga, nyu): Train/Test within folds.
-    For Cross-Prediction modes: Train on one dataset, test on the other.
-    Aggregate and report test metrics separately for TCGA and NYU sources if applicable.
+    Perform cross-validation on the combined TCGA and NYU dataset.
+    Train on combined data within each fold.
+    Aggregate and report test metrics separately for TCGA and NYU sources.
     """
+    # Hyperparameters for training
     hyperparams = {
         'learning_rate': args.learning_rate,
+        # 'dropout': args.dropout, # Not used in Linear model
+        # 'alpha': args.alpha, # Survival specific
+        # 'gamma': args.gamma, # Survival specific
+        # 'coxph_net': args.coxph_net # Survival specific
     }
 
     # --- Data Module Setup --- 
     data_module = HCCDataModule(
-        train_csv_file=args.tcga_csv_file, 
-        test_csv_file=args.nyu_csv_file,   
-        train_dicom_root=args.tcga_dicom_root,
-        test_dicom_root=args.nyu_dicom_root,   
-        model_type="linear", 
+        train_csv_file=args.tcga_csv_file, # Pass TCGA csv
+        test_csv_file=args.nyu_csv_file,   # Pass NYU csv
+        train_dicom_root=args.tcga_dicom_root, # Pass TCGA root
+        test_dicom_root=args.nyu_dicom_root,   # Pass NYU root
+        model_type="linear", # Set explicitly for binary classification
         batch_size=args.batch_size,
         num_slices=args.num_slices,
         num_samples=args.num_samples_per_patient,
         num_workers=args.num_workers,
         preprocessed_root=args.preprocessed_root,
-        # Pass cross_validation=True only if it's a CV splitting mode
-        cross_validation=(args.cv_mode in ['combined', 'tcga', 'nyu']),
+        cross_validation=True,
         cv_folds=args.cv_folds,
-        cv_mode=args.cv_mode, 
+        cv_mode=args.cv_mode,
         leave_one_out=args.leave_one_out,
         random_state=42,
-        use_validation=True 
+        use_validation=True # Use validation set within folds
     )
+    # Setup does the combining, filtering, preprocessing, and splitting
     data_module.setup()
 
     # --- Model Setup --- 
@@ -207,99 +211,225 @@ def cross_validation_mode(args):
     dino_model = load_dinov2_model(args.dinov2_weights)
     dino_model = dino_model.to(device)
     dino_model.eval()
-    for param in dino_model.parameters(): param.requires_grad = False
+    # Prevent DINOv2 from tracking gradients
+    for param in dino_model.parameters():
+        param.requires_grad = False
+    # dino_model.register_forward_hook(lambda m, i, o: None) # Not needed if requires_grad=False
 
     # --- Results Storage --- 
-    all_test_results = [] # Use a consistent name
-    fold_test_accuracies = [] # Still useful for k-fold CV modes
+    all_fold_results = [] # Store results dictionary for each test patient
+    fold_test_accuracies = [] # Store accuracy per fold for averaging
 
-    # --- Training & Evaluation Logic --- 
-    is_single_run = args.cv_mode in ['nyu-train_tcga-test', 'tcga-train_nyu-test']
-    num_cycles = 1 if is_single_run else data_module.get_total_folds()
-    
-    for cycle_idx in range(num_cycles):
-        current_fold = cycle_idx 
-        if not is_single_run:
-             print(f"\n===== Processing Fold {current_fold + 1}/{num_cycles} =====")
-        else:
-             print(f"\n===== Processing Cross-Prediction Run (Mode: {args.cv_mode}) =====")
+    # --- Cross-Validation Loop --- 
+    current_fold = -1 # Initialize fold counter
+    while True:
+        current_fold += 1
+        print(f"\n===== Processing Fold {current_fold + 1}/{data_module.get_total_folds()} =====")
 
-        # Get dataloaders
+        # Get dataloaders for current fold
+        # These now use the combined, pre-split data for the fold
         train_loader = data_module.train_dataloader()
-        val_loader = data_module.val_dataloader()
+        val_loader = data_module.val_dataloader() # Can be None
         test_loader = data_module.test_dataloader()
 
-        # Add fold index for logging
-        if not is_single_run:
-             if hasattr(train_loader.dataset, '__fold_idx__'): train_loader.dataset.__fold_idx__ = current_fold
-             if val_loader and hasattr(val_loader.dataset, '__fold_idx__'): val_loader.dataset.__fold_idx__ = current_fold
-             if hasattr(test_loader.dataset, '__fold_idx__'): test_loader.dataset.__fold_idx__ = current_fold
+        # Add fold index to dataset for potential use in extract_features desc
+        if hasattr(train_loader.dataset, '__fold_idx__'):
+            train_loader.dataset.__fold_idx__ = current_fold
+        if val_loader and hasattr(val_loader.dataset, '__fold_idx__'):
+            val_loader.dataset.__fold_idx__ = current_fold
+        if hasattr(test_loader.dataset, '__fold_idx__'):
+            test_loader.dataset.__fold_idx__ = current_fold
 
         # --- Feature Extraction --- 
+        # Note: extract_features now returns patient_info list as the third element
         x_train, y_train_events, _ = extract_features(train_loader, dino_model, device)
-        x_val, y_val_events, _ = extract_features(val_loader, dino_model, device) 
+        x_val, y_val_events, _ = extract_features(val_loader, dino_model, device) # Will be empty if val_loader is None
         x_test, y_test_events, test_patient_info = extract_features(test_loader, dino_model, device)
 
-        # Handle empty datasets
+        # Check for empty datasets post-extraction
         if x_train.size == 0:
-             print(f"[WARN] Cycle {current_fold + 1}: No training features. Skipping cycle.")
-             if not is_single_run and not data_module.next_fold(): break
-             else: continue
+            print(f"[WARN] Fold {current_fold + 1}: No training features extracted. Skipping fold.")
+            if not data_module.next_fold():
+                break
+            else:
+                continue
         if x_test.size == 0:
-             print(f"[WARN] Cycle {current_fold + 1}: No test features. Skipping cycle.")
-             if not is_single_run and not data_module.next_fold(): break
-             else: continue
+            print(f"[WARN] Fold {current_fold + 1}: No test features extracted. Skipping fold.")
+            if not data_module.next_fold():
+                break
+            else:
+                continue
+        # Validation set can be empty, handle downstream
         has_validation_data = x_val.size > 0
-        use_early_stopping_cycle = args.early_stopping and has_validation_data
-        # ... (Validation logic) ...
+        if not has_validation_data:
+            print(f"[INFO] Fold {current_fold + 1}: No validation data available or extracted.")
 
         # --- Feature Preprocessing --- 
-        # ... (Remains the same: mean, zero-var, upsample, scale, average slices) ...
+        # Average across samples dimension -> [patients, slices, features]
+        x_train = x_train.mean(axis=1)
+        if has_validation_data:
+            x_val = x_val.mean(axis=1)
+        x_test = x_test.mean(axis=1)
+
+        # Remove zero-variance features (calculated only on training set)
+        # Reshape for variance calculation: [patients * slices, features]
+        n_train_p, n_train_s, n_train_f = x_train.shape
+        x_train_flat_var = x_train.reshape(-1, n_train_f)
+        variances = np.var(x_train_flat_var, axis=0)
+        zero_var_indices = np.where(variances == 0)[0]
+        if len(zero_var_indices) > 0:
+            print(f"[INFO] Fold {current_fold + 1}: Removing {len(zero_var_indices)} features with zero variance based on training set.")
+            non_zero_var_indices = np.where(variances != 0)[0]
+            x_train = x_train[:, :, non_zero_var_indices]
+            if has_validation_data:
+                x_val = x_val[:, :, non_zero_var_indices]
+            x_test = x_test[:, :, non_zero_var_indices]
+            # Update feature dimension
+            n_train_f = x_train.shape[2]
+        else:
+            print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found in training set.")
+
+        # Upsampling (optional, on training data only)
+        if args.upsampling:
+            print(f"[INFO] Fold {current_fold + 1}: Performing upsampling on training data...")
+            # Reshape train features before upsampling if needed, or adapt upsampling function
+            # Assuming upsample works on [patients, ...] shape
+            x_train_shape_before_upsample = x_train.shape
+            x_train, y_train_events = upsample_training_data(x_train, y_train_events)
+            print(f"[INFO] Fold {current_fold + 1}: Training data shape after upsampling: {x_train.shape}")
+            # Update train shape info if needed
+            n_train_p, n_train_s, n_train_f = x_train.shape
+
+        # Standardize features (fit on train, transform train/val/test)
+        # Reshape needed for StandardScaler: [patients * slices, features]
+        x_mapper = StandardScaler()
+        x_train_reshaped = x_train.reshape(-1, n_train_f)
+        x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
+        x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
+
+        if has_validation_data:
+            n_val_p, n_val_s, n_val_f = x_val.shape
+            x_val_reshaped = x_val.reshape(-1, n_val_f)
+            x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
+            x_val_scaled = x_val_scaled.reshape(n_val_p, n_val_s, n_val_f)
+        else:
+            x_val_scaled = np.array([]) # Empty array if no val data
+
+        n_test_p, n_test_s, n_test_f = x_test.shape
+        x_test_reshaped = x_test.reshape(-1, n_test_f)
+        x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
+        x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
+
+        # Collapse the slice dimension by averaging -> [patients, features]
+        x_train_final = x_train_scaled.mean(axis=1)
+        x_val_final = x_val_scaled.mean(axis=1) if has_validation_data else np.array([])
+        x_test_final = x_test_scaled.mean(axis=1)
+
+        print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
-        net = nn.Linear(in_features, 1) # Single output
+        net = nn.Linear(in_features, 1) # Single output for BCEWithLogitsLoss
         net.to(device)
+
         optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
+        # Use BCEWithLogitsLoss for binary classification with single output neuron
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        # Tensors
+        # Prepare training, validation and test tensors
         train_tensor_x = torch.tensor(x_train_final, dtype=torch.float32).to(device)
+        # Target shape should be [batch_size, 1] for BCEWithLogitsLoss
         train_tensor_y = torch.tensor(y_train_events, dtype=torch.float32).unsqueeze(1).to(device)
+
         val_tensor_x = torch.tensor(x_val_final, dtype=torch.float32).to(device) if has_validation_data else None
         val_tensor_y = torch.tensor(y_val_events, dtype=torch.float32).unsqueeze(1).to(device) if has_validation_data else None
-        test_tensor_x = torch.tensor(x_test_final, dtype=torch.float32).to(device)
-        test_tensor_y = torch.tensor(y_test_events, dtype=torch.float32).unsqueeze(1).to(device)
 
-        # Training loop 
+        test_tensor_x = torch.tensor(x_test_final, dtype=torch.float32).to(device)
+        test_tensor_y = torch.tensor(y_test_events, dtype=torch.float32).unsqueeze(1).to(device) # Ground truth for test
+
+        # Training loop with progress display and early stopping
         best_val_loss = float('inf')
         best_model_state = None
-        patience = args.early_stopping_patience
+        patience = args.early_stopping_patience # Use arg for patience
         epochs_no_improve = 0
+
         for epoch in range(args.epochs):
-            # ... (Training phase remains the same) ...
-            # ... (Validation phase remains the same) ...
-            # ... (Logging remains the same, uses cycle_idx as fold number) ...
-            # ... (Early stopping / Checkpointing remains the same) ...
-        
-        # Load Best Model
-        # ... (Remains the same) ...
+            # --- Training Phase --- 
+            net.train()
+            optimizer.zero_grad()
+            outputs = net(train_tensor_x) # Raw logits, shape [batch, 1]
+            loss = criterion(outputs, train_tensor_y)
+            loss.backward()
+            if args.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.gradient_clip)
+            optimizer.step()
+            train_loss_epoch = loss.item()
+
+            # --- Validation Phase --- 
+            val_loss_epoch = None
+            val_accuracy_epoch = None
+            if has_validation_data and val_tensor_x is not None:
+                net.eval()
+                with torch.no_grad():
+                    val_outputs = net(val_tensor_x) # Raw logits
+                    val_loss = criterion(val_outputs, val_tensor_y)
+                    val_loss_epoch = val_loss.item()
+
+                    # Calculate validation accuracy
+                    val_probs = torch.sigmoid(val_outputs) # Convert logits to probabilities
+                    val_pred_labels = (val_probs >= 0.5).float() # Threshold probabilities
+                    val_accuracy_epoch = accuracy_score(val_tensor_y.cpu().numpy(), val_pred_labels.cpu().numpy())
+                net.train() # Set back to train mode
+
+            # --- Logging --- 
+            log_msg = f"[Fold {current_fold + 1}] Epoch {epoch+1}/{args.epochs} - Train Loss: {train_loss_epoch:.4f}"
+            if val_loss_epoch is not None:
+                log_msg += f" - Val Loss: {val_loss_epoch:.4f}"
+            if val_accuracy_epoch is not None:
+                log_msg += f" - Val Acc: {val_accuracy_epoch:.4f}"
+            print(log_msg)
+
+            # --- Early Stopping & Model Checkpointing --- 
+            if args.early_stopping and has_validation_data:
+                current_loss_for_stopping = val_loss_epoch
+                if current_loss_for_stopping < best_val_loss:
+                    best_val_loss = current_loss_for_stopping
+                    best_model_state = net.state_dict().copy() # Save best model
+                    epochs_no_improve = 0
+                    print(f"[Fold {current_fold + 1}] New best validation loss: {best_val_loss:.4f}. Saving model.")
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= patience:
+                        print(f"[Fold {current_fold + 1}] Early stopping triggered at epoch {epoch+1} after {patience} epochs with no improvement.")
+                        break
+            elif not args.early_stopping: 
+                # If not early stopping, save the last model state
+                best_model_state = net.state_dict().copy()
+
+        # --- Post-Training: Load Best Model --- 
+        if best_model_state is not None:
+            print(f"[Fold {current_fold + 1}] Loading best model state for final evaluation.")
+            net.load_state_dict(best_model_state)
+        else:
+            print(f"[WARN] Fold {current_fold + 1}: No best model state found (possibly due to no validation or error). Using last state.")
+            # Ensure model is in eval mode even if loop finished early without saving state
+            net.eval() 
 
         # --- Final Evaluation on Test Set --- 
         net.eval()
         with torch.no_grad():
-            test_outputs = net(test_tensor_x) 
-            test_probs = torch.sigmoid(test_outputs).cpu().numpy().flatten()
-            test_pred_labels = (test_probs >= 0.5).astype(int)
-            y_test_true = y_test_events
-            test_accuracy = accuracy_score(y_test_true, test_pred_labels)
-            
-            print(f"[Cycle {current_fold + 1}] Test Accuracy: {test_accuracy:.4f}")
-            # Store accuracy only if it's a CV fold mode and not LOOCV
-            if data_module.is_cv_split_mode and not args.leave_one_out:
-                 fold_test_accuracies.append(test_accuracy)
+            test_outputs = net(test_tensor_x) # Raw logits [n_test, 1]
+            test_probs = torch.sigmoid(test_outputs).cpu().numpy().flatten() # Probabilities [n_test,]
+            test_pred_labels = (test_probs >= 0.5).astype(int) # Predicted labels [n_test,]
+            y_test_true = y_test_events # Ground truth [n_test,]
 
-        # --- Store Test Results --- 
+            # Calculate test accuracy for this fold
+            test_accuracy = accuracy_score(y_test_true, test_pred_labels)
+            fold_test_accuracies.append(test_accuracy)
+            print(f"[Fold {current_fold + 1}] Final Test Accuracy: {test_accuracy:.4f}")
+
+        # --- Store Fold Results --- 
+        # Store predictions and metadata for each patient in the test set of this fold
         for i in range(len(test_patient_info)):
             patient_meta = test_patient_info[i]
             fold_results = {
@@ -308,36 +438,32 @@ def cross_validation_mode(args):
                 "predicted_risk_score": test_probs[i],
                 "predicted_label": test_pred_labels[i],
                 "event_indicator": int(y_test_true[i]),
-                "dataset_type": patient_meta['dataset_type'] 
+                "dataset_type": patient_meta['dataset_type'] # Store TCGA or NYU
             }
-            all_test_results.append(fold_results)
+            all_fold_results.append(fold_results)
 
-        # --- Move to Next Fold (Only for CV modes) --- 
-        if data_module.is_cv_split_mode:
-            if not data_module.next_fold():
-                print("\n===== Finished all CV folds =====")
-                break
+        # --- Move to Next Fold --- 
+        if not data_module.next_fold():
+            print("\n===== Finished all folds =====")
+            break
 
     # --- Aggregation and Final Reporting --- 
-    if not all_test_results:
-         print("[ERROR] No test results collected. Exiting.")
-         return
-         
-    final_predictions_df = pd.DataFrame(all_test_results)
-    
-    # Check row count consistency (for CV modes)
-    if data_module.is_cv_split_mode:
-        total_patients_expected = len(data_module.all_patients)
-        if len(final_predictions_df) != total_patients_expected:
-             print(f"[WARN] Final predictions DF has {len(final_predictions_df)} rows, expected {total_patients_expected} for CV mode '{args.cv_mode}'.")
-        else:
-             print(f"Final predictions DF contains results for all {len(final_predictions_df)} patients in CV mode '{args.cv_mode}'.")
+    if not all_fold_results:
+        print("[ERROR] No results were collected from any fold. Exiting.")
+        return
+
+    # Convert collected results to DataFrame
+    final_predictions_df = pd.DataFrame(all_fold_results)
+
+    # Ensure DataFrame has the expected number of rows (total patients)
+    total_patients_expected = len(data_module.all_patients)
+    if len(final_predictions_df) != total_patients_expected:
+        print(f"[WARN] Final predictions DataFrame has {len(final_predictions_df)} rows, but expected {total_patients_expected} (total unique patients). Check for patient dropouts or duplication.")
     else:
-         print(f"Final predictions DF contains results for {len(final_predictions_df)} patients in the test set.")
-         
+        print(f"Final predictions DataFrame contains results for all {len(final_predictions_df)} patients.")
+
     # --- Save Final Predictions --- 
-    mode_suffix = args.cv_mode.replace('-', '_')
-    final_csv_path = os.path.join(args.output_dir, f"final_predictions_binary_{mode_suffix}.csv")
+    final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_combined.csv")
     final_predictions_df.sort_values(by=["dataset_type", "patient_id"], inplace=True)
     final_predictions_df.to_csv(final_csv_path, index=False)
     print(f"Final aggregated predictions CSV saved to {final_csv_path}")
@@ -350,9 +476,9 @@ def cross_validation_mode(args):
     def calculate_metrics(y_true, y_pred_scores, y_pred_labels, description):
         print(f"\n--- {description} Metrics --- ")
         if len(y_true) == 0:
-             print("No samples found for this subset.")
-             return
-             
+            print("No samples found for this subset.")
+            return
+
         try:
             accuracy = accuracy_score(y_true, y_pred_labels)
             precision = precision_score(y_true, y_pred_labels, zero_division=0)
@@ -360,12 +486,12 @@ def cross_validation_mode(args):
             f1 = f1_score(y_true, y_pred_labels, zero_division=0)
             # Check if both classes are present for ROC AUC
             if len(np.unique(y_true)) > 1:
-                 roc_auc = roc_auc_score(y_true, y_pred_scores)
-                 print(f"ROC AUC:   {roc_auc:.4f}")
+                roc_auc = roc_auc_score(y_true, y_pred_scores)
+                print(f"ROC AUC:   {roc_auc:.4f}")
             else:
-                 print("ROC AUC:   Not defined (only one class present)")
-                 roc_auc = np.nan
-                 
+                print("ROC AUC:   Not defined (only one class present)")
+                roc_auc = np.nan
+
             print(f"Accuracy:  {accuracy:.4f}")
             print(f"Precision: {precision:.4f}")
             print(f"Recall:    {recall:.4f}")
@@ -393,8 +519,8 @@ def cross_validation_mode(args):
                                   nyu_df["predicted_label"].values, 
                                   "NYU Test Set (Aggregated)")
 
-    # --- Per-Fold Accuracy Summary (Only for k-fold CV modes) --- 
-    if data_module.is_cv_split_mode and not args.leave_one_out and fold_test_accuracies:
+    # --- Per-Fold Accuracy Summary --- 
+    if fold_test_accuracies:
         mean_accuracy = np.mean(fold_test_accuracies)
         std_accuracy = np.std(fold_test_accuracies)
         min_accuracy = np.min(fold_test_accuracies)
@@ -404,8 +530,8 @@ def cross_validation_mode(args):
         print(f"Standard Deviation: {std_accuracy:.4f}")
         print(f"Minimum: {min_accuracy:.4f}")
         print(f"Maximum: {max_accuracy:.4f}")
-    elif data_module.is_cv_split_mode and not args.leave_one_out:
-         print("\n--- No per-fold accuracies recorded for CV mode ---")
+    else:
+        print("\n--- No per-fold accuracies recorded (likely due to errors or no completed folds) ---")
 
 def main(args):
     if args.cross_validation:
@@ -466,8 +592,8 @@ if __name__ == "__main__":
                         help="Enable cross validation mode (combines TCGA/NYU)")
     parser.add_argument('--cv_folds', type=int, default=10,
                         help="Number of cross validation folds")
-    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu', 'nyu-train_tcga-test', 'tcga-train_nyu-test'], 
-                        help="Dataset mode: 'combined'(CV), 'tcga'(CV), 'nyu'(CV), 'nyu-train_tcga-test'(Predict), 'tcga-train_nyu-test'(Predict)")
+    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
+                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
     parser.add_argument('--leave_one_out', action='store_true',
                         help="Enable leave-one-out cross validation mode (overrides cv_folds)")
     
