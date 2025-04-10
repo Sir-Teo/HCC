@@ -13,9 +13,10 @@ from lifelines import KaplanMeierFitter
 from lifelines.utils import concordance_index  # for overall C-index computation
 import datetime  # new import for timestamp
 from tqdm import tqdm # Add progress bar
+from torch.utils.data import DataLoader
 
 # Custom module imports
-from data.dataset import HCCDataModule # Use the updated DataModule
+from data.dataset import HCCDataModule, HCCDicomDataset # Use the updated DataModule
 from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1 # Keep survival models
 # Removed old helpers, will use adapted versions
@@ -197,6 +198,46 @@ def cross_validation_mode(args):
     )
     data_module.setup() # Combines, filters, preprocesses, splits
 
+    # --- Cross-Dataset Prediction Mode ---
+    # For cross-dataset prediction (when args.cross_predict is not None)
+    # we'll load a separate dataset for testing and override the test_dataloader
+    cross_predict_data_module = None
+    if args.cross_predict:
+        print(f"\n===== Cross-Dataset Prediction Mode: Training on {args.cv_mode}, Testing on {args.cross_predict} =====")
+        # Create a separate data module for the test dataset
+        cross_predict_data_module = HCCDataModule(
+            train_csv_file=args.tcga_csv_file,
+            test_csv_file=args.nyu_csv_file,
+            train_dicom_root=args.tcga_dicom_root,
+            test_dicom_root=args.nyu_dicom_root,
+            model_type="time_to_event",
+            batch_size=args.batch_size,
+            num_slices=args.num_slices,
+            num_samples=args.num_samples_per_patient,
+            num_workers=args.num_workers,
+            preprocessed_root=args.preprocessed_root,
+            cross_validation=False,  # Don't need CV for this
+            cv_mode=args.cross_predict,  # Use the cross_predict value as the mode
+            random_state=42
+        )
+        cross_predict_data_module.setup()
+        
+        # Create a dataset containing ALL patients from the cross_predict source
+        cross_predict_all_patients = cross_predict_data_module.all_patients
+        print(f"Loaded {len(cross_predict_all_patients)} patients from {args.cross_predict} source for cross-dataset testing.")
+        
+        # Create a custom test dataset with all patients from cross_predict source
+        cross_predict_test_dataset = HCCDicomDataset(
+            patient_data_list=cross_predict_all_patients,
+            model_type="time_to_event",
+            transform=None,
+            num_slices=args.num_slices,
+            num_samples=args.num_samples_per_patient,
+            preprocessed_root=args.preprocessed_root
+        )
+        # Store this for later use
+        cross_predict_data_module.full_test_dataset = cross_predict_test_dataset
+
     # --- Model Setup --- 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -218,7 +259,22 @@ def cross_validation_mode(args):
         # Get dataloaders for current fold 
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader() # Can be None
-        test_loader = data_module.test_dataloader()
+        
+        # Use the cross-dataset test loader if in cross prediction mode
+        if args.cross_predict and cross_predict_data_module:
+            # Use the full test dataset we created (all patients from cross_predict source)
+            test_loader = DataLoader(
+                cross_predict_data_module.full_test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                collate_fn=data_module.skip_none_collate,
+                drop_last=False,
+                pin_memory=True
+            )
+            print(f"Using all {len(cross_predict_data_module.full_test_dataset)} patients from {args.cross_predict} for cross-dataset prediction")
+        else:
+            test_loader = data_module.test_dataloader()
 
         # Add fold index to dataset for description
         if hasattr(train_loader.dataset, '__fold_idx__'): train_loader.dataset.__fold_idx__ = current_fold
@@ -399,16 +455,27 @@ def cross_validation_mode(args):
         # --- Store Fold Results --- 
         for i in range(len(test_patient_info)):
             patient_meta = test_patient_info[i]
+            # Update dataset_type for cross prediction mode
+            dataset_type = patient_meta.get('dataset_type', 'Unknown')
+            if args.cross_predict:
+                # Override dataset_type with cross_predict value
+                dataset_type = args.cross_predict.upper()
+                
             fold_results = {
                 "patient_id": patient_meta['patient_id'],
                 "fold": current_fold + 1,
                 "predicted_risk_score": test_risk_scores[i],
                 "duration": y_test_true_durations[i],
                 "event_indicator": int(y_test_true_events[i]),
-                "dataset_type": patient_meta['dataset_type'] # TCGA or NYU
+                "dataset_type": dataset_type
             }
             all_fold_results.append(fold_results)
 
+        # --- Exit after one fold if in cross-dataset prediction mode ---
+        if args.cross_predict:
+            print(f"\n===== Completed cross-dataset prediction (Train: {args.cv_mode}, Test: {args.cross_predict}) =====")
+            break
+            
         # --- Move to Next Fold --- 
         if not data_module.next_fold():
             print("\n===== Finished all folds =====")
@@ -421,14 +488,23 @@ def cross_validation_mode(args):
 
     final_predictions_df = pd.DataFrame(all_fold_results)
 
-    total_patients_expected = len(data_module.all_patients)
+    if args.cross_predict:
+        total_patients_expected = len(cross_predict_data_module.all_patients)
+    else:
+        total_patients_expected = len(data_module.all_patients)
+        
     if len(final_predictions_df) != total_patients_expected:
         print(f"[WARN] Final predictions DF has {len(final_predictions_df)} rows, expected {total_patients_expected}. Check patient processing.")
     else:
         print(f"Final predictions DF contains results for all {len(final_predictions_df)} patients.")
 
     # --- Save Final Predictions --- 
-    final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_survival.csv")
+    # Update filename for cross-dataset prediction mode
+    if args.cross_predict:
+        final_csv_path = os.path.join(args.output_dir, f"final_predictions_{args.cv_mode}_to_{args.cross_predict}_survival.csv")
+    else:
+        final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_survival.csv")
+        
     final_predictions_df.sort_values(by=["dataset_type", "patient_id"], inplace=True)
     final_predictions_df.to_csv(final_csv_path, index=False)
     print(f"Final aggregated survival predictions CSV saved to {final_csv_path}")
@@ -470,21 +546,22 @@ def cross_validation_mode(args):
                                   nyu_df["event_indicator"].values, 
                                   "NYU Test Set (Aggregated)")
 
-    # --- Per-Fold C-Index Summary (Only if not LOOCV) --- 
-    valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
-    if not args.leave_one_out and valid_fold_cindices:
-        mean_cindex = np.mean(valid_fold_cindices)
-        std_cindex = np.std(valid_fold_cindices)
-        min_cindex = np.min(valid_fold_cindices)
-        max_cindex = np.max(valid_fold_cindices)
-        print("\n--- Cross Validation C-Index Statistics (Per-Fold Test Set C-Indices) ---")
-        print(f"Mean: {mean_cindex:.4f}")
-        print(f"Standard Deviation: {std_cindex:.4f}")
-        print(f"Minimum: {min_cindex:.4f}")
-        print(f"Maximum: {max_cindex:.4f}")
-        print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
-    elif not args.leave_one_out:
-        print("\n--- No valid per-fold C-indices recorded ---")
+    # --- Per-Fold C-Index Summary (Only if not LOOCV and not cross-predict) --- 
+    if not args.leave_one_out and not args.cross_predict:
+        valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
+        if valid_fold_cindices:
+            mean_cindex = np.mean(valid_fold_cindices)
+            std_cindex = np.std(valid_fold_cindices)
+            min_cindex = np.min(valid_fold_cindices)
+            max_cindex = np.max(valid_fold_cindices)
+            print("\n--- Cross Validation C-Index Statistics (Per-Fold Test Set C-Indices) ---")
+            print(f"Mean: {mean_cindex:.4f}")
+            print(f"Standard Deviation: {std_cindex:.4f}")
+            print(f"Minimum: {min_cindex:.4f}")
+            print(f"Maximum: {max_cindex:.4f}")
+            print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
+        else:
+            print("\n--- No valid per-fold C-indices recorded ---")
 
 def main(args):
     if args.cross_validation:
@@ -528,6 +605,8 @@ if __name__ == "__main__":
     parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
                         help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
+    parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
+                        help="Train on cv_mode dataset and predict on this dataset")
     
     args = parser.parse_args()
 
@@ -548,6 +627,10 @@ if __name__ == "__main__":
     if args.upsampling: run_name += "_upsampled"
     if args.leave_one_out: run_name += "_loocv"
     else: run_name += f"_{args.cv_folds}fold"
+    
+    # Add cross-prediction tag if applicable
+    if args.cross_predict:
+        run_name += f"_cross_{args.cross_predict}"
         
     args.output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)

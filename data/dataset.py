@@ -523,7 +523,15 @@ class HCCDataModule:
             patient_indices = list(range(len(self.all_patients)))
             patient_events = [p['event'] for p in self.all_patients]
 
-            if self.leave_one_out:
+            # Special case for cross-dataset prediction (cv_folds=1)
+            # This avoids the StratifiedKFold error that requires n_splits >= 2
+            if self.cv_folds == 1:
+                print("[INFO] Single fold mode detected (likely cross-dataset prediction). Using all data for training.")
+                # Create a mock split using all indices for both train and test
+                # The test set will be overridden by the cross_predict dataset
+                self.cv_splits = [(patient_indices, patient_indices)]
+                print(f"Created mock fold structure with all {len(patient_indices)} patients in train set.")
+            elif self.leave_one_out:
                 from sklearn.model_selection import LeaveOneOut
                 self.cv_splitter = LeaveOneOut()
                 self.cv_splits = list(self.cv_splitter.split(patient_indices))
@@ -585,9 +593,20 @@ class HCCDataModule:
         """Setup datasets for a specific cross-validation fold using the combined patient list."""
         train_indices, test_indices = self.cv_splits[fold_idx]
         
+        # Special case for cross-dataset prediction (cv_folds=1)
+        # We created a mock split with identical train and test indices
+        # For this case, we need to ensure test_indices is not actually used
+        # because the cross_predict dataset will be used for testing instead
+        if self.cv_folds == 1 and train_indices == test_indices:
+            print("[INFO] Using all dataset for training in single-fold mode (test set will be from another dataset)")
+            mock_test_mode = True
+        else:
+            mock_test_mode = False
+        
         # Get the patient data dictionaries for this fold
         fold_train_val_patients = [self.all_patients[i] for i in train_indices]
-        fold_test_patients = [self.all_patients[i] for i in test_indices]
+        # In mock test mode, create an empty test set as it will be replaced by cross_predict_data_module
+        fold_test_patients = [] if mock_test_mode else [self.all_patients[i] for i in test_indices]
 
         # Split training data into train and validation sets
         if len(fold_train_val_patients) > 1 and self.use_validation:

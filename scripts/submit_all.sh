@@ -55,6 +55,109 @@ mkdir -p "$LOG_DIR"
 # --- Loop and Submit ---
 echo "Starting SLURM job submission loop..."
 
+# --- Submit Cross-dataset Evaluation Jobs ---
+echo "Submitting cross-dataset evaluation jobs (train on X, test on Y)..."
+
+# Configurations for cross-dataset evaluation:
+# 1. Train on NYU, predict on TCGA
+# 2. Train on TCGA, predict on NYU
+# Both for binary and time-to-event models
+for script_name in "train.py" "train_binary.py"; do
+    echo "  Cross-Dataset Evaluation for Script: $script_name"
+    
+    specific_args=()
+    base_output_dir=""
+    if [ "$script_name" == "train.py" ]; then
+        specific_args=("${SURVIVAL_ARGS[@]}")
+        base_output_dir="$BASE_OUTPUT_DIR_SURVIVAL"
+    else # train_binary.py
+        base_output_dir="$BASE_OUTPUT_DIR_BINARY"
+    fi
+
+    # Cross-dataset scenarios
+    for cross_mode in "nyu_to_tcga" "tcga_to_nyu"; do
+        echo "    Mode: $cross_mode"
+        
+        # Parse train and test sources
+        if [ "$cross_mode" == "nyu_to_tcga" ]; then
+            train_source="nyu"
+            test_source="tcga"
+        else
+            train_source="tcga"
+            test_source="nyu"
+        fi
+        
+        # --- Construct Job Name and Log File Path ---
+        script_prefix="${script_name%.py}" # train or train_binary
+        JOB_NAME="hcc_${script_prefix}_${cross_mode}"
+        LOG_FILE="${LOG_DIR}/${JOB_NAME}_%J.log" # %J is the SLURM job ID
+
+        # --- Construct Output Directory for Python Script ---
+        PYTHON_OUTPUT_BASE="${base_output_dir}/cross_${cross_mode}"
+
+        # --- Prepare Python Command ---
+        PYTHON_CMD="python $script_name"
+        PYTHON_CMD="$PYTHON_CMD ${COMMON_ARGS[*]}"
+        PYTHON_CMD="$PYTHON_CMD ${specific_args[*]}"
+        PYTHON_CMD="$PYTHON_CMD --cross_validation" # Still use CV infrastructure
+        PYTHON_CMD="$PYTHON_CMD --cv_mode $train_source" # Train on this dataset
+        PYTHON_CMD="$PYTHON_CMD --cv_folds 1" # Special case - one fold for cross-dataset prediction
+        PYTHON_CMD="$PYTHON_CMD --output_dir $PYTHON_OUTPUT_BASE"
+        # Add argument to switch test dataset
+        PYTHON_CMD="$PYTHON_CMD --cross_predict $test_source"
+
+        # --- Create Temporary Job Script ---
+        TEMP_SLURM_SCRIPT=$(mktemp /tmp/hcc_job_XXXXXX.slurm)
+        
+        echo "#!/bin/bash" > "$TEMP_SLURM_SCRIPT"
+        # Add SBATCH options
+        for opt in "${SBATCH_OPTS[@]}"; do
+            echo "$opt" >> "$TEMP_SLURM_SCRIPT"
+        done
+        # Add job-specific name and output
+        echo "#SBATCH --job-name=$JOB_NAME" >> "$TEMP_SLURM_SCRIPT"
+        echo "#SBATCH --output=$LOG_FILE" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+        
+        # Add commands to run
+        echo "echo \"--- Starting SLURM Job --- \"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"Job Name: \$SLURM_JOB_NAME (\$SLURM_JOB_ID)\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"Running on: \$SLURMD_NODENAME\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"GPU: \$CUDA_VISIBLE_DEVICES\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"Conda Env: $CONDA_ENV_NAME\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"Python Script: $script_name\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"Cross-Dataset Mode: Train on $train_source, Test on $test_source\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"--------------------------\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+        
+        echo "nvidia-smi" >> "$TEMP_SLURM_SCRIPT"
+        echo "nvcc --version" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+
+        echo "# Load modules and activate environment" >> "$TEMP_SLURM_SCRIPT"
+        echo "module load gcc/8.1.0" >> "$TEMP_SLURM_SCRIPT"
+        echo "source ~/.bashrc" >> "$TEMP_SLURM_SCRIPT"
+        echo "conda activate $CONDA_ENV_NAME" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+
+        echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"srun $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+        
+        echo "srun $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
+        echo "" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
+
+        # --- Submit Job ---
+        echo "  Submitting: $JOB_NAME (Log: ${LOG_FILE/\%J/<job_id>})"
+        sbatch "$TEMP_SLURM_SCRIPT"
+        
+        # Clean up temporary script
+        rm "$TEMP_SLURM_SCRIPT"
+    done # cross_mode
+done # script_name
+
+# Original CV mode jobs
 for script_name in "train.py" "train_binary.py"; do
     echo "  Script: $script_name"
     

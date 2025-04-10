@@ -8,7 +8,7 @@ dinov2/experiments/
 .ipynb_checkpoints/
 HCC-Recurrence/
 wandb/
-
+checkpoints*/
 *.xlsx  
 checkpoints/
 weights/
