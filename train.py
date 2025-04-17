@@ -411,7 +411,7 @@ def cross_validation_mode(args):
         save_path = None
         if use_early_stopping_fold:
             save_path = os.path.join(args.output_dir, f"best_model_fold{current_fold+1}.pt")
-            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience, save_path=save_path))
+            callbacks.append(tt.callbacks.EarlyStopping(metric='loss', dataset='val', patience=args.early_stopping_patience, file_path=save_path))
 
         print(f"[INFO] Fold {current_fold + 1}: Training the CoxPH model...")
         # Fit the model 
