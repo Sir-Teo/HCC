@@ -539,21 +539,20 @@ class HCCDataModule:
                 self.cv_splitter = LeaveOneOut()
                 self.cv_splits = list(self.cv_splitter.split(patient_indices))
             else:
-                from sklearn.model_selection import StratifiedKFold
+                from sklearn.model_selection import StratifiedKFold, KFold
                 skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                # Check if there are enough samples for stratification
-                if len(np.unique(patient_events)) < 2:
-                     print("[WARN] Only one class present in the combined dataset. Using KFold instead of StratifiedKFold.")
-                     from sklearn.model_selection import KFold
-                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                     self.cv_splits = list(kf.split(patient_indices))
-                elif any(np.bincount(patient_events) < self.cv_folds):
-                     print(f"[WARN] The least populated class has {min(np.bincount(patient_events))} members, which is less than n_splits={self.cv_folds}. Using KFold instead.")
-                     from sklearn.model_selection import KFold
-                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                     self.cv_splits = list(kf.split(patient_indices))
+                # In combined mode, stratify on dataset_type and event to keep each fold balanced
+                if self.cv_mode == 'combined':
+                    strat_labels = [f"{p['dataset_type']}_{int(p['event'])}" for p in self.all_patients]
+                    self.cv_splits = list(skf.split(patient_indices, strat_labels))
                 else:
-                     self.cv_splits = list(skf.split(patient_indices, patient_events))
+                    # Fall back to stratifying on event label
+                    if len(np.unique(patient_events)) < 2 or any(np.bincount(patient_events) < self.cv_folds):
+                        print("[WARN] Stratification on events not possible; using KFold instead.")
+                        kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                        self.cv_splits = list(kf.split(patient_indices))
+                    else:
+                        self.cv_splits = list(skf.split(patient_indices, patient_events))
             
             print(f"Total patients for cross-validation (mode '{self.cv_mode}'): {len(self.all_patients)}")
             print(f"Number of folds: {len(self.cv_splits)}")

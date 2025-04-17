@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -p radiology,a100_short,a100_long
+#SBATCH -p radiology,a100_short,a100_long,a100_dev
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
-#SBATCH --time=12:00:00
+#SBATCH --time=3:00:00
 #SBATCH --job-name=hcc
 #SBATCH --output=/gpfs/data/shenlab/wz1492/HCC/logs/train-%J.log
 #SBATCH --exclude=a100-4020

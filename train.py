@@ -14,6 +14,7 @@ from lifelines.utils import concordance_index  # for overall C-index computation
 import datetime  # new import for timestamp
 from tqdm import tqdm # Add progress bar
 from torch.utils.data import DataLoader
+from imblearn.over_sampling import SMOTE
 
 # Custom module imports
 from data.dataset import HCCDataModule, HCCDicomDataset # Use the updated DataModule
@@ -152,6 +153,37 @@ def upsample_training_data(x_train, durations, events):
     print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples.")
     return x_train_upsampled, durations_upsampled, events_upsampled
     
+# --- Upsampling by Dataset for Survival Data ---
+def upsample_by_dataset(x_train, durations, events, patient_info):
+    """
+    Upsample the minority class within each dataset (e.g., TCGA, NYU) separately.
+    """
+    # Group sample indices by dataset_type
+    groups = {}
+    for idx, info in enumerate(patient_info):
+        ds = info.get('dataset_type', 'Unknown')
+        groups.setdefault(ds, []).append(idx)
+    x_parts, d_parts, e_parts = [], [], []
+    for ds, idxs in groups.items():
+        X = x_train[idxs]
+        D = durations[idxs]
+        E = events[idxs]
+        # Upsample within this dataset group
+        X_up, D_up, E_up = upsample_training_data(X, D, E)
+        x_parts.append(X_up)
+        d_parts.append(D_up)
+        e_parts.append(E_up)
+    # Concatenate upsampled groups
+    if x_parts:
+        x_new = np.concatenate(x_parts, axis=0)
+        d_new = np.concatenate(d_parts, axis=0)
+        e_new = np.concatenate(e_parts, axis=0)
+        # Shuffle combined samples
+        perm = np.random.permutation(len(e_new))
+        return x_new[perm], d_new[perm], e_new[perm]
+    # Fallback if no upsampling done
+    return x_train, durations, events
+
 # --- Data Validation --- 
 def validate_survival_data(durations, events):
      # Basic checks
@@ -282,7 +314,7 @@ def cross_validation_mode(args):
         if hasattr(test_loader.dataset, '__fold_idx__'): test_loader.dataset.__fold_idx__ = current_fold
 
         # --- Feature Extraction --- 
-        x_train, y_train_durations, y_train_events, _ = extract_features(train_loader, dino_model, device)
+        x_train, y_train_durations, y_train_events, train_patient_info = extract_features(train_loader, dino_model, device)
         x_val, y_val_durations, y_val_events, _ = extract_features(val_loader, dino_model, device) 
         x_test, y_test_durations, y_test_events, test_patient_info = extract_features(test_loader, dino_model, device)
 
@@ -334,11 +366,8 @@ def cross_validation_mode(args):
         else:
             print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found.")
 
-        # Upsampling (optional, on training data)
-        if args.upsampling:
-            print(f"[INFO] Fold {current_fold + 1}: Upsampling training data...")
-            x_train, y_train_durations, y_train_events = upsample_training_data(x_train, y_train_durations, y_train_events)
-            n_train_p, n_train_s, n_train_f = x_train.shape # Update shape after upsampling
+        # Restore train shape (no manual up-sampling here)
+        n_train_p, n_train_s, n_train_f = x_train.shape
 
         # Standardize features (fit on train, transform all)
         x_mapper = StandardScaler()
@@ -376,6 +405,55 @@ def cross_validation_mode(args):
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
+        # SMOTE upsampling (optional, balanced within each dataset) for survival
+        if args.upsampling:
+            print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE per dataset for survival (adaptive k_neighbors)")
+            parts_X, parts_y, parts_dur = [], [], []
+            for ds in {pi['dataset_type'] for pi in train_patient_info}:
+                idxs = [i for i,pi in enumerate(train_patient_info) if pi['dataset_type']==ds]
+                Xg = x_train_final[idxs]
+                Eg = y_train_events[idxs]
+                Dg = y_train_durations[idxs]
+                # only apply SMOTE if both event and non-event present and enough minority samples
+                classes, counts = np.unique(Eg, return_counts=True)
+                if len(classes) > 1 and counts.min() > 1:
+                    minority_label = classes[np.argmin(counts)]
+                    minority_count = counts.min()
+                    k = min(minority_count - 1, 5)
+                    if k < 1:
+                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: Not enough minority samples ({minority_count}) for SMOTE. Skipping.")
+                        X_res, y_res, D_res = Xg, Eg, Dg
+                    else:
+                        sm_group = SMOTE(random_state=42, k_neighbors=k)
+                        try:
+                            X_res, y_res = sm_group.fit_resample(Xg, Eg)
+                        except ValueError as e:
+                            print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: SMOTE error {e}. Skipping SMOTE for this group.")
+                            X_res, y_res = Xg, Eg
+                        # assign durations for synthetic minority samples
+                        n_old = len(Eg)
+                        n_new = len(y_res) - n_old
+                        if n_new > 0:
+                            dur_cands = Dg[Eg == minority_label]
+                            if len(dur_cands) > 0:
+                                new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
+                            else:
+                                new_durs = np.zeros(n_new, dtype=Dg.dtype)
+                            D_res = np.concatenate([Dg, new_durs])
+                        else:
+                            D_res = Dg
+                else:
+                    # insufficient classes or too few samples
+                    X_res, y_res, D_res = Xg, Eg, Dg
+                parts_X.append(X_res)
+                parts_y.append(y_res)
+                parts_dur.append(D_res)
+            # recombine all groups
+            x_train_final = np.vstack(parts_X)
+            y_train_events = np.concatenate(parts_y)
+            y_train_durations = np.concatenate(parts_dur)
+            print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
+
         # --- Survival Model Training --- (Corrected Indentation Starts Here)
         in_features = x_train_final.shape[1]
         out_features = 1 # Cox model has 1 output (log hazard ratio)
@@ -411,7 +489,7 @@ def cross_validation_mode(args):
         save_path = None
         if use_early_stopping_fold:
             save_path = os.path.join(args.output_dir, f"best_model_fold{current_fold+1}.pt")
-            callbacks.append(tt.callbacks.EarlyStopping(metric='loss', dataset='val', patience=args.early_stopping_patience, file_path=save_path))
+            callbacks.append(tt.callbacks.EarlyStopping(metric='loss', dataset='val', patience=args.early_stopping_patience, file_path=save_path, rm_file=False))
 
         print(f"[INFO] Fold {current_fold + 1}: Training the CoxPH model...")
         # Fit the model 

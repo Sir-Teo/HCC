@@ -26,6 +26,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
+from imblearn.over_sampling import SMOTE
 
 sns.set(style="whitegrid")
 
@@ -158,6 +159,33 @@ def upsample_training_data(x_train, events):
     print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples. Minority class originally had {n_minority} samples.")
     return x_train_upsampled, events_upsampled
 
+# --- Upsampling by Dataset for Binary Data ---
+def upsample_by_dataset_binary(x_train, events, patient_info):
+    """
+    Upsample the minority class within each dataset separately for binary classification.
+    """
+    # Group sample indices by dataset_type
+    groups = {}
+    for idx, info in enumerate(patient_info):
+        ds = info.get('dataset_type', 'Unknown')
+        groups.setdefault(ds, []).append(idx)
+    x_parts, e_parts = [], []
+    for ds, idxs in groups.items():
+        X = x_train[idxs]
+        E = events[idxs]
+        # Upsample within this dataset group
+        X_up, E_up = upsample_training_data(X, E)
+        x_parts.append(X_up)
+        e_parts.append(E_up)
+    # Concatenate upsampled groups
+    if x_parts:
+        x_new = np.concatenate(x_parts, axis=0)
+        e_new = np.concatenate(e_parts, axis=0)
+        # Shuffle combined samples
+        perm = np.random.permutation(len(e_new))
+        return x_new[perm], e_new[perm]
+    # Fallback if no upsampling done
+    return x_train, events
 
 # Removed train_and_evaluate function - logic merged into cross_validation_mode
 
@@ -297,7 +325,7 @@ def cross_validation_mode(args):
 
         # --- Feature Extraction --- 
         # Note: extract_features now returns patient_info list as the third element
-        x_train, y_train_events, _ = extract_features(train_loader, dino_model, device)
+        x_train, y_train_events, train_patient_info = extract_features(train_loader, dino_model, device)
         x_val, y_val_events, _ = extract_features(val_loader, dino_model, device) # Will be empty if val_loader is None
         x_test, y_test_events, test_patient_info = extract_features(test_loader, dino_model, device)
 
@@ -344,16 +372,15 @@ def cross_validation_mode(args):
         else:
             print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found in training set.")
 
-        # Upsampling (optional, on training data only)
+        # Upsampling (optional, on training data) by dataset
         if args.upsampling:
-            print(f"[INFO] Fold {current_fold + 1}: Performing upsampling on training data...")
-            # Reshape train features before upsampling if needed, or adapt upsampling function
-            # Assuming upsample works on [patients, ...] shape
-            x_train_shape_before_upsample = x_train.shape
-            x_train, y_train_events = upsample_training_data(x_train, y_train_events)
+            print(f"[INFO] Fold {current_fold + 1}: Upsampling training data by dataset...")
+            x_train, y_train_events = upsample_by_dataset_binary(
+                x_train, y_train_events, train_patient_info
+            )
             print(f"[INFO] Fold {current_fold + 1}: Training data shape after upsampling: {x_train.shape}")
-            # Update train shape info if needed
-            n_train_p, n_train_s, n_train_f = x_train.shape
+        # Update train shape info after possible upsampling
+        n_train_p, n_train_s, n_train_f = x_train.shape
 
         # Standardize features (fit on train, transform train/val/test)
         # Reshape needed for StandardScaler: [patients * slices, features]
@@ -381,6 +408,26 @@ def cross_validation_mode(args):
         x_test_final = x_test_scaled.mean(axis=1)
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
+        # SMOTE upsampling (optional, by dataset)
+        if args.upsampling:
+            print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE upsampling by dataset for binary...")
+            smote = SMOTE(random_state=42)
+            X_parts, y_parts, info_parts = [], [], []
+            for ds in set(info.get('dataset_type','Unknown') for info in train_patient_info):
+                idxs = [i for i,info in enumerate(train_patient_info) if info.get('dataset_type')==ds]
+                Xg = x_train_final[idxs]
+                yg = y_train_events[idxs]
+                X_res, y_res = smote.fit_resample(Xg, yg)
+                pi = [info for info in train_patient_info if info.get('dataset_type')==ds]
+                # repeat info list to match new samples
+                pi_res = pi + [pi[i % len(pi)] for i in range(len(y_res)-len(pi))]
+                X_parts.append(X_res)
+                y_parts.append(y_res)
+                info_parts.extend(pi_res)
+            x_train_final = np.vstack(X_parts)
+            y_train_events = np.concatenate(y_parts)
+            train_patient_info = info_parts
+            print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
 
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
