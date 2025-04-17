@@ -18,9 +18,9 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import umap.umap_ as umap
 
-def plot_embedding(embedding, title, filename, sources, event_labels, output_dir):
-    plt.figure(figsize=(10, 8))
-    sns.scatterplot(
+def plot_embedding(embedding, title, filename, sources, event_labels, patient_ids, output_dir, num_labels=5):
+    plt.figure(figsize=(12, 10)) # Increased figure size slightly for labels
+    ax = sns.scatterplot(
         x=embedding[:, 0],
         y=embedding[:, 1],
         hue=sources,
@@ -34,7 +34,33 @@ def plot_embedding(embedding, title, filename, sources, event_labels, output_dir
     plt.xlabel("Component 1")
     plt.ylabel("Component 2")
     plt.legend(title="Source / Event", bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
+
+    # --- Add labels for outliers ---
+    if num_labels > 0 and len(patient_ids) == len(embedding):
+        # Calculate center
+        center = embedding.mean(axis=0)
+        # Calculate distance from center
+        distances = np.linalg.norm(embedding - center, axis=1)
+        # Get indices of N furthest points
+        outlier_indices = np.argsort(distances)[-num_labels:]
+
+        print(f"\n--- Top {num_labels} Outliers for {title} ---")
+        # Add text labels and print info
+        for i in outlier_indices:
+            patient_id = patient_ids[i]
+            distance = distances[i]
+            print(f"  - Patient ID: {patient_id:<15} Distance: {distance:.4f}")
+            plt.text(
+                embedding[i, 0] + 0.01, # Slight offset for x
+                embedding[i, 1] + 0.01, # Slight offset for y
+                patient_id,
+                fontsize=9,
+                ha='left', # Horizontal alignment
+                va='bottom' # Vertical alignment
+            )
+    # --- End of label addition ---
+
+    plt.tight_layout(rect=(0, 0, 0.85, 1)) # FIX: Use tuple for rect
     plot_path = os.path.join(output_dir, filename)
     plt.savefig(plot_path)
     print(f"{title} saved to {plot_path}")
@@ -111,25 +137,52 @@ def main(args):
     df_train['source'] = 'train'
 
     # Check if a test CSV file is provided
+    train_csv_path_for_module = args.train_csv_file
+    test_csv_path_for_module = args.test_csv_file
+
     if args.test_csv_file:
         df_test = pd.read_csv(args.test_csv_file)
         df_test['dicom_root'] = args.test_dicom_root
         df_test['source'] = 'test'
+        # df_all = pd.concat([df_train, df_test], ignore_index=True) # Keep for now, maybe needed later
     else:
-        # If no test CSV provided, perform a train-test split on the training data
+        print("[INFO] No test CSV provided. Performing train-test split on training data.")
         from sklearn.model_selection import train_test_split
-        # For example, use an 80-20 split
-        df_train, df_test = train_test_split(df_train, test_size=0.2, random_state=42)
-        # For the split test set, use the same dicom root as training (or adjust if needed)
+        # We split the original df_train before adding dicom_root/source cols
+        df_train_orig = pd.read_csv(args.train_csv_file)
+        df_train_split, df_test_split = train_test_split(df_train_orig, test_size=0.2, random_state=42)
+
+        # Define paths for temporary CSVs within the output directory
+        temp_train_csv = os.path.join(args.output_dir, "temp_train_split.csv")
+        temp_test_csv = os.path.join(args.output_dir, "temp_test_split.csv")
+
+        # Save the splits to temporary files
+        df_train_split.to_csv(temp_train_csv, index=False)
+        df_test_split.to_csv(temp_test_csv, index=False)
+        print(f"[INFO] Saved temporary train split to {temp_train_csv}")
+        print(f"[INFO] Saved temporary test split to {temp_test_csv}")
+
+        # Update the paths to be passed to the data module
+        train_csv_path_for_module = temp_train_csv
+        test_csv_path_for_module = temp_test_csv
+
+        # Re-create df_train and df_test for feature extraction/plotting logic below
+        # These dataframes need the 'dicom_root' and 'source' columns
+        df_train = df_train_split.copy()
+        df_train['dicom_root'] = args.train_dicom_root
+        df_train['source'] = 'train'
+
+        df_test = df_test_split.copy()
+        # For the split test set, use the same dicom root as training by default
         df_test['dicom_root'] = args.train_dicom_root
         df_test['source'] = 'test'
 
-    # Initialize the data module with separate CSVs for train and test
+    # Initialize the data module with CSV file PATHS
     data_module = HCCDataModule(
-        train_csv_file=df_train,
-        test_csv_file=df_test,
+        train_csv_file=train_csv_path_for_module,
+        test_csv_file=test_csv_path_for_module,
         train_dicom_root=args.train_dicom_root,
-        test_dicom_root=args.test_dicom_root,
+        test_dicom_root=args.test_dicom_root if args.test_csv_file else args.train_dicom_root, # Use train root if split
         model_type="time_to_event",
         batch_size=args.batch_size,
         num_slices=args.num_slices,
@@ -157,7 +210,6 @@ def main(args):
     test_embeddings = test_features.mean(axis=1)    # shape: (num_test_patients, feature_dim)
 
     # Combine embeddings and create corresponding source labels
-        # Combine embeddings and create corresponding source labels
     embeddings = np.concatenate([train_embeddings, test_embeddings], axis=0)
     sources = np.array(['train'] * train_embeddings.shape[0] + ['test'] * test_embeddings.shape[0])
     
@@ -177,6 +229,11 @@ def main(args):
     # Convert numeric events (0/1) into string labels for better legend readability
     event_labels = np.array(['positive' if e == 1 else 'negative' for e in events])
     
+    # Extract patient IDs
+    train_ids = np.array([p['patient_id'] for p in data_module.train_dataset.patient_data])
+    test_ids = np.array([p['patient_id'] for p in data_module.test_dataset.patient_data])
+    patient_ids = np.concatenate([train_ids, test_ids], axis=0)
+
     # Optionally standardize embeddings before PCA
     embeddings_2d = embeddings.mean(axis=1)  # Collapse the slice dimension by averaging
     print(len(embeddings_2d), len(embeddings_2d[0]))
@@ -187,17 +244,17 @@ def main(args):
     pca = PCA(n_components=2)
     embeddings_pca = pca.fit_transform(embeddings_scaled)
     print(f"PCA explained variance ratios: {pca.explained_variance_ratio_}")
-    plot_embedding(embeddings_pca, "PCA of DINOv2 Embeddings", "dino_embeddings_pca.png", sources, event_labels, args.output_dir)
+    plot_embedding(embeddings_pca, "PCA of DINOv2 Embeddings", "dino_embeddings_pca.png", sources, event_labels, patient_ids, args.output_dir)
 
     # t-SNE
     tsne = TSNE(n_components=2, perplexity=30, random_state=42)
     embeddings_tsne = tsne.fit_transform(embeddings_scaled)
-    plot_embedding(embeddings_tsne, "t-SNE of DINOv2 Embeddings", "dino_embeddings_tsne.png", sources, event_labels, args.output_dir)
+    plot_embedding(embeddings_tsne, "t-SNE of DINOv2 Embeddings", "dino_embeddings_tsne.png", sources, event_labels, patient_ids, args.output_dir)
 
     # UMAP
     umap_model = umap.UMAP(n_components=2, random_state=42)
     embeddings_umap = umap_model.fit_transform(embeddings_scaled)
-    plot_embedding(embeddings_umap, "UMAP of DINOv2 Embeddings", "dino_embeddings_umap.png", sources, event_labels, args.output_dir)
+    plot_embedding(embeddings_umap, "UMAP of DINOv2 Embeddings", "dino_embeddings_umap.png", sources, event_labels, patient_ids, args.output_dir)
 
 
 

@@ -359,10 +359,20 @@ def cross_validation_mode(args):
         x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
         x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
 
-        # Collapse slice dimension by averaging -> [patients, features]
-        x_train_final = x_train_scaled.mean(axis=1)
-        x_val_final = x_val_scaled.mean(axis=1) if has_validation_data else np.array([])
-        x_test_final = x_test_scaled.mean(axis=1)
+        # Collapse slice dimension by adaptive average pooling -> [patients, features]
+        slice_pool = torch.nn.AdaptiveAvgPool1d(1)
+        # Pool slice dimension for training set
+        x_train_tensor = torch.from_numpy(x_train_scaled.transpose(0, 2, 1))  # [patients, features, slices]
+        x_train_final = slice_pool(x_train_tensor).squeeze(-1).numpy()  # [patients, features]
+        # Pool slice dimension for validation set
+        if has_validation_data:
+            x_val_tensor = torch.from_numpy(x_val_scaled.transpose(0, 2, 1))
+            x_val_final = slice_pool(x_val_tensor).squeeze(-1).numpy()
+        else:
+            x_val_final = np.array([])
+        # Pool slice dimension for test set
+        x_test_tensor = torch.from_numpy(x_test_scaled.transpose(0, 2, 1))
+        x_test_final = slice_pool(x_test_tensor).squeeze(-1).numpy()
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
@@ -397,8 +407,11 @@ def cross_validation_mode(args):
 
         # Define callbacks for pycox fit method 
         callbacks = []
+        # Setup early stopping callback with save path if enabled
+        save_path = None
         if use_early_stopping_fold:
-            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience))
+            save_path = os.path.join(args.output_dir, f"best_model_fold{current_fold+1}.pt")
+            callbacks.append(tt.callbacks.EarlyStopping(patience=args.early_stopping_patience, save_path=save_path))
 
         print(f"[INFO] Fold {current_fold + 1}: Training the CoxPH model...")
         # Fit the model 
@@ -414,12 +427,12 @@ def cross_validation_mode(args):
         )
 
         # --- Post-Training: Load Best Model (if early stopping used) --- 
-        if use_early_stopping_fold and hasattr(model, 'load_model_weights'):
+        if use_early_stopping_fold and save_path and hasattr(model, 'load_model_weights'):
             try:
-                print(f"[INFO] Fold {current_fold + 1}: Loading best model weights based on validation loss.")
-                model.load_model_weights() # pycox EarlyStopping saves best weights internally
+                print(f"[INFO] Fold {current_fold + 1}: Loading best model weights based on validation loss from {save_path}.")
+                model.load_model_weights(save_path)
             except Exception as e:
-                print(f"[WARN] Fold {current_fold + 1}: Could not load best model weights: {e}. Using last state.")
+                print(f"[WARN] Fold {current_fold + 1}: Could not load best model weights from {save_path}: {e}. Using last state.")
         else:
             print(f"[INFO] Fold {current_fold + 1}: Using model state from the last epoch.")
 

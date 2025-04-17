@@ -10,6 +10,7 @@ import pydicom
 from torch.utils.data import Dataset, DataLoader, default_collate
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm # Added for progress bar
+import torch.nn.functional as F
 
 DEBUG = False 
 
@@ -119,29 +120,31 @@ class HCCDicomDataset(Dataset):
                  print(f"[DEBUG] Skipping patient {patient_id} ({dataset_type}) in __getitem__ due to empty full_stack.")
              return None # Signal to collate_fn to skip this sample
 
-        if DEBUG:
-            print(f"[DEBUG] __getitem__ for patient {patient_id} ({dataset_type}) - full stack shape: {full_stack.shape}")
-
-        # Generate num_samples 3D sub-stacks (each with num_slices).
-        sub_stacks = []
-        for _ in range(self.num_samples):
-            # Sample sub-stack
-            sampled_stack = self.sample_sub_stack(full_stack)
-
-            # Apply transform (if any) to each slice in this sub-stack.
+        if self.num_slices <= 0:
+            # Use the entire axial series as one sub-stack
             if self.transform is not None:
-                transformed_slices = []
-                for slice_ in sampled_stack:
-                    # slice_ shape: [C, H, W]
-                    slice_ = self.transform(slice_)
-                    transformed_slices.append(slice_)
-                # Re-stack along slice dimension => shape [num_slices, C, H, W]
-                sampled_stack = torch.stack(transformed_slices, dim=0)
-
-            sub_stacks.append(sampled_stack)
-
-        # Shape: [num_samples, num_slices, C, H, W]
-        sub_stacks = torch.stack(sub_stacks, dim=0)
+                # Apply transform to each slice
+                transformed = [self.transform(s) for s in full_stack]
+                full_stack = torch.stack(transformed, dim=0)
+            # Pool across slice dimension to unify to one slice per patient
+            # full_stack: [total_slices, C, H, W] -> permute to [1, C, total_slices, H, W]
+            full_stack = full_stack.permute(1, 0, 2, 3).unsqueeze(0)
+            # Adaptive pooling to collapse slice dimension
+            pooled = F.adaptive_avg_pool3d(full_stack, (1, full_stack.size(3), full_stack.size(4)))
+            # pooled: [1, C, 1, H, W] -> get back to [1, C, H, W]
+            pooled = pooled.squeeze(2)
+            # Final sub_stacks: [num_samples=1, num_slices=1, C, H, W]
+            sub_stacks = pooled.unsqueeze(0)
+        else:
+            # Generate num_samples 3D sub-stacks (each with num_slices)
+            stacks = []
+            for _ in range(self.num_samples):
+                sub = self.sample_sub_stack(full_stack)
+                if self.transform is not None:
+                    sub = torch.stack([self.transform(s) for s in sub], dim=0)
+                stacks.append(sub)
+            # Shape: [num_samples, num_slices, C, H, W]
+            sub_stacks = torch.stack(stacks, dim=0)
 
         # Return according to model type
         if self.model_type == "linear":

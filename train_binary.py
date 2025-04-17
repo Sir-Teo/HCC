@@ -658,7 +658,7 @@ if __name__ == "__main__":
                         help="If set, perform upsampling of the minority class in the training data for each fold")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used based on validation loss within each fold")
-    parser.add_argument('--early_stopping_patience', type=int, default=10, 
+    parser.add_argument('--early_stopping_patience', type=int, default=20, 
                         help="Number of epochs with no improvement to wait before stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, # Defaulting to CV mode
                         help="Enable cross validation mode (combines TCGA/NYU)")

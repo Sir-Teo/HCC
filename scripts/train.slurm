@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p radiology,a100_short
+#SBATCH -p radiology,a100_short,a100_long
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -25,11 +25,10 @@ srun python train.py \
     --tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
     --nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --batch_size 32 \
-    --num_slices  32\
+    --num_slices  0\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 1e-5 \
     --num_samples_per_patient 1\
-    --gradient_clip 2\
     --center_risk \
     --coxph_net mlp \
     --upsampling \
@@ -38,8 +37,6 @@ srun python train.py \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
-    --leave_one_out
-    
 
 
 

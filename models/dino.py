@@ -11,6 +11,7 @@ class DinoV2Wrapper(nn.Module):
     def __init__(self, base_model):
         super().__init__()
         self.base_model = base_model
+        self.patch_pool = nn.AdaptiveAvgPool1d(1)  # Add patch-level adaptive pooling
 
     def forward(self, x):
         return self.base_model(x)
@@ -18,8 +19,10 @@ class DinoV2Wrapper(nn.Module):
     def forward_features(self, x):
         token_embeddings = self.forward(x)
         if token_embeddings.ndim == 3 and token_embeddings.size(1) > 1:
-            patch_tokens = token_embeddings[:, 1:, :]
-            features = patch_tokens.mean(dim=1)
+            patch_tokens = token_embeddings[:, 1:, :]  # [batch, patches, embed_dim]
+            # Use AdaptiveAvgPool1d to pool patch tokens
+            pooled = self.patch_pool(patch_tokens.transpose(1, 2))  # [batch, embed_dim, 1]
+            features = pooled.squeeze(-1)  # [batch, embed_dim]
             return features
         elif token_embeddings.ndim == 2:
             return token_embeddings

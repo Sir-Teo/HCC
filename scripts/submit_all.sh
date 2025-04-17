@@ -26,17 +26,16 @@ COMMON_ARGS=(
 "--tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC"
 "--tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv"
 "--nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv"
-"--batch_size 32"
-"--num_slices 32"
+"--batch_size 16"
+"--num_slices 0"
 "--preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/"
 "--learning_rate 1e-5"
 "--num_samples_per_patient 1"
-"--gradient_clip 1.0" # Using 1.0 as per last script update
 "--upsampling"
 "--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth"
-"--epochs 1000" # Using 1000 as per slurm scripts
+"--epochs 3000" # Using 1000 as per slurm scripts
 "--early_stopping"
-"--early_stopping_patience 10"
+"--early_stopping_patience 20"
 # --cross_validation is implicitly handled by running these scripts
 )
 
