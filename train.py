@@ -15,6 +15,7 @@ import datetime  # new import for timestamp
 from tqdm import tqdm # Add progress bar
 from torch.utils.data import DataLoader
 from imblearn.over_sampling import SMOTE
+from torch import nn
 
 # Custom module imports
 from data.dataset import HCCDataModule, HCCDicomDataset # Use the updated DataModule
@@ -389,7 +390,7 @@ def cross_validation_mode(args):
         x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
 
         # Collapse slice dimension by adaptive average pooling -> [patients, features]
-        slice_pool = torch.nn.AdaptiveAvgPool1d(1)
+        slice_pool = nn.AdaptiveAvgPool1d(1)
         # Pool slice dimension for training set
         x_train_tensor = torch.from_numpy(x_train_scaled.transpose(0, 2, 1))  # [patients, features, slices]
         x_train_final = slice_pool(x_train_tensor).squeeze(-1).numpy()  # [patients, features]
@@ -462,7 +463,6 @@ def cross_validation_mode(args):
         if hyperparams['coxph_net'] == 'mlp':
             net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
         elif hyperparams['coxph_net'] == 'linear':
-            from torch import nn
             net = nn.Linear(in_features, out_features, bias=False) # Usually no bias in Cox
         else:
             raise ValueError("Unknown coxph_net option. Choose 'mlp' or 'linear'.")

@@ -402,10 +402,20 @@ def cross_validation_mode(args):
         x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
         x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
 
-        # Collapse the slice dimension by averaging -> [patients, features]
-        x_train_final = x_train_scaled.mean(axis=1)
-        x_val_final = x_val_scaled.mean(axis=1) if has_validation_data else np.array([])
-        x_test_final = x_test_scaled.mean(axis=1)
+        # Collapse the slice dimension by adaptive average pooling -> [patients, features]
+        slice_pool = nn.AdaptiveAvgPool1d(1)
+        # Pool training set
+        x_train_tensor = torch.from_numpy(x_train_scaled.transpose(0, 2, 1))  # [patients, features, slices]
+        x_train_final = slice_pool(x_train_tensor).squeeze(-1).numpy()  # [patients, features]
+        # Pool validation set
+        if has_validation_data:
+            x_val_tensor = torch.from_numpy(x_val_scaled.transpose(0, 2, 1))
+            x_val_final = slice_pool(x_val_tensor).squeeze(-1).numpy()
+        else:
+            x_val_final = np.array([])
+        # Pool test set
+        x_test_tensor = torch.from_numpy(x_test_scaled.transpose(0, 2, 1))
+        x_test_final = slice_pool(x_test_tensor).squeeze(-1).numpy()
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
         # SMOTE upsampling (optional, by dataset)
