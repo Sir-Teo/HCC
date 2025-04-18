@@ -16,8 +16,6 @@
   - [Embedding Visualization](#embedding-visualization)
 - [Command-Line Interfaces](#command-line-interfaces)
 - [Notebooks](#notebooks)
-- [Contributing](#contributing)
-- [License](#license)
 
 ---
 
@@ -112,7 +110,7 @@ python train.py \
   --preprocessed_root /path/to/preprocessed \
   --output_dir checkpoints_survival_cv \
   --batch_size 16 \
-  --num_slices 32 \
+  --num_slices 0 \
   --epochs 100 \
   --cv_folds 10 \
   --coxph_net mlp \
@@ -133,7 +131,7 @@ python train_binary.py \
   --preprocessed_root /path/to/preprocessed \
   --output_dir checkpoints_binary_cv \
   --batch_size 16 \
-  --num_slices 32 \
+  --num_slices 0 \
   --epochs 100 \
   --cv_folds 10 \
   --learning_rate 1e-5 \
@@ -152,7 +150,7 @@ python visualize.py \
   --dinov2_weights /path/to/dinov2_weights.pth \
   --output_dir visualization_outputs \
   --batch_size 32 \
-  --num_slices 32 \
+  --num_slices 0 \
   --num_samples_per_patient 1
 ```
 
@@ -174,16 +172,4 @@ Explore examples and EDA in the `notebooks/` directory:
 - `EDA.ipynb`, `survival.ipynb`, `semantic_segmentation.ipynb`, etc.
 
 ---
-
-## Contributing
-
-1. Fork the repository and create a feature branch.
-2. Write tests for new functionality.
-3. Submit a pull request and tag maintainers for review.
-
----
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](./dinov2/LICENSE) for details.
 
