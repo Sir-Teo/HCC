@@ -1,87 +1,189 @@
-# HCC
+# HCC: Hepatocellular Carcinoma Recurrence Prediction
 
-This is the repository for the Hepatocellular Carcinoma Recurrence Prediction project. This repository implements a survival analysis pipeline that leverages features extracted from DINOv2 and a Cox Proportional Hazards (CoxPH) model using either a custom multi-layer perceptron (MLP) or a linear layer. The code is organized into modular components for data handling, feature extraction, model building, and training, as well as dinov2 SSL code
+**A modular pipeline for time-to-event survival analysis and binary classification using DINOv2 features**
 
+---
 
-## Dataset
+## Table of Contents
 
-patient 13850412 might not have axial
+- [Project Overview](#project-overview)
+- [Repository Structure](#repository-structure)
+- [Datasets](#datasets)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [Survival Analysis Training](#survival-analysis-training)
+  - [Binary Classification Training](#binary-classification-training)
+  - [Embedding Visualization](#embedding-visualization)
+- [Command-Line Interfaces](#command-line-interfaces)
+- [Notebooks](#notebooks)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Training
+---
+
+## Project Overview
+
+This repository implements a pipeline for predicting hepatocellular carcinoma recurrence using features extracted from frozen DINOv2 vision transformer representations. We support:
+
+1. **Survival Analysis (Time-to-Event)**: Train a Cox Proportional Hazards (CoxPH) model (MLP or linear) on patient-level features.
+2. **Binary Classification**: Predict recurrence as a binary event using a simple classifier on top of DINOv2 features.
+3. **Embedding Visualization**: Project high-dimensional features to 2D (PCA, t-SNE, UMAP) and inspect clusters/outliers.
+
+Key features:
+- Modular data handling via `data.dataset.HCCDataModule` and `HCCDicomDataset`.
+- Flexible training scripts: `train.py` (survival), `train_binary.py` (classification), `visualize.py`.
+- Built-in cross-validation, upsampling support, and comprehensive plotting utilities.
+- Seamless integration of DINOv2 for feature extraction.
+
+---
+
+## Repository Structure
 
 ```
-python main.py \
-    --dicom_root /path/to/dicom \
-    --csv_file processed_patient_labels.csv \
-    --dinov2_weights /path/to/dinov2_weights.pth \
-    --output_dir checkpoints \
-    --batch_size 32 \
-    --num_slices 2 \
-    --epochs 20
+HCC/
+├── data/                   # Data loading and preprocessing modules
+│   └── dataset.py          # HCCDataModule, DICOM dataset loaders
+├── models/                 # Model definitions
+│   ├── dino.py             # Utilities to load and wrap DINOv2
+│   └── mlp.py              # Custom MLP and CoxPH-with-L1 implementations
+├── utils/                  # Plotting and helper utilities
+├── train.py                # CLI for survival analysis training
+├── train_binary.py         # CLI for binary classification training
+├── visualize.py            # CLI for embedding visualization
+├── dinov2/                 # DINOv2 source and training code (SSL)
+├── notebooks/              # Notebooks for EDA and examples
+└── readme.md               # This file
 ```
 
 ---
 
-## SSL 
+## Datasets
 
-- [**LLD-MMRI Dataset**](https://github.com/LMMMEng/LLD-MMRI-Dataset): An open-access dataset for liver lesion diagnosis on multi-phase MRI, comprising 498 cases with 7 different lesion types. (~220,000 images)
-  
-- [**AMOS Dataset**](https://arxiv.org/abs/2206.08023): A large-scale abdominal multi-organ benchmark for versatile medical image segmentation, including 500 CT and 100 MRI scans with annotations for 15 abdominal organs.
-  
-- [**LiverHCCSeg Dataset**](https://www.sciencedirect.com/science/article/pii/S2352340923007473) 17 HCC Cases
+- **NYU Internal HCC**: Retrospective series of HCC patient CT volumes with recurrence labels.
+- **TCGA-LIHC**: Public liver cancer CT dataset with survival follow-up.
+- **External SSL Sources** (in `dinov2/`): LLD-MMRI, AMOS, LiverHCCSeg, CHAOS for self-supervised pretraining.
 
-- [**CHAOS Dataset**](https://chaos.grand-challenge.org/): The Combined (CT-MR) Healthy Abdominal Organ Segmentation dataset, featuring 40 CT and 120 MRI volumes with annotations for liver, kidneys, and spleen.
+> **Note**: Ensure DICOM volumes are organized according to the provided CSV metadata.
 
-With all combined, there are 330,000 images (MRI) in total.
+---
 
-### Classification Benchmark
+## Installation
 
-- [**Duke Liver Dataset**](https://scholars.duke.edu/publication/1589665): A publicly available liver MRI dataset with liver segmentation masks and series labels, consisting of 2,146 abdominal MRI series from 105 patients, including 310 image series with corresponding manually segmented liver masks.
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your_org/HCC.git
+   cd HCC
+   ```
 
-Dinov2 official evaluation code trains **52 linear classifiers** on top of frozen DINOv2 features to evaluate the model's representation quality. These classifiers are trained with different configurations, combining:
+2. **Create and activate a Python environment**
+   ```bash
+   conda create -n hcc_env python=3.10 -y
+   conda activate hcc_env
+   ```
 
-1. **Number of Blocks Used**: Last 1 or last 4 blocks.
-2. **Average Pooling**: With and without pooling.
-3. **Learning Rates**: 13 different values.
+3. **Install DINOv2 dependencies** (for feature extraction and SSL):
+   ```bash
+   cd dinov2
+   pip install -r requirements.txt
+   pip install -r requirements-extras.txt
+   pip install -e .
+   cd ..
+   ```
 
-After training, each classifier's performance is evaluated, and the best one is selected based on accuracy.
+4. **Install HCC project dependencies**:
+   ```bash
+   pip install numpy pandas matplotlib seaborn scikit-learn torchtuples pycox lifelines tqdm imbalanced-learn umap-learn
+   ```
 
-### Our Task Dataset
+---
 
-- NYU Internal HCC Dataset
+## Quick Start
 
-### How to Run SSL
+### Survival Analysis Training
 
+Train a time-to-event CoxPH model with cross-validation and optional upsampling:
+```bash
+python train.py \
+  --tcga_dicom_root /path/to/TCGA/DICOM \
+  --nyu_dicom_root /path/to/NYU/DICOM \
+  --tcga_csv_file /path/to/tcga.csv \
+  --nyu_csv_file /path/to/nyu.csv \
+  --dinov2_weights /path/to/dinov2_weights.pth \
+  --preprocessed_root /path/to/preprocessed \
+  --output_dir checkpoints_survival_cv \
+  --batch_size 16 \
+  --num_slices 32 \
+  --epochs 100 \
+  --cv_folds 10 \
+  --coxph_net mlp \
+  --learning_rate 1e-5 \
+  --upsampling
 ```
-python dinov2/run/train/train.py \
---config-file dinov2/configs/train/vitl14.yaml \
---wandb-project-name "Experiment-003-Teo" \
---output-dir "./models/Experiment_003" \
---ngpus 2 \
---timeout 10079 \
---partition a100_long,radiology \
-train.dataset_path=UnlabeledMedicalImageDataset:root=/gpfs/data/mankowskilab/HCC/data/images
+
+### Binary Classification Training
+
+Train a binary classifier to predict recurrence:
+```bash
+python train_binary.py \
+  --tcga_dicom_root /path/to/TCGA/DICOM \
+  --nyu_dicom_root /path/to/NYU/DICOM \
+  --tcga_csv_file /path/to/tcga.csv \
+  --nyu_csv_file /path/to/nyu.csv \
+  --dinov2_weights /path/to/dinov2_weights.pth \
+  --preprocessed_root /path/to/preprocessed \
+  --output_dir checkpoints_binary_cv \
+  --batch_size 16 \
+  --num_slices 32 \
+  --epochs 100 \
+  --cv_folds 10 \
+  --learning_rate 1e-5 \
+  --upsampling
 ```
 
-### How to Run Classification Benchmark
+### Embedding Visualization
 
-#### For Untrained Model
-
-```
-sbatch gpu_train_untrained.sbatch
-```
-
-#### For Pretrained Model
-
-```
-sbatch gpu_train_pretrained.sbatch
-```
-
-#### For our own SSL Model
-
-```
-sbatch gpu_train.sbatch
+Project DINOv2 features into 2D to inspect patient clusters and outliers:
+```bash
+python visualize.py \
+  --train_dicom_root /path/to/TCGA/DICOM \
+  --test_dicom_root /path/to/NYU/DICOM \
+  --train_csv_file /path/to/tcga.csv \
+  --test_csv_file /path/to/nyu.csv \
+  --dinov2_weights /path/to/dinov2_weights.pth \
+  --output_dir visualization_outputs \
+  --batch_size 32 \
+  --num_slices 32 \
+  --num_samples_per_patient 1
 ```
 
-## Time to Event Model Training
+---
+
+## Command-Line Interfaces
+
+Each script provides `--help` for full argument details:
+
+- **Survival**: `python train.py --help`
+- **Classification**: `python train_binary.py --help`
+- **Visualization**: `python visualize.py --help`
+
+---
+
+## Notebooks
+
+Explore examples and EDA in the `notebooks/` directory:
+- `EDA.ipynb`, `survival.ipynb`, `semantic_segmentation.ipynb`, etc.
+
+---
+
+## Contributing
+
+1. Fork the repository and create a feature branch.
+2. Write tests for new functionality.
+3. Submit a pull request and tag maintainers for review.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](./dinov2/LICENSE) for details.
 
