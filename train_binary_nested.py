@@ -26,7 +26,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, ADASYN
 import json # Add json import
 
 sns.set(style="whitegrid")
@@ -458,6 +458,28 @@ def cross_validation_mode(args):
             y_train_events = np.concatenate(y_parts)
             train_patient_info = info_parts
             print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
+        elif args.upsampling and args.upsampling_method == 'adasyn':
+            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN upsampling by dataset for binary...")
+            X_parts, y_parts, info_parts = [], [], []
+            for ds in set(pi.get('dataset_type','Unknown') for pi in train_patient_info):
+                idxs = [i for i, pi in enumerate(train_patient_info) if pi.get('dataset_type') == ds]
+                Xg = x_train_final[idxs]
+                yg = y_train_events[idxs]
+                adasyn = ADASYN(random_state=42)
+                try:
+                    X_res, y_res = adasyn.fit_resample(Xg, yg)
+                except ValueError as e:
+                    print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: ADASYN error {e}. Skipping ADASYN for this group.")
+                    X_res, y_res = Xg, yg
+                pi_list = [pi for pi in train_patient_info if pi.get('dataset_type') == ds]
+                pi_res = pi_list + [pi_list[i % len(pi_list)] for i in range(len(y_res) - len(pi_list))]
+                X_parts.append(X_res)
+                y_parts.append(y_res)
+                info_parts.extend(pi_res)
+            x_train_final = np.vstack(X_parts)
+            y_train_events = np.concatenate(y_parts)
+            train_patient_info = info_parts
+            print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
 
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
@@ -842,7 +864,7 @@ if __name__ == "__main__":
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data for each fold")
-    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote'], help="Upsampling method: 'random' or 'smote'")
+    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used based on validation loss within each fold")
     parser.add_argument('--early_stopping_patience', type=int, default=20, 

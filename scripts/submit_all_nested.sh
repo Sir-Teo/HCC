@@ -27,7 +27,7 @@ COMMON_ARGS=(
 "--tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv"
 "--nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv"
 "--batch_size 16"
-"--num_slices 0" # Keeping 0 as per user's previous setting? Or should this be 32? Adjust if needed.
+"--num_slices 0" 
 "--preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/"
 "--num_samples_per_patient 1"
 "--upsampling"

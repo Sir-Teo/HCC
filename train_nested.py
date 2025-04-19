@@ -14,7 +14,7 @@ from lifelines.utils import concordance_index  # for overall C-index computation
 import datetime  # new import for timestamp
 from tqdm import tqdm # Add progress bar
 from torch.utils.data import DataLoader
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, ADASYN
 from torch import nn
 import json # Add json import
 
@@ -485,6 +485,46 @@ def cross_validation_mode(args):
             # define features dims for nested CV tuning
             in_features = x_train_final.shape[1]
             out_features = 1
+        elif args.upsampling and args.upsampling_method == 'adasyn':
+            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN per dataset for survival (adaptive synthetic sampling)")
+            parts_X, parts_y, parts_dur = [], [], []
+            for ds in {pi['dataset_type'] for pi in train_patient_info}:
+                idxs = [i for i,pi in enumerate(train_patient_info) if pi['dataset_type']==ds]
+                Xg = x_train_final[idxs]
+                Eg = y_train_events[idxs]
+                Dg = y_train_durations[idxs]
+                classes, counts = np.unique(Eg, return_counts=True)
+                if len(classes) > 1:
+                    minority_label = classes[np.argmin(counts)]
+                    adasyn_group = ADASYN(random_state=42)
+                    try:
+                        X_res, y_res = adasyn_group.fit_resample(Xg, Eg)
+                    except ValueError as e:
+                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: ADASYN error {e}. Skipping ADASYN for this group.")
+                        X_res, y_res = Xg, Eg
+                else:
+                    X_res, y_res = Xg, Eg
+                n_old = len(Eg)
+                n_new = len(y_res) - n_old
+                if n_new > 0:
+                    dur_cands = Dg[Eg == minority_label]
+                    if len(dur_cands) > 0:
+                        new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
+                    else:
+                        new_durs = np.zeros(n_new, dtype=Dg.dtype)
+                    D_res = np.concatenate([Dg, new_durs])
+                else:
+                    D_res = Dg
+                parts_X.append(X_res)
+                parts_y.append(y_res)
+                parts_dur.append(D_res)
+            x_train_final = np.vstack(parts_X)
+            y_train_events = np.concatenate(parts_y)
+            y_train_durations = np.concatenate(parts_dur)
+            print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
+            # define features dims for nested CV tuning
+            in_features = x_train_final.shape[1]
+            out_features = 1
 
         # Nested CV: tune learning_rate via inner C-index
         skf_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=42)
@@ -817,7 +857,7 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
     parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
     parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")
-    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote'], help="Upsampling method: 'random' or 'smote'")
+    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
     parser.add_argument('--early_stopping_patience', type=int, default=20, help="Patience epochs for early stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable combined cross validation mode")
