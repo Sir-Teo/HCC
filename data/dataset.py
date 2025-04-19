@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm # Added for progress bar
 import torch.nn.functional as F
 
-DEBUG = False 
+DEBUG = False
 
 def nan_hook(module, input, output):
     if torch.isnan(output).any() and DEBUG:
@@ -81,12 +81,6 @@ class HCCDicomDataset(Dataset):
             for dcm_path in dcm_files:
                 try:
                     dcm = pydicom.dcmread(dcm_path, stop_before_pixels=True)
-                    # Skip CT images
-                    if hasattr(dcm, 'Modality') and dcm.Modality.upper() == 'CT':
-                        continue
-                    # Check that necessary fields exist
-                    if not (hasattr(dcm, 'ImageOrientationPatient') and hasattr(dcm, 'ImagePositionPatient')):
-                        continue
                     return True  # Valid image found
                 except Exception:
                     continue

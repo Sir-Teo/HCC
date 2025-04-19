@@ -19,16 +19,16 @@ module load gcc/8.1.0
 source ~/.bashrc 
 conda activate dinov2
 
-srun python train.py \
+srun python train_nested.py \
     --nyu_dicom_root  /gpfs/data/mankowskilab/HCC_Recurrence/dicom \
-    --tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
+    --tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793424834/TCGA-LIHC \
     --tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
     --nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --batch_size 32 \
-    --num_slices  0\
+    --num_slices 32 \
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --learning_rate 5e-7 \
-    --num_samples_per_patient 1\
+    --num_samples_per_patient 1 \
     --center_risk \
     --coxph_net mlp \
     --upsampling \
@@ -38,6 +38,9 @@ srun python train.py \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
+    --inner_folds 6 \
+    --learning_rates 1e-7 1e-6 1e-5 1e-4 \
+    --cv_folds 7
 
 
 

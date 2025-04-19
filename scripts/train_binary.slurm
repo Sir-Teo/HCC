@@ -30,8 +30,9 @@ srun python train_binary.py \
     --num_samples_per_patient 1\
     --preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/ \
     --upsampling \
+    --upsampling_method smote \
     --dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth \
-    --epochs 3000 \
+    --epochs 5000 \
     --early_stopping \
 
 

@@ -14,7 +14,7 @@ from lifelines.utils import concordance_index  # for overall C-index computation
 import datetime  # new import for timestamp
 from tqdm import tqdm # Add progress bar
 from torch.utils.data import DataLoader
-from imblearn.over_sampling import SMOTE, ADASYN
+from imblearn.over_sampling import SMOTE
 from torch import nn
 import json # Add json import
 
@@ -210,6 +210,13 @@ def cross_validation_mode(args):
         'gamma': args.gamma, # Regularization for CoxPHWithL1
         'coxph_net': args.coxph_net # 'mlp' or 'linear'
     }
+
+    # Nested CV settings
+    if args.leave_one_out:
+        inner_folds = 6
+    else:
+        inner_folds = args.inner_folds
+    lr_candidates = args.learning_rates
 
     # --- Data Module Setup --- 
     data_module = HCCDataModule(
@@ -475,48 +482,49 @@ def cross_validation_mode(args):
             y_train_events = np.concatenate(parts_y)
             y_train_durations = np.concatenate(parts_dur)
             print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
-        elif args.upsampling and args.upsampling_method == 'adasyn':
-            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN per dataset for survival (adaptive synthetic sampling)")
-            parts_X, parts_y, parts_dur = [], [], []
-            for ds in {pi['dataset_type'] for pi in train_patient_info}:
-                idxs = [i for i,pi in enumerate(train_patient_info) if pi['dataset_type']==ds]
-                Xg = x_train_final[idxs]
-                Eg = y_train_events[idxs]
-                Dg = y_train_durations[idxs]
-                classes, counts = np.unique(Eg, return_counts=True)
-                if len(classes) > 1:
-                    minority_label = classes[np.argmin(counts)]
-                    adasyn_group = ADASYN(random_state=42)
-                    try:
-                        X_res, y_res = adasyn_group.fit_resample(Xg, Eg)
-                    except ValueError as e:
-                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: ADASYN error {e}. Skipping ADASYN for this group.")
-                        X_res, y_res = Xg, Eg
+            # define features dims for nested CV tuning
+            in_features = x_train_final.shape[1]
+            out_features = 1
+
+        # Nested CV: tune learning_rate via inner C-index
+        skf_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=42)
+        best_score = -np.inf
+        for lr in lr_candidates:
+            inner_scores = []
+            for train_idx, val_idx in skf_inner.split(x_train_final, y_train_events):
+                Xi, Di, Ei = x_train_final[train_idx], y_train_durations[train_idx], y_train_events[train_idx]
+                Xv, Dv, Ev = x_train_final[val_idx], y_train_durations[val_idx], y_train_events[val_idx]
+                # build inner model
+                if hyperparams['coxph_net'] == 'mlp':
+                    net_i = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
                 else:
-                    X_res, y_res = Xg, Eg
-                n_old = len(Eg)
-                n_new = len(y_res) - n_old
-                if n_new > 0:
-                    dur_cands = Dg[Eg == minority_label]
-                    if len(dur_cands) > 0:
-                        new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
-                    else:
-                        new_durs = np.zeros(n_new, dtype=Dg.dtype)
-                    D_res = np.concatenate([Dg, new_durs])
-                else:
-                    D_res = Dg
-                parts_X.append(X_res)
-                parts_y.append(y_res)
-                parts_dur.append(D_res)
-            x_train_final = np.vstack(parts_X)
-            y_train_events = np.concatenate(parts_y)
-            y_train_durations = np.concatenate(parts_dur)
-            print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
+                    net_i = nn.Linear(in_features, out_features, bias=False)
+                if args.center_risk:
+                    net_i = CenteredModel(net_i)
+                model_i = CoxPHWithL1(net_i, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
+                model_i.optimizer.set_lr(lr)
+                # fit inner model
+                model_i.fit(Xi, (Di, Ei), batch_size=args.batch_size, epochs=min(10, args.epochs), verbose=False)
+                model_i.compute_baseline_hazards()
+                try:
+                    risk_v = -model_i.predict(Xv).reshape(-1)
+                    cind = concordance_index(Dv, risk_v, event_observed=Ev)
+                    inner_scores.append(cind)
+                except Exception as e:
+                    print(f"[Fold {current_fold+1}] LR={lr}: inner fold error {e}; skipping this fold")
+            # compute inner metric if any valid scores
+            if inner_scores:
+                mean_score = np.mean(inner_scores)
+                print(f"[Fold {current_fold+1}] LR={lr}: inner C-index={mean_score:.4f}")
+                if mean_score > best_score:
+                    best_score, best_lr = mean_score, lr
+            else:
+                print(f"[Fold {current_fold+1}] LR={lr}: no valid inner C-index scores, skipping this LR candidate")
+        hyperparams['learning_rate'] = best_lr
+        print(f"[Fold {current_fold+1}] Selected learning_rate={best_lr} (inner C-index={best_score:.4f})")
+        print(f"[Fold {current_fold+1}] Using outer learning_rate={best_lr}")
 
         # --- Survival Model Training --- (Corrected Indentation Starts Here)
-        in_features = x_train_final.shape[1]
-        out_features = 1 # Cox model has 1 output (log hazard ratio)
-
         # Build the network based on hyperparameters
         if hyperparams['coxph_net'] == 'mlp':
             net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
@@ -809,7 +817,7 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
     parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
     parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")
-    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
+    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote'], help="Upsampling method: 'random' or 'smote'")
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
     parser.add_argument('--early_stopping_patience', type=int, default=20, help="Patience epochs for early stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable combined cross validation mode")
@@ -819,6 +827,8 @@ if __name__ == "__main__":
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
     parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
                         help="Train on cv_mode dataset and predict on this dataset")
+    parser.add_argument('--inner_folds', type=int, default=6, help='Number of inner CV folds for learning-rate tuning')
+    parser.add_argument('--learning_rates', type=float, nargs='+', default=[1e-7,1e-6,1e-5,1e-4], help='Learning-rate candidates for nested CV')
     
     args = parser.parse_args()
 

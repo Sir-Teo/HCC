@@ -26,7 +26,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
-from imblearn.over_sampling import SMOTE, ADASYN
+from imblearn.over_sampling import SMOTE
 import json # Add json import
 
 sns.set(style="whitegrid")
@@ -204,14 +204,14 @@ def cross_validation_mode(args):
     Train on combined data within each fold.
     Aggregate and report test metrics separately for TCGA and NYU sources.
     """
-    # Hyperparameters for training
-    hyperparams = {
-        'learning_rate': args.learning_rate,
-        # 'dropout': args.dropout, # Not used in Linear model
-        # 'alpha': args.alpha, # Survival specific
-        # 'gamma': args.gamma, # Survival specific
-        # 'coxph_net': args.coxph_net # Survival specific
-    }
+    # Nested CV hyperparameter tuning settings
+    # inner_folds = args.inner_folds
+    # inner_folds for nested CV: keep at 6 when doing leave-one-out outer CV
+    if args.leave_one_out:
+        inner_folds = 6
+    else:
+        inner_folds = args.inner_folds
+    lr_candidates = args.learning_rates
 
     # --- Data Module Setup --- 
     data_module = HCCDataModule(
@@ -422,52 +422,90 @@ def cross_validation_mode(args):
         # SMOTE upsampling (optional, by dataset)
         if args.upsampling and args.upsampling_method == 'smote':
             print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE upsampling by dataset for binary...")
-            smote = SMOTE(random_state=42)
             X_parts, y_parts, info_parts = [], [], []
-            for ds in set(info.get('dataset_type','Unknown') for info in train_patient_info):
-                idxs = [i for i,info in enumerate(train_patient_info) if info.get('dataset_type')==ds]
+            # For each dataset group, fit SMOTE with k_neighbors <= n_minority-1
+            for ds in set(pi.get('dataset_type','Unknown') for pi in train_patient_info):
+                idxs = [i for i,pi in enumerate(train_patient_info) if pi.get('dataset_type') == ds]
                 Xg = x_train_final[idxs]
                 yg = y_train_events[idxs]
-                X_res, y_res = smote.fit_resample(Xg, yg)
-                pi = [info for info in train_patient_info if info.get('dataset_type')==ds]
-                # repeat info list to match new samples
-                pi_res = pi + [pi[i % len(pi)] for i in range(len(y_res)-len(pi))]
+                classes, counts = np.unique(yg, return_counts=True)
+                # If at least two classes present
+                if len(classes) > 1:
+                    # minority class count
+                    n_minority = int(counts.min())
+                    k = min(5, n_minority - 1)
+                    if k < 1:
+                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: minority count ({n_minority}) too small for SMOTE. Skipping.")
+                        X_res, y_res = Xg, yg
+                    else:
+                        try:
+                            sm = SMOTE(random_state=42, k_neighbors=k)
+                            X_res, y_res = sm.fit_resample(Xg, yg)
+                        except ValueError as e:
+                            print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: SMOTE error {e}. Skipping SMOTE.")
+                            X_res, y_res = Xg, yg
+                else:
+                    print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: single-class group. Skipping SMOTE.")
+                    X_res, y_res = Xg, yg
+                # repeat corresponding patient_info entries
+                pi_list = [pi for pi in train_patient_info if pi.get('dataset_type') == ds]
+                pi_res = pi_list + [pi_list[i % len(pi_list)] for i in range(len(y_res) - len(pi_list))]
                 X_parts.append(X_res)
                 y_parts.append(y_res)
                 info_parts.extend(pi_res)
+            # combine all groups back
             x_train_final = np.vstack(X_parts)
             y_train_events = np.concatenate(y_parts)
             train_patient_info = info_parts
             print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
-        # ADASYN upsampling (optional, by dataset)
-        if args.upsampling and args.upsampling_method == 'adasyn':
-            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN upsampling by dataset for binary...")
-            X_parts, y_parts, info_parts = [], [], []
-            for ds in set(info.get('dataset_type','Unknown') for info in train_patient_info):
-                idxs = [i for i, info in enumerate(train_patient_info) if info.get('dataset_type')==ds]
-                Xg = x_train_final[idxs]
-                yg = y_train_events[idxs]
-                adasyn = ADASYN(random_state=42)
-                try:
-                    X_res, y_res = adasyn.fit_resample(Xg, yg)
-                except ValueError as e:
-                    print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: ADASYN error {e}. Skipping ADASYN for this group.")
-                    X_res, y_res = Xg, yg
-                pi = [info for info in train_patient_info if info.get('dataset_type')==ds]
-                pi_res = pi + [pi[i % len(pi)] for i in range(len(y_res)-len(pi))]
-                X_parts.append(X_res)
-                y_parts.append(y_res)
-                info_parts.extend(pi_res)
-            x_train_final = np.vstack(X_parts)
-            y_train_events = np.concatenate(y_parts)
-            train_patient_info = info_parts
-            print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
+
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
-        net = nn.Linear(in_features, 1) # Single output for BCEWithLogitsLoss
+
+        # Nested CV: tune learning rate
+        best_lr = args.learning_rate
+        if lr_candidates:
+            print(f"[Fold {current_fold+1}] Starting inner CV over {inner_folds} folds for LRs: {lr_candidates}")
+            best_inner_score = -np.inf
+            skf_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=42)
+            for lr in lr_candidates:
+                inner_scores = []
+                for itrain, ival in skf_inner.split(x_train_final, y_train_events):
+                    # small inner model
+                    net_inner = nn.Linear(in_features, 1).to(device)
+                    optimizer_inner = torch.optim.Adam(net_inner.parameters(), lr=lr, weight_decay=1e-4)
+                    y_inner = y_train_events[itrain]
+                    pos = int(y_inner.sum()); neg = len(y_inner) - pos
+                    if pos > 0:
+                        pw = torch.tensor([neg/pos], device=device)
+                        criterion_inner = nn.BCEWithLogitsLoss(pos_weight=pw)
+                    else:
+                        criterion_inner = nn.BCEWithLogitsLoss()
+                    X_i = torch.tensor(x_train_final[itrain], dtype=torch.float32).to(device)
+                    y_i = torch.tensor(y_train_events[itrain], dtype=torch.float32).unsqueeze(1).to(device)
+                    X_v = torch.tensor(x_train_final[ival], dtype=torch.float32).to(device)
+                    y_v = y_train_events[ival]
+                    for epoch_i in range(min(10, args.epochs)):
+                        net_inner.train(); optimizer_inner.zero_grad()
+                        loss_i = criterion_inner(net_inner(X_i), y_i)
+                        loss_i.backward(); optimizer_inner.step()
+                    net_inner.eval()
+                    with torch.no_grad():
+                        preds = (torch.sigmoid(net_inner(X_v)).cpu().numpy().flatten() >= 0.5).astype(int)
+                    inner_scores.append(average_precision_score(y_v, preds))
+                mean_score = np.mean(inner_scores)
+                print(f"[Fold {current_fold+1}] LR={lr}: inner AUPRC={mean_score:.4f}")
+                if mean_score > best_inner_score:
+                    best_inner_score, best_lr = mean_score, lr
+            print(f"[Fold {current_fold+1}] Selected LR={best_lr} with inner AUPRC={best_inner_score:.4f}")
+        else:
+            best_lr = args.learning_rate
+
+        net = nn.Linear(in_features, 1)  # Single output for BCEWithLogitsLoss
         net.to(device)
 
-        optimizer = torch.optim.Adam(net.parameters(), lr=hyperparams['learning_rate'], weight_decay=1e-4)
+        optimizer = torch.optim.Adam(net.parameters(), lr=best_lr, weight_decay=1e-4)
+
         # Use class-weighted BCE loss based on training class balance
         positives = int(y_train_events.sum())
         negatives = len(y_train_events) - positives
@@ -792,6 +830,10 @@ if __name__ == "__main__":
                         help='Base directory to save outputs and models')
     parser.add_argument('--learning_rate', type=float, default=1e-5,
                         help='Learning rate for the classification model')
+    parser.add_argument('--inner_folds', type=int, default=6,
+                        help='Number of inner cross-validation folds for learning-rate tuning')
+    parser.add_argument('--learning_rates', type=float, nargs='+', default=[1e-6,1e-5,1e-4],
+                        help='Learning-rate candidates for nested CV')
     parser.add_argument('--gradient_clip', type=float, default=1.0, # Adjusted default maybe
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
@@ -800,7 +842,7 @@ if __name__ == "__main__":
                         help="Path to your local DINOv2 state dict file (.pth or .pt).")
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data for each fold")
-    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
+    parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote'], help="Upsampling method: 'random' or 'smote'")
     parser.add_argument('--early_stopping', action='store_true',
                         help="If set, early stopping will be used based on validation loss within each fold")
     parser.add_argument('--early_stopping_patience', type=int, default=20, 
