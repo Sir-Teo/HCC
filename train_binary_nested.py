@@ -624,14 +624,17 @@ def cross_validation_mode(args):
                 val_logits = net(val_tensor_x)
                 val_probs_full = torch.sigmoid(val_logits).cpu().numpy().flatten()
                 val_true = y_val_events
-            # Select threshold based on Average Precision (AUPRC) instead of F1
-            best_ap, best_thr = 0.0, 0.5
+            # Select threshold based on chosen metric (AUPRC or F1)
+            best_score, best_thr = 0.0, 0.5
             for t in np.linspace(0.1, 0.9, 81):
                 preds = (val_probs_full >= t).astype(int)
-                ap = average_precision_score(val_true, preds)
-                if ap > best_ap:
-                    best_ap, best_thr = ap, t
-            print(f"[Fold {current_fold + 1}] Best val AUPRC {best_ap:.4f} at threshold {best_thr:.2f}")
+                if args.threshold_metric == 'auprc':
+                    score = average_precision_score(val_true, preds)
+                else:
+                    score = f1_score(val_true, preds)
+                if score > best_score:
+                    best_score, best_thr = score, t
+            print(f"[Fold {current_fold + 1}] Best val {args.threshold_metric.upper()} {best_score:.4f} at threshold {best_thr:.2f}")
             threshold = best_thr
 
         # --- Final Evaluation on Test Set ---
@@ -879,6 +882,8 @@ if __name__ == "__main__":
                         help="Enable leave-one-out cross validation mode (overrides cv_folds)")
     parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
                         help="Train on cv_mode dataset and predict on this dataset")
+    parser.add_argument('--threshold_metric', type=str, choices=['auprc','f1'], default='f1',
+                        help="Metric to optimize threshold on validation: 'auprc' or 'f1'")
     
     args = parser.parse_args()
 

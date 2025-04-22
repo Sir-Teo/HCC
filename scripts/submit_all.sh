@@ -32,7 +32,7 @@ COMMON_ARGS=(
 "--learning_rate 1e-5"
 "--num_samples_per_patient 1"
 "--upsampling"
-"--upsampling_method adasyn"
+"--upsampling_method smote"
 "--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth"
 "--epochs 3000" # Using 1000 as per slurm scripts
 "--early_stopping"
