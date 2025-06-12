@@ -31,6 +31,13 @@ from utils.plotting import (plot_cv_metrics, plot_survival_functions, plot_brier
                       
 sns.set(style="whitegrid")
 
+# Ensure improved preprocessing
+try:
+    import improved_preprocessing_patch as _imp_patch
+    _imp_patch.patch_dataset_preprocessing()
+except Exception as _e:
+    print(f"[WARN] Could not apply improved preprocessing patch in train_nested: {_e}")
+
 # --- Adapted Feature Extraction (from train_binary, handles survival labels) ---
 def extract_features(data_loader, model, device):
     """
@@ -541,13 +548,15 @@ def cross_validation_mode(args):
                     net_i = nn.Linear(in_features, out_features, bias=False)
                 if args.center_risk:
                     net_i = CenteredModel(net_i)
-                model_i = CoxPHWithL1(net_i, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
+                model_i = CoxPHWithL1(net_i, torch.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
                 model_i.optimizer.set_lr(lr)
                 # fit inner model
                 model_i.fit(Xi, (Di, Ei), batch_size=args.batch_size, epochs=min(10, args.epochs), verbose=False)
                 model_i.compute_baseline_hazards()
                 try:
-                    risk_v = -model_i.predict(Xv).reshape(-1)
+                    # Ensure input is tensor, predict, convert back, reshape
+                    Xv_tensor = torch.from_numpy(Xv).float().to(device)
+                    risk_v = -model_i.predict(Xv_tensor).cpu().numpy().reshape(-1)
                     cind = concordance_index(Dv, risk_v, event_observed=Ev)
                     inner_scores.append(cind)
                 except Exception as e:
@@ -578,7 +587,7 @@ def cross_validation_mode(args):
 
         # Instantiate the CoxPH model with L1/L2 regularization
         # Use Adam optimizer by default from pycox
-        model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
+        model = CoxPHWithL1(net, torch.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
         model.optimizer.set_lr(hyperparams['learning_rate'])
         # Note: pycox Adam usually doesn't use weight_decay directly
 
@@ -629,7 +638,9 @@ def cross_validation_mode(args):
 
         # Predict risk scores (negative log partial hazard)
         # Ensure model is in eval mode (usually handled by pycox predict)
-        test_risk_scores = -model.predict(x_test_final).reshape(-1) # Higher score = higher risk
+        # Ensure input is tensor, predict, convert back, reshape
+        x_test_final_tensor = torch.from_numpy(x_test_final).float().to(device)
+        test_risk_scores = -model.predict(x_test_final_tensor).cpu().numpy().reshape(-1) # Higher score = higher risk
         y_test_true_durations = y_test_durations
         y_test_true_events = y_test_events
 
@@ -853,7 +864,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for MLP')
     parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Number of slice samples per patient series')
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'], help='Network type for CoxPH')
-    parser.add_argument('--dinov2_weights', type=str, required=True, help="Path to DINOv2 weights (.pth or .pt).")
+    parser.add_argument('--dinov2_weights', type=str, default=None, help="Path to DINOv2 weights (.pth or .pt). If not provided, uses pretrained ImageNet DINO weights.")
     parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
     parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
     parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")

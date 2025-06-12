@@ -9,12 +9,12 @@ CONDA_ENV_NAME="dinov2"
 # --- Base SLURM Options ---
 # These will be included in every submitted job script
 SBATCH_OPTS=(
-"#SBATCH -p radiology,a100_short,a100_long"      # Partitions
+"#SBATCH -p radiology,a100_short,a100_long,gpu4_short,gpu4_medium,gpu4_long"      # Partitions
 "#SBATCH --gres=gpu:1"                # Request 1 GPU
 "#SBATCH --nodes=1"                   # Request 1 node
 "#SBATCH --ntasks=1"                  # Request 1 task
 "#SBATCH --cpus-per-task=16"          # CPUs per task
-"#SBATCH --mem=120GB"                 # Memory
+"#SBATCH --mem=100GB"                 # Memory
 "#SBATCH --time=12:00:00"             # Max walltime
 "#SBATCH --exclude=a100-4020"         # Exclude specific nodes if needed
 )
@@ -26,17 +26,17 @@ COMMON_ARGS=(
 "--tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC"
 "--tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv"
 "--nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv"
-"--batch_size 16"
+"--batch_size 32"
 "--num_slices 0"
 "--preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/"
 "--learning_rate 1e-5"
+"--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_112499/teacher_checkpoint.pth"
 "--num_samples_per_patient 1"
 "--upsampling"
 "--upsampling_method smote"
-"--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth"
-"--epochs 3000" # Using 1000 as per slurm scripts
+"--epochs 1000" # Using 1000 as per slurm scripts
 "--early_stopping"
-"--early_stopping_patience 20"
+"--early_stopping_patience 10"
 # --cross_validation is implicitly handled by running these scripts
 )
 
@@ -141,10 +141,10 @@ for script_name in "train.py" "train_binary.py"; do
         echo "" >> "$TEMP_SLURM_SCRIPT"
 
         echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"srun $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"srun --cpu-bind=none $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
         echo "" >> "$TEMP_SLURM_SCRIPT"
         
-        echo "srun $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
+        echo "srun --cpu-bind=none $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
         echo "" >> "$TEMP_SLURM_SCRIPT"
         echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
 
@@ -251,10 +251,10 @@ for script_name in "train.py" "train_binary.py"; do
             echo "" >> "$TEMP_SLURM_SCRIPT"
 
             echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
-            echo "echo \"srun $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
+            echo "echo \"srun --cpu-bind=none $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
             echo "" >> "$TEMP_SLURM_SCRIPT"
             
-            echo "srun $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
+            echo "srun --cpu-bind=none $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
             echo "" >> "$TEMP_SLURM_SCRIPT"
             echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
 

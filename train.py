@@ -31,6 +31,13 @@ from utils.plotting import (plot_cv_metrics, plot_survival_functions, plot_brier
                       
 sns.set(style="whitegrid")
 
+# Ensure improved preprocessing is used for every DICOM slice
+try:
+    import improved_preprocessing_patch as _imp_patch
+    _imp_patch.patch_dataset_preprocessing()
+except Exception as _e:
+    print(f"[WARN] Could not apply improved preprocessing patch: {_e}")
+
 # --- Adapted Feature Extraction (from train_binary, handles survival labels) ---
 def extract_features(data_loader, model, device):
     """
@@ -805,7 +812,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for MLP')
     parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Number of slice samples per patient series')
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'], help='Network type for CoxPH')
-    parser.add_argument('--dinov2_weights', type=str, required=True, help="Path to DINOv2 weights (.pth or .pt).")
+    parser.add_argument('--dinov2_weights', type=str, default=None, help="Path to DINOv2 weights (.pth or .pt). If not provided, uses pretrained ImageNet DINO weights.")
     parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
     parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
     parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")

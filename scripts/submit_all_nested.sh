@@ -9,12 +9,12 @@ CONDA_ENV_NAME="dinov2"
 # --- Base SLURM Options ---
 # These will be included in every submitted job script
 SBATCH_OPTS=(
-"#SBATCH -p radiology,a100_short,a100_long"      # Partitions
+"#SBATCH -p radiology,a100_short,a100_long,gpu4_medium,gpu4_long,gpu4_short,gpu8_short,gpu8_medium,gpu8_long"      # Partitions
 "#SBATCH --gres=gpu:1"                # Request 1 GPU
 "#SBATCH --nodes=1"                   # Request 1 node
 "#SBATCH --ntasks=1"                  # Request 1 task
 "#SBATCH --cpus-per-task=16"          # CPUs per task
-"#SBATCH --mem=120GB"                 # Memory
+"#SBATCH --mem=100GB"                 # Memory
 "#SBATCH --time=12:00:00"             # Max walltime
 "#SBATCH --exclude=a100-4020"         # Exclude specific nodes if needed
 )
@@ -26,16 +26,16 @@ COMMON_ARGS=(
 "--tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC"
 "--tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv"
 "--nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv"
-"--batch_size 16"
+"--batch_size 32"
 "--num_slices 0" 
 "--preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/"
 "--num_samples_per_patient 1"
+"--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_112499/teacher_checkpoint.pth"
 "--upsampling"
 "--upsampling_method smote"
-"--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments_large_dataset/eval/training_124999/teacher_checkpoint.pth"
-"--epochs 3000"
+"--epochs 5000"
 "--early_stopping"
-"--early_stopping_patience 20"
+"--early_stopping_patience 5"
 # Default learning rate for outer loop, can be overridden
 "--learning_rate 1e-5"
 # Nested CV specific arguments (defaults from python script used here)
@@ -48,15 +48,15 @@ COMMON_ARGS=(
 SURVIVAL_ARGS=(
 "--center_risk"
 "--coxph_net mlp"
-"--alpha 0.5"
-"--gamma 0.5"
+"--alpha 0.3"
+"--gamma 0.3"
 # Default LR grid for survival
-"--learning_rates 1e-8 5e-8 1e-7 5e-6 1e-6 5e-5 1e-5 1e-4 1e-3"
+"--learning_rates 1e-8 5e-8 1e-7 5e-6 1e-6 5e-5 1e-5 1e-4 1e-3 1e-2"
 )
 
 BINARY_ARGS=(
 # Default LR grid for binary
-"--learning_rates 1e-8 5e-8 1e-7 5e-6 1e-6 5e-5 1e-5 1e-4 1e-3"
+"--learning_rates 1e-8 5e-8 1e-7 5e-6 1e-6 5e-5 1e-5 1e-4 1e-3 1e-2"
 )
 
 
@@ -152,10 +152,10 @@ for script_name in "train_nested.py" "train_binary_nested.py"; do
         echo "" >> "$TEMP_SLURM_SCRIPT"
 
         echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"srun $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
+        echo "echo \"srun --cpu-bind=none $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
         echo "" >> "$TEMP_SLURM_SCRIPT"
 
-        echo "srun $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
+        echo "srun --cpu-bind=none $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
         echo "" >> "$TEMP_SLURM_SCRIPT"
         echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
 
@@ -286,10 +286,10 @@ for script_name in "train_nested.py" "train_binary_nested.py"; do
 
             echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
             # Use echo -e to handle potential newlines if PYTHON_CMD gets complex
-            echo "echo -e \"srun $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
+            echo "echo -e \"srun --cpu-bind=none $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
             echo "" >> "$TEMP_SLURM_SCRIPT"
 
-            echo "srun $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
+            echo "srun --cpu-bind=none $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
             echo "" >> "$TEMP_SLURM_SCRIPT"
             echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
 

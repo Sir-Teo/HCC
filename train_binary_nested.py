@@ -29,6 +29,13 @@ from torch.utils.data import DataLoader
 from imblearn.over_sampling import SMOTE, ADASYN
 import json # Add json import
 
+# Ensure improved preprocessing
+try:
+    import improved_preprocessing_patch as _imp_patch
+    _imp_patch.patch_dataset_preprocessing()
+except Exception as _e:
+    print(f"[WARN] Could not apply improved preprocessing patch in train_binary_nested: {_e}")
+
 sns.set(style="whitegrid")
 
 # --- Feature Extraction --- 
@@ -863,8 +870,8 @@ if __name__ == "__main__":
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample slices from each patient series')
-    parser.add_argument('--dinov2_weights', type=str, required=True,
-                        help="Path to your local DINOv2 state dict file (.pth or .pt).")
+    parser.add_argument('--dinov2_weights', type=str, default=None,
+                        help="Path to your local DINOv2 state dict file (.pth or .pt). If not provided, uses pretrained ImageNet DINO weights.")
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data for each fold")
     parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
@@ -882,7 +889,7 @@ if __name__ == "__main__":
                         help="Enable leave-one-out cross validation mode (overrides cv_folds)")
     parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
                         help="Train on cv_mode dataset and predict on this dataset")
-    parser.add_argument('--threshold_metric', type=str, choices=['auprc','f1'], default='f1',
+    parser.add_argument('--threshold_metric', type=str, choices=['auprc','f1'], default='auprc',
                         help="Metric to optimize threshold on validation: 'auprc' or 'f1'")
     
     args = parser.parse_args()

@@ -29,6 +29,13 @@ from torch.utils.data import DataLoader
 from imblearn.over_sampling import SMOTE, ADASYN
 import json # Add json import
 
+# Ensure improved preprocessing is applied
+try:
+    import improved_preprocessing_patch as _imp_patch
+    _imp_patch.patch_dataset_preprocessing()
+except Exception as _e:
+    print(f"[WARN] Could not apply improved preprocessing patch in train_binary: {_e}")
+
 sns.set(style="whitegrid")
 
 # --- Feature Extraction --- 
@@ -422,16 +429,28 @@ def cross_validation_mode(args):
         # SMOTE upsampling (optional, by dataset)
         if args.upsampling and args.upsampling_method == 'smote':
             print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE upsampling by dataset for binary...")
-            smote = SMOTE(random_state=42)
             X_parts, y_parts, info_parts = [], [], []
             for ds in set(info.get('dataset_type','Unknown') for info in train_patient_info):
-                idxs = [i for i,info in enumerate(train_patient_info) if info.get('dataset_type')==ds]
+                idxs = [i for i, info in enumerate(train_patient_info) if info.get('dataset_type') == ds]
                 Xg = x_train_final[idxs]
                 yg = y_train_events[idxs]
-                X_res, y_res = smote.fit_resample(Xg, yg)
-                pi = [info for info in train_patient_info if info.get('dataset_type')==ds]
-                # repeat info list to match new samples
-                pi_res = pi + [pi[i % len(pi)] for i in range(len(y_res)-len(pi))]
+                # Determine dynamic k_neighbors based on minority count
+                classes, counts = np.unique(yg, return_counts=True)
+                if len(classes) > 1:
+                    n_minority = counts.min()
+                    k = min(5, n_minority - 1)
+                    if k >= 1:
+                        smote = SMOTE(random_state=42, k_neighbors=k)
+                        X_res, y_res = smote.fit_resample(Xg, yg)
+                    else:
+                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: minority class too small for SMOTE (n_minority={n_minority}). Skipping SMOTE.")
+                        X_res, y_res = Xg, yg
+                else:
+                    print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: single-class group. Skipping SMOTE.")
+                    X_res, y_res = Xg, yg
+                # Repeat patient_info entries to match new samples
+                pi = [info for info in train_patient_info if info.get('dataset_type') == ds]
+                pi_res = pi + [pi[i % len(pi)] for i in range(len(y_res) - len(pi))]
                 X_parts.append(X_res)
                 y_parts.append(y_res)
                 info_parts.extend(pi_res)
@@ -799,8 +818,8 @@ if __name__ == "__main__":
                         help='Gradient clipping threshold. Set 0 to disable.')
     parser.add_argument('--num_samples_per_patient', type=int, default=1,
                         help='Number of times to sample slices from each patient series')
-    parser.add_argument('--dinov2_weights', type=str, required=True,
-                        help="Path to your local DINOv2 state dict file (.pth or .pt).")
+    parser.add_argument('--dinov2_weights', type=str, default=None,
+                        help="Path to your local DINOv2 state dict file (.pth or .pt). If not provided, uses pretrained ImageNet DINO weights.")
     parser.add_argument('--upsampling', action='store_true',
                         help="If set, perform upsampling of the minority class in the training data for each fold")
     parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
@@ -818,7 +837,7 @@ if __name__ == "__main__":
                         help="Enable leave-one-out cross validation mode (overrides cv_folds)")
     parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
                         help="Train on cv_mode dataset and predict on this dataset")
-    parser.add_argument('--threshold_metric', type=str, choices=['auprc','f1'], default='f1',
+    parser.add_argument('--threshold_metric', type=str, choices=['auprc','f1'], default='auprc',
                         help="Metric to optimize threshold on validation: 'auprc' or 'f1'")
     
     args = parser.parse_args()
