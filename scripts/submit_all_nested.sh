@@ -6,6 +6,30 @@ BASE_OUTPUT_DIR_SURVIVAL="checkpoints_survival_nested_cv" # Base output for trai
 BASE_OUTPUT_DIR_BINARY="checkpoints_binary_nested_cv"   # Base output for train_binary_nested.py results
 CONDA_ENV_NAME="dinov2"
 
+# --- Weight Configuration ---
+# Parse command line argument for weight selection
+WEIGHT_TYPE="$1"
+
+# Weight paths
+LOCAL_WEIGHTS="/gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_112499/teacher_checkpoint.pth"
+PRETRAINED_WEIGHTS="./dinov2/pretrained_weights/dinov2_vitl14_pretrain.pth"
+
+# Select weights based on command line argument
+if [ "$WEIGHT_TYPE" == "pretrain" ]; then
+    DINOV2_WEIGHTS="$PRETRAINED_WEIGHTS"
+    WEIGHT_SUFFIX="pretrain"
+    echo "Using pretrained weights: $DINOV2_WEIGHTS"
+elif [ "$WEIGHT_TYPE" == "local" ]; then
+    DINOV2_WEIGHTS="$LOCAL_WEIGHTS"
+    WEIGHT_SUFFIX="local"
+    echo "Using local weights: $DINOV2_WEIGHTS"
+else
+    echo "Usage: $0 [pretrain|local]"
+    echo "  pretrain - Use pretrained DinoV2 weights"
+    echo "  local    - Use local trained weights"
+    exit 1
+fi
+
 # --- Base SLURM Options ---
 # These will be included in every submitted job script
 SBATCH_OPTS=(
@@ -30,7 +54,7 @@ COMMON_ARGS=(
 "--num_slices 0" 
 "--preprocessed_root /gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/"
 "--num_samples_per_patient 1"
-"--dinov2_weights /gpfs/data/shenlab/wz1492/HCC/dinov2/experiments/eval/training_112499/teacher_checkpoint.pth"
+"--dinov2_weights $DINOV2_WEIGHTS"
 "--upsampling"
 "--upsampling_method smote"
 "--epochs 5000"
@@ -66,107 +90,7 @@ mkdir -p "$LOG_DIR"
 # --- Loop and Submit ---
 echo "Starting NESTED CV SLURM job submission loop..."
 
-# --- Submit Cross-dataset Evaluation Jobs ---
-echo "Submitting NESTED cross-dataset evaluation jobs (train on X, test on Y)..."
 
-# Configurations for cross-dataset evaluation:
-# Train on NYU, predict on TCGA
-# Train on TCGA, predict on NYU
-for script_name in "train_nested.py" "train_binary_nested.py"; do
-    echo "  Cross-Dataset Evaluation for Script: $script_name"
-
-    specific_args=()
-    base_output_dir=""
-    if [ "$script_name" == "train_nested.py" ]; then
-        specific_args=("${SURVIVAL_ARGS[@]}")
-        base_output_dir="$BASE_OUTPUT_DIR_SURVIVAL"
-    else # train_binary_nested.py
-        specific_args=("${BINARY_ARGS[@]}")
-        base_output_dir="$BASE_OUTPUT_DIR_BINARY"
-    fi
-
-    # Cross-dataset scenarios
-    for cross_mode in "nyu_to_tcga" "tcga_to_nyu"; do
-        echo "    Mode: $cross_mode"
-
-        # Parse train and test sources
-        if [ "$cross_mode" == "nyu_to_tcga" ]; then
-            train_source="nyu"
-            test_source="tcga"
-        else
-            train_source="tcga"
-            test_source="nyu"
-        fi
-
-        # --- Construct Job Name and Log File Path ---
-        script_prefix="${script_name%.py}" # train_nested or train_binary_nested
-        JOB_NAME="hcc_${script_prefix}_${cross_mode}"
-        LOG_FILE="${LOG_DIR}/${JOB_NAME}_%J.log" # %J is the SLURM job ID
-
-        # --- Construct Output Directory for Python Script ---
-        PYTHON_OUTPUT_BASE="${base_output_dir}/nested_cross_${cross_mode}"
-
-        # --- Prepare Python Command ---
-        PYTHON_CMD="python $script_name"
-        PYTHON_CMD="$PYTHON_CMD ${COMMON_ARGS[*]}"
-        PYTHON_CMD="$PYTHON_CMD ${specific_args[*]}"
-        PYTHON_CMD="$PYTHON_CMD --cross_validation" # Still use CV infrastructure
-        PYTHON_CMD="$PYTHON_CMD --cv_mode $train_source" # Train on this dataset
-        PYTHON_CMD="$PYTHON_CMD --cv_folds 1" # Special case - one fold for cross-dataset prediction
-        PYTHON_CMD="$PYTHON_CMD --output_dir $PYTHON_OUTPUT_BASE"
-        # Add argument to switch test dataset
-        PYTHON_CMD="$PYTHON_CMD --cross_predict $test_source"
-
-        # --- Create Temporary Job Script ---
-        TEMP_SLURM_SCRIPT=$(mktemp /tmp/hcc_nested_job_XXXXXX.slurm)
-
-        echo "#!/bin/bash" > "$TEMP_SLURM_SCRIPT"
-        # Add SBATCH options
-        for opt in "${SBATCH_OPTS[@]}"; do
-            echo "$opt" >> "$TEMP_SLURM_SCRIPT"
-        done
-        # Add job-specific name and output
-        echo "#SBATCH --job-name=$JOB_NAME" >> "$TEMP_SLURM_SCRIPT"
-        echo "#SBATCH --output=$LOG_FILE" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-
-        # Add commands to run
-        echo "echo \"--- Starting NESTED SLURM Job --- \"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"Job Name: \$SLURM_JOB_NAME (\$SLURM_JOB_ID)\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"Running on: \$SLURMD_NODENAME\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"GPU: \$CUDA_VISIBLE_DEVICES\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"Conda Env: $CONDA_ENV_NAME\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"Python Script: $script_name\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"Cross-Dataset Mode: Train on $train_source, Test on $test_source\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"--------------------------\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-
-        echo "nvidia-smi" >> "$TEMP_SLURM_SCRIPT"
-        echo "nvcc --version" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-
-        echo "# Load modules and activate environment" >> "$TEMP_SLURM_SCRIPT"
-        echo "module load gcc/8.1.0" >> "$TEMP_SLURM_SCRIPT"
-        echo "source ~/.bashrc" >> "$TEMP_SLURM_SCRIPT"
-        echo "conda activate $CONDA_ENV_NAME" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-
-        echo "echo \"Executing command:\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"srun --cpu-bind=none $PYTHON_CMD\"" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-
-        echo "srun --cpu-bind=none $PYTHON_CMD" >> "$TEMP_SLURM_SCRIPT"
-        echo "" >> "$TEMP_SLURM_SCRIPT"
-        echo "echo \"--- SLURM Job Finished --- \"" >> "$TEMP_SLURM_SCRIPT"
-
-        # --- Submit Job ---
-        echo "  Submitting: $JOB_NAME (Log: ${LOG_FILE/\%J/<job_id>})"
-        sbatch "$TEMP_SLURM_SCRIPT"
-
-        # Clean up temporary script
-        rm "$TEMP_SLURM_SCRIPT"
-    done # cross_mode
-done # script_name
 
 # Nested CV mode jobs
 for script_name in "train_nested.py" "train_binary_nested.py"; do
@@ -200,7 +124,7 @@ for script_name in "train_nested.py" "train_binary_nested.py"; do
 
             # --- Construct Job Name and Log File Path ---
             script_prefix="${script_name%.py}" # train_nested or train_binary_nested
-            JOB_NAME="hcc_${script_prefix}_${mode}_${fold_suffix}"
+            JOB_NAME="hcc_${script_prefix}_${mode}_${fold_suffix}_${WEIGHT_SUFFIX}"
             LOG_FILE="${LOG_DIR}/${JOB_NAME}_%J.log" # %J is the SLURM job ID
 
             # --- Construct Output Directory for Python Script ---

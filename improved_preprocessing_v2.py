@@ -9,6 +9,11 @@ import pydicom
 from scipy import ndimage
 from skimage import exposure, filters
 import warnings
+# ADD SimpleITK import for bias field correction
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
 warnings.filterwarnings('ignore')
 
 class ImprovedPreprocessor:
@@ -107,58 +112,127 @@ class ImprovedPreprocessor:
     def domain_adaptation_normalization(self, image, target_mean=0.5, target_std=0.2):
         """
         Normalize images to have consistent statistics across domains.
+        Statistics are computed only on foreground (non-zero) voxels to avoid
+        biasing by padded background.
         """
-        # Compute current statistics
-        current_mean = np.mean(image)
-        current_std = np.std(image)
-        
+        # Determine foreground mask
+        mask = image > 0
+        if np.sum(mask) < 10:  # Not enough foreground, skip
+            return image
+
+        fg_pixels = image[mask]
+        current_mean = float(np.mean(fg_pixels))
+        current_std = float(np.std(fg_pixels))
+
         if current_std > 1e-8:
-            # Standardize then rescale to target distribution
             image_norm = (image - current_mean) / current_std
             image_norm = image_norm * target_std + target_mean
             image_norm = np.clip(image_norm, 0, 1)
         else:
             image_norm = np.full_like(image, target_mean)
-            
+
         return image_norm
+    
+    def bias_field_correction(self, image):
+        """
+        Apply N4 bias-field correction to reduce intensity inhomogeneity.
+        If SimpleITK is not available, the input image is returned unchanged.
+        """
+        if sitk is None:
+            return image
+        try:
+            itk_img = sitk.GetImageFromArray(image.astype(np.float32))
+            corrector = sitk.N4BiasFieldCorrectionImageFilter()
+            # A small number of iterations keeps runtime low for single 2D slices
+            corrector.SetMaximumNumberOfIterations([50])
+            corrected = corrector.Execute(itk_img)
+            return sitk.GetArrayFromImage(corrected)
+        except Exception:
+            # Fallback – if correction fails, return the original slice
+            return image
+
+    def remove_background(self, image):
+        """
+        Suppress background air signal using Otsu thresholding and morphological filling.
+        The input image is assumed to be roughly scaled to [0,1].
+        """
+        try:
+            thresh = filters.threshold_otsu(image)
+            mask = image > thresh
+            mask = ndimage.binary_fill_holes(mask)
+            return image * mask.astype(np.float32)
+        except Exception:
+            return image
+    
+    def crop_foreground(self, image, padding=5):
+        """
+        Crop the image to the bounding box of non-zero pixels with optional padding.
+        If the slice is mostly background, returns the original image.
+        """
+        coords = np.argwhere(image > 0)
+        if coords.size == 0:
+            return image  # nothing to crop
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0) + 1  # slice end index
+        # Apply padding and clamp
+        y_min = max(y_min - padding, 0)
+        x_min = max(x_min - padding, 0)
+        y_max = min(y_max + padding, image.shape[0])
+        x_max = min(x_max + padding, image.shape[1])
+        return image[y_min:y_max, x_min:x_max]
     
     def preprocess_slice(self, image, sequence_name='', apply_domain_adaptation=True):
         """
-        Complete preprocessing pipeline for a single slice.
+        Complete preprocessing pipeline for a single MRI slice. The steps are:
+        0) Bias-field correction (if SimpleITK available)
+        1) Robust percentile normalisation to [0,1]
+        2) Background suppression using Otsu threshold
+        3) Crop to foreground to minimise zero padding before resizing
+        4) Optional sequence-specific tweaks (contrast/gamma, etc.)
+        5) Domain-adaptation normalisation (mean/std alignment)
         """
-        # Ensure image is 2D
+        # Ensure 2D
         if len(image.shape) > 2:
             image = image.squeeze()
-        
+
         # Convert to float32
         image = image.astype(np.float32)
-        
-        # Handle edge cases
+
+        # Handle empty slices quickly
         if np.all(image == 0):
             return np.zeros_like(image)
-        
+
         try:
-            # Step 1: Sequence-specific preprocessing
+            # Step 0: Bias-field correction
+            image = self.bias_field_correction(image)
+
+            # Step 1: Initial robust intensity normalisation
+            image = self.robust_intensity_normalization(image, method='percentile')
+
+            # Step 2: Remove background signal
+            image = self.remove_background(image)
+
+            # NEW: Crop to foreground to minimise zero padding before resizing
+            image = self.crop_foreground(image)
+
+            # Step 3: Sequence-specific adjustments (lightweight)
             image = self.sequence_specific_preprocessing(image, sequence_name)
-            
-            # Step 2: Enhance image quality
-            image = self.enhance_image_quality(image)
-            
-            # Step 3: Domain adaptation normalization
+
+            # Step 4: Domain alignment
             if apply_domain_adaptation:
                 image = self.domain_adaptation_normalization(image)
-            
-            # Step 4: Final intensity normalization to [0, 1]
+
+            # Final clamp to [0,1]
             image = np.clip(image, 0, 1)
-            
+
         except Exception as e:
             print(f"Warning: Preprocessing failed for sequence '{sequence_name}': {e}")
-            # Fallback to simple normalization
+            # Fallback to simple min-max
             if image.max() > image.min():
                 image = (image - image.min()) / (image.max() - image.min())
             else:
                 image = np.zeros_like(image)
-        
+
         return image
 
 def test_preprocessing_on_outliers():
