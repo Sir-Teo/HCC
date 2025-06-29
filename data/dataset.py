@@ -381,6 +381,21 @@ class HCCDataModule:
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225])
         ])
+        
+        # Ensure the normalization uses float32 - wrap the transform
+        original_transform = self.transform
+        def float32_transform(tensor):
+            # Ensure input is float32
+            if tensor.dtype != torch.float32:
+                tensor = tensor.float()
+            # Apply original transform
+            result = original_transform(tensor)
+            # Ensure output is float32
+            if result.dtype != torch.float32:
+                result = result.float()
+            return result
+        
+        self.transform = float32_transform
 
     def _build_patient_list(self, csv_file, dicom_root, dataset_type):
         """Builds the list of patient data dictionaries from DICOM directories and CSV.
