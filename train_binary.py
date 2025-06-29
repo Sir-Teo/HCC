@@ -633,16 +633,15 @@ def cross_validation_mode(args):
     all_fold_results = [] # Store results dictionary for each test patient
     fold_test_accuracies = [] # Store accuracy per fold for averaging
 
-    # --- Cross-Validation Loop --- 
-    current_fold = -1 # Initialize fold counter
-    while True:
-        # Set up the next fold first
-        if not data_module.next_fold():
-            print("\n===== Finished all folds =====")
-            break
-        
-        current_fold += 1
-        print(f"\n===== Processing Fold {current_fold}/{data_module.get_total_folds()} =====")
+    # --- Cross-Validation Loop ---
+    total_folds = data_module.get_total_folds()
+    print(f"[INFO] Starting cross-validation with {total_folds} folds…")
+
+    for current_fold in range(total_folds):
+        # Explicitly set up the desired fold (guarantees each fold is processed)
+        data_module._setup_fold(current_fold)
+
+        print(f"\n===== Processing Fold {current_fold}/{total_folds} =====")
 
         # Get dataloaders for current fold
         train_loader = data_module.train_dataloader()
@@ -1026,10 +1025,7 @@ def cross_validation_mode(args):
             }
             all_fold_results.append(fold_results)
 
-        # --- Move to Next Fold --- 
-        if not data_module.next_fold():
-            print("\n===== Finished all folds =====")
-            break
+    print("\n===== Finished all folds =====")
 
     # --- Aggregation and Final Reporting --- 
     if not all_fold_results:
