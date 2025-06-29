@@ -21,8 +21,6 @@ conda activate dinov2
 
 srun python train.py \
     --nyu_dicom_root  /gpfs/data/mankowskilab/HCC_Recurrence/dicom \
-    --tcga_dicom_root /gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC \
-    --tcga_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv \
     --nyu_csv_file /gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv \
     --batch_size 32 \
     --num_slices  0\
@@ -38,6 +36,7 @@ srun python train.py \
     --alpha 0.5 \
     --gamma 0.5 \
     --early_stopping \
+    --cv_folds 7 \
 
 
 

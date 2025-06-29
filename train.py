@@ -635,7 +635,7 @@ if __name__ == "__main__":
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
     parser.add_argument('--early_stopping_patience', type=int, default=20, help="Patience epochs for early stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable cross validation mode")
-    parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds")
+    parser.add_argument('--cv_folds', type=int, default=7, help="Number of CV folds")
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
     
     args = parser.parse_args()

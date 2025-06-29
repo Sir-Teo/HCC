@@ -125,35 +125,41 @@ class HCCDicomDataset(Dataset):
 
             # --- Check for empty stack --- 
             if full_stack.size(0) == 0:
-                 if DEBUG:
-                     print(f"[DEBUG] Skipping patient {patient_id} ({dataset_type}) in __getitem__ due to empty full_stack.")
-                 return None # Signal to collate_fn to skip this sample
-
-            if self.num_slices <= 0:
-                # Use the entire axial series as one sub-stack
-                if self.transform is not None:
-                    # Apply transform to each slice
-                    transformed = [self.transform(s) for s in full_stack]
-                    full_stack = torch.stack(transformed, dim=0)
-                # Pool across slice dimension to unify to one slice per patient
-                # full_stack: [total_slices, C, H, W] -> permute to [1, C, total_slices, H, W]
-                full_stack = full_stack.permute(1, 0, 2, 3).unsqueeze(0)
-                # Adaptive pooling to collapse slice dimension
-                pooled = F.adaptive_avg_pool3d(full_stack, (1, full_stack.size(3), full_stack.size(4)))
-                # pooled: [1, C, 1, H, W] -> get back to [1, C, H, W]
-                pooled = pooled.squeeze(2)
-                # Final sub_stacks: [num_samples=1, num_slices=1, C, H, W]
-                sub_stacks = pooled.unsqueeze(0)
+                if DEBUG:
+                    print(f"[DEBUG] Patient {patient_id} ({dataset_type}) has empty stack, using zero tensor placeholders.")
+                # Instead of returning None (which gets filtered out), return zero tensors
+                # This ensures ALL patients are included in the analysis
+                if self.num_slices <= 0:
+                    sub_stacks = torch.zeros(1, 1, 3, 224, 224)  # [1, 1, C, H, W]
+                else:
+                    sub_stacks = torch.zeros(self.num_samples, self.num_slices, 3, 224, 224)
             else:
-                # Generate num_samples 3D sub-stacks (each with num_slices)
-                stacks = []
-                for _ in range(self.num_samples):
-                    sub = self.sample_sub_stack(full_stack)
+                # Normal sampling for patients with valid images
+                if self.num_slices <= 0:
+                    # Use the entire axial series as one sub-stack
                     if self.transform is not None:
-                        sub = torch.stack([self.transform(s) for s in sub], dim=0)
-                    stacks.append(sub)
-                # Shape: [num_samples, num_slices, C, H, W]
-                sub_stacks = torch.stack(stacks, dim=0)
+                        # Apply transform to each slice
+                        transformed = [self.transform(s) for s in full_stack]
+                        full_stack = torch.stack(transformed, dim=0)
+                    # Pool across slice dimension to unify to one slice per patient
+                    # full_stack: [total_slices, C, H, W] -> permute to [1, C, total_slices, H, W]
+                    full_stack = full_stack.permute(1, 0, 2, 3).unsqueeze(0)
+                    # Adaptive pooling to collapse slice dimension
+                    pooled = F.adaptive_avg_pool3d(full_stack, (1, full_stack.size(3), full_stack.size(4)))
+                    # pooled: [1, C, 1, H, W] -> get back to [1, C, H, W]
+                    pooled = pooled.squeeze(2)
+                    # Final sub_stacks: [num_samples=1, num_slices=1, C, H, W]
+                    sub_stacks = pooled.unsqueeze(0)
+                else:
+                    # Generate num_samples 3D sub-stacks (each with num_slices)
+                    stacks = []
+                    for _ in range(self.num_samples):
+                        sub = self.sample_sub_stack(full_stack)
+                        if self.transform is not None:
+                            sub = torch.stack([self.transform(s) for s in sub], dim=0)
+                        stacks.append(sub)
+                    # Shape: [num_samples, num_slices, C, H, W]
+                    sub_stacks = torch.stack(stacks, dim=0)
 
         # Return according to model type
         if self.model_type == "linear":
@@ -563,14 +569,28 @@ class HCCDataModule:
 
         # Setup splits based on whether cross_validation is enabled
         if self.cross_validation:
-            # For cross-validation, only use patients with clinical data (not None events)
-            # but keep all patients in the overall dataset for feature extraction
-            cv_patients = [p for p in self.all_patients if p.get('event') is not None]
-            cv_indices = [i for i, p in enumerate(self.all_patients) if p.get('event') is not None]
+            # Use ALL patients for cross-validation (as requested by user)
+            # First, ensure all patients have valid event/time data by updating self.all_patients directly
+            patients_with_clinical = 0
+            patients_dicom_only = 0
+            
+            for i, p in enumerate(self.all_patients):
+                if p.get('event') is not None:
+                    patients_with_clinical += 1
+                else:
+                    # DICOM-only patient - assign default values directly to self.all_patients
+                    self.all_patients[i]['event'] = 0  # Default to negative event
+                    self.all_patients[i]['time'] = 365.0  # Default survival time
+                    patients_dicom_only += 1
+            
+            # Now all patients have valid event data, create CV setup
+            cv_patients = self.all_patients
+            cv_indices = list(range(len(self.all_patients)))
             patient_events = [p['event'] for p in cv_patients]
             
-            print(f"Using {len(cv_patients)} patients with clinical data for cross-validation splits")
-            print(f"(Total dataset includes {len(self.all_patients)} patients, including {len(self.all_patients) - len(cv_patients)} DICOM-only patients)")
+            print(f"Using ALL {len(cv_patients)} patients for cross-validation splits")
+            print(f"  - {patients_with_clinical} patients with clinical data")
+            print(f"  - {patients_dicom_only} DICOM-only patients (assigned event=0 for CV)")
 
             if self.leave_one_out:
                 from sklearn.model_selection import LeaveOneOut
@@ -611,11 +631,18 @@ class HCCDataModule:
             self.val_dataset = None
             self.test_dataset = None
         else:
-            # Standard train/val/test split - also filter patients with clinical data
-            cv_patients = [p for p in self.all_patients if p.get('event') is not None]
-            cv_indices = [i for i, p in enumerate(self.all_patients) if p.get('event') is not None]
+            # Standard train/val/test split - use ALL patients
+            # First ensure all patients have valid event/time data
+            for i, p in enumerate(self.all_patients):
+                if p.get('event') is None:
+                    # DICOM-only patient - assign default values
+                    self.all_patients[i]['event'] = 0
+                    self.all_patients[i]['time'] = 365.0
             
-            print(f"Using {len(cv_patients)} patients with clinical data for train/val/test splits")
+            cv_patients = self.all_patients
+            cv_indices = list(range(len(self.all_patients)))
+            
+            print(f"Using ALL {len(cv_patients)} patients for train/val/test splits")
             
             from sklearn.model_selection import train_test_split
             train_temp, test_temp = train_test_split(
