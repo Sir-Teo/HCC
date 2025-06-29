@@ -238,21 +238,55 @@ def patch_dataset_preprocessing_v3():
         from data.dataset import HCCDicomDataset
         
         # Store original preprocessing method
-        if not hasattr(HCCDicomDataset, '_original_preprocess_slice_v3'):
-            HCCDicomDataset._original_preprocess_slice_v3 = HCCDicomDataset._preprocess_slice
+        if not hasattr(HCCDicomDataset, '_original_dicom_to_tensor_v3'):
+            HCCDicomDataset._original_dicom_to_tensor_v3 = HCCDicomDataset.dicom_to_tensor
         
-        def enhanced_preprocess_slice(self, image_slice):
-            """Enhanced preprocessing with v3 improvements"""
+        def enhanced_dicom_to_tensor(self, dcm):
+            """Enhanced DICOM to tensor with v3 preprocessing improvements"""
+            # Get original pixel array
+            img = dcm.pixel_array.astype(np.float32)
+            img_min, img_max = img.min(), img.max()
+            
+            # Normalize to [0, 1]
+            if img_max > img_min:
+                img = (img - img_min) / (img_max - img_min)
+            else:
+                img = np.zeros_like(img)
+            
+            # Apply advanced v3 preprocessing
             preprocessor = get_advanced_preprocessor()
-            return preprocessor.process_slice(image_slice)
+            img = preprocessor.process_slice(img)
+            
+            # Ensure 3 channels for RGB
+            if img.ndim == 2:
+                img = np.repeat(img[..., np.newaxis], 3, axis=-1)
+            elif img.ndim == 3 and img.shape[2] == 1:
+                img = np.repeat(img, 3, axis=-1)
+            elif img.ndim == 3 and img.shape[2] != 3:
+                print(f"[WARN] Unexpected channel count {img.shape[2]}, taking first channel.")
+                img = img[:,:,0:1]
+                img = np.repeat(img, 3, axis=-1)
+            
+            # Convert to tensor and resize
+            tensor_img = torch.from_numpy(img).permute(2, 0, 1)
+            
+            # Resize tensor_img to (3, 224, 224) using torch.nn.functional.interpolate
+            if tensor_img.shape[1:] != (224, 224):
+                tensor_img = tensor_img.unsqueeze(0)  # add batch dim for interpolate
+                tensor_img = torch.nn.functional.interpolate(tensor_img, size=(224, 224), mode='bilinear', align_corners=False)
+                tensor_img = tensor_img.squeeze(0)  # remove batch dim
+            
+            return tensor_img
         
         # Patch the method
-        HCCDicomDataset._preprocess_slice = enhanced_preprocess_slice
+        HCCDicomDataset.dicom_to_tensor = enhanced_dicom_to_tensor
         
-        print("[INFO] Advanced preprocessing v3 patch applied successfully")
+        print("✅ Successfully patched HCCDicomDataset.dicom_to_tensor with advanced preprocessing v3!")
         
     except Exception as e:
         print(f"[WARN] Could not apply advanced preprocessing v3 patch: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Auto-apply patch when imported
 if __name__ != "__main__":
