@@ -105,40 +105,55 @@ class HCCDicomDataset(Dataset):
         patient_id = patient['patient_id']
         dataset_type = patient['dataset_type'] # Get type for this patient
 
-        # Load the entire axial series (as a single 4D tensor: [total_slices, C, H, W]).
-        full_stack = self.load_axial_series(dicom_dir, patient_id, dataset_type)
-
-        # --- Check for empty stack --- 
-        if full_stack.size(0) == 0:
-             if DEBUG:
-                 print(f"[DEBUG] Skipping patient {patient_id} ({dataset_type}) in __getitem__ due to empty full_stack.")
-             return None # Signal to collate_fn to skip this sample
-
-        if self.num_slices <= 0:
-            # Use the entire axial series as one sub-stack
-            if self.transform is not None:
-                # Apply transform to each slice
-                transformed = [self.transform(s) for s in full_stack]
-                full_stack = torch.stack(transformed, dim=0)
-            # Pool across slice dimension to unify to one slice per patient
-            # full_stack: [total_slices, C, H, W] -> permute to [1, C, total_slices, H, W]
-            full_stack = full_stack.permute(1, 0, 2, 3).unsqueeze(0)
-            # Adaptive pooling to collapse slice dimension
-            pooled = F.adaptive_avg_pool3d(full_stack, (1, full_stack.size(3), full_stack.size(4)))
-            # pooled: [1, C, 1, H, W] -> get back to [1, C, H, W]
-            pooled = pooled.squeeze(2)
-            # Final sub_stacks: [num_samples=1, num_slices=1, C, H, W]
-            sub_stacks = pooled.unsqueeze(0)
+        # Check if this patient was marked as having no images
+        has_images = patient.get('has_images', True)  # Default to True for backward compatibility
+        
+        if not has_images:
+            # Patient has no images but valid clinical data - return zero tensor for images
+            if DEBUG:
+                print(f"[DEBUG] Patient {patient_id} has no images, using zero tensor placeholders.")
+            
+            # Create zero tensor with expected shape [num_samples, num_slices, C, H, W]
+            if self.num_slices <= 0:
+                sub_stacks = torch.zeros(1, 1, 3, 224, 224)  # [1, 1, C, H, W]
+            else:
+                sub_stacks = torch.zeros(self.num_samples, self.num_slices, 3, 224, 224)
         else:
-            # Generate num_samples 3D sub-stacks (each with num_slices)
-            stacks = []
-            for _ in range(self.num_samples):
-                sub = self.sample_sub_stack(full_stack)
+            # Normal image loading for patients with images
+            # Load the entire axial series (as a single 4D tensor: [total_slices, C, H, W]).
+            full_stack = self.load_axial_series(dicom_dir, patient_id, dataset_type)
+
+            # --- Check for empty stack --- 
+            if full_stack.size(0) == 0:
+                 if DEBUG:
+                     print(f"[DEBUG] Skipping patient {patient_id} ({dataset_type}) in __getitem__ due to empty full_stack.")
+                 return None # Signal to collate_fn to skip this sample
+
+            if self.num_slices <= 0:
+                # Use the entire axial series as one sub-stack
                 if self.transform is not None:
-                    sub = torch.stack([self.transform(s) for s in sub], dim=0)
-                stacks.append(sub)
-            # Shape: [num_samples, num_slices, C, H, W]
-            sub_stacks = torch.stack(stacks, dim=0)
+                    # Apply transform to each slice
+                    transformed = [self.transform(s) for s in full_stack]
+                    full_stack = torch.stack(transformed, dim=0)
+                # Pool across slice dimension to unify to one slice per patient
+                # full_stack: [total_slices, C, H, W] -> permute to [1, C, total_slices, H, W]
+                full_stack = full_stack.permute(1, 0, 2, 3).unsqueeze(0)
+                # Adaptive pooling to collapse slice dimension
+                pooled = F.adaptive_avg_pool3d(full_stack, (1, full_stack.size(3), full_stack.size(4)))
+                # pooled: [1, C, 1, H, W] -> get back to [1, C, H, W]
+                pooled = pooled.squeeze(2)
+                # Final sub_stacks: [num_samples=1, num_slices=1, C, H, W]
+                sub_stacks = pooled.unsqueeze(0)
+            else:
+                # Generate num_samples 3D sub-stacks (each with num_slices)
+                stacks = []
+                for _ in range(self.num_samples):
+                    sub = self.sample_sub_stack(full_stack)
+                    if self.transform is not None:
+                        sub = torch.stack([self.transform(s) for s in sub], dim=0)
+                    stacks.append(sub)
+                # Shape: [num_samples, num_slices, C, H, W]
+                sub_stacks = torch.stack(stacks, dim=0)
 
         # Return according to model type
         if self.model_type == "linear":
@@ -362,13 +377,34 @@ class HCCDataModule:
              
         df = pd.read_csv(csv_file)
         patient_list = []
-        required_cols = ['Pre op MRI Accession number', 'time', 'event']
+        required_cols = ['Deidentified ID', 'time', 'event']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in {csv_file}: {missing_cols}")
 
+        # Track seen patient IDs to handle duplicates
+        seen_patients = set()
+        skipped_missing = 0
+        skipped_duplicates = 0
+        
         for _, row in df.iterrows():
-            patient_id = str(row['Pre op MRI Accession number'])
+            # Use MRI Accession number if available, otherwise use Deidentified ID
+            accession_num = row.get('Pre op MRI Accession number', None)
+            if pd.isna(accession_num) or str(accession_num).strip() == '':
+                # Fallback to Deidentified ID for patients without accession numbers
+                patient_id = str(row['Deidentified ID'])
+                print(f"[INFO] Using Deidentified ID {patient_id} (no accession number available)")
+            else:
+                patient_id = str(accession_num)
+            
+            # Handle duplicates by using a combination of IDs to create unique entries
+            unique_key = f"{patient_id}_{row['Deidentified ID']}"
+            if unique_key in seen_patients:
+                print(f"[WARN] Skipping duplicate patient: {patient_id} (Deidentified ID: {row['Deidentified ID']})")
+                skipped_duplicates += 1
+                continue
+            seen_patients.add(unique_key)
+            
             pat_dicom_dir = os.path.join(dicom_root, patient_id)
             
             # Basic check if directory exists
@@ -376,6 +412,7 @@ class HCCDataModule:
                  
             data_entry = {
                 'patient_id': patient_id,
+                'deidentified_id': str(row['Deidentified ID']),  # Keep both IDs for reference
                 'dicom_dir': pat_dicom_dir, # Specific dicom dir for this patient
                 'dataset_type': dataset_type, # NYU
                 'source': dataset_type # Use dataset_type as source identifier
@@ -387,23 +424,65 @@ class HCCDataModule:
                 data_entry['event'] = row['event']
             
             patient_list.append(data_entry)
+            
         print(f"Found {len(patient_list)} initial patient entries in {dataset_type} ({csv_file})")
+        if skipped_duplicates > 0:
+            print(f"Skipped {skipped_duplicates} duplicate entries")
         return patient_list
 
     def _filter_patient_list(self, patient_list):
-         """Filters a list of patient data based on image validity."""
+         """Filters a list of patient data based on image validity, but includes patients with clinical data even without images."""
          filtered_list = []
+         no_images_but_included = 0
+         excluded_completely = 0
+         
          print(f"Filtering {len(patient_list)} patients for valid images...")
          # Use a dummy dataset instance just for the filtering method
          temp_ds = HCCDicomDataset([], transform=self.transform) 
          for entry in tqdm(patient_list, desc="Filtering Patients"):
-             if temp_ds._has_valid_images(entry['dicom_dir'], entry['dataset_type']):
+             has_images = temp_ds._has_valid_images(entry['dicom_dir'], entry['dataset_type'])
+             
+             if has_images:
+                 # Patient has valid images - include normally
                  filtered_list.append(entry)
              else:
-                 if DEBUG:
-                     print(f"[DEBUG] Filtering out patient {entry['patient_id']} ({entry['dataset_type']}) due to no valid images.")
+                 # Patient doesn't have images - check if we should include for clinical data only
+                 if self._should_include_clinical_only(entry):
+                     # Mark this patient as having no images but include for clinical data
+                     entry['has_images'] = False
+                     filtered_list.append(entry)
+                     no_images_but_included += 1
+                     print(f"[INFO] Including patient {entry['patient_id']} without images for clinical data (Event: {entry.get('event', 'N/A')}, Time: {entry.get('time', 'N/A')})")
+                 else:
+                     excluded_completely += 1
+                     if DEBUG:
+                         print(f"[DEBUG] Completely excluding patient {entry['patient_id']} ({entry['dataset_type']}) - no images and insufficient clinical data.")
+         
          print(f"Retained {len(filtered_list)} patients after filtering.")
+         if no_images_but_included > 0:
+             print(f"Included {no_images_but_included} patients without images for clinical data only.")
+         if excluded_completely > 0:
+             print(f"Excluded {excluded_completely} patients due to insufficient data.")
          return filtered_list
+
+    def _should_include_clinical_only(self, patient_entry):
+        """Determine if a patient should be included even without images based on clinical data quality."""
+        # Include if patient has valid survival time and event data
+        try:
+            time_val = patient_entry.get('time', None)
+            event_val = patient_entry.get('event', None)
+            
+            # Check if we have valid time and event data
+            if time_val is not None and event_val is not None:
+                time_float = float(time_val)
+                event_int = int(event_val)
+                
+                # Include if time > 0 and event is 0 or 1
+                if time_float > 0 and event_int in [0, 1]:
+                    return True
+            return False
+        except (ValueError, TypeError):
+            return False
 
     def setup(self):
         # Build patient list from NYU data only
@@ -706,3 +785,4 @@ class HCCDataModule:
 
     def collate_fn(self, batch):
         return self.skip_none_collate(batch)
+
