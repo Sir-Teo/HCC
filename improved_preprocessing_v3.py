@@ -194,29 +194,29 @@ class AdvancedHCCPreprocessor:
             image_slice = image_slice / image_slice.max()
         
         # Step 1: Adaptive windowing
-        processed = self.adaptive_windowing(image_slice)
+        processed = self.adaptive_windowing(image_slice).astype(np.float32)
         
         # Step 2: Noise reduction
         if self.noise_reduction:
-            processed = self.advanced_noise_reduction(processed)
+            processed = self.advanced_noise_reduction(processed).astype(np.float32)
         
         # Step 3: Multi-scale processing
-        processed = self.multi_scale_processing(processed)
+        processed = self.multi_scale_processing(processed).astype(np.float32)
         
         # Step 4: Contrast enhancement
         if self.enhance_contrast:
-            processed = self.adaptive_histogram_equalization(processed)
+            processed = self.adaptive_histogram_equalization(processed).astype(np.float32)
         
         # Step 5: Texture enhancement
-        processed = self.texture_enhancement(processed)
+        processed = self.texture_enhancement(processed).astype(np.float32)
         
         # Final normalization
         processed = (processed - processed.mean()) / (processed.std() + 1e-8)
-        processed = np.clip(processed, -3, 3)  # Clip extreme values
+        processed = np.clip(processed, -3, 3).astype(np.float32)  # Ensure float32 and clip extreme values
         
         # Resize to target size
         if processed.shape != self.target_size:
-            processed = cv2.resize(processed, self.target_size, interpolation=cv2.INTER_CUBIC)
+            processed = cv2.resize(processed, self.target_size, interpolation=cv2.INTER_CUBIC).astype(np.float32)
         
         return processed
 
@@ -251,11 +251,15 @@ def patch_dataset_preprocessing_v3():
             if img_max > img_min:
                 img = (img - img_min) / (img_max - img_min)
             else:
-                img = np.zeros_like(img)
+                img = np.zeros_like(img, dtype=np.float32)
             
             # Apply advanced v3 preprocessing
             preprocessor = get_advanced_preprocessor()
             img = preprocessor.process_slice(img)
+            
+            # Ensure img is float32 after preprocessing
+            if img.dtype != np.float32:
+                img = img.astype(np.float32)
             
             # Ensure 3 channels for RGB
             if img.ndim == 2:
@@ -267,8 +271,15 @@ def patch_dataset_preprocessing_v3():
                 img = img[:,:,0:1]
                 img = np.repeat(img, 3, axis=-1)
             
+            # Ensure final array is float32 before tensor conversion
+            img = img.astype(np.float32)
+            
             # Convert to tensor and resize
             tensor_img = torch.from_numpy(img).permute(2, 0, 1)
+            
+            # Ensure tensor is float32
+            if tensor_img.dtype != torch.float32:
+                tensor_img = tensor_img.float()
             
             # Resize tensor_img to (3, 224, 224) using torch.nn.functional.interpolate
             if tensor_img.shape[1:] != (224, 224):
