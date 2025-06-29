@@ -157,11 +157,24 @@ class HCCDicomDataset(Dataset):
 
         # Return according to model type
         if self.model_type == "linear":
-            label = torch.tensor(patient['event'], dtype=torch.float32) # Assuming binary uses 'event'
+            # Handle patients without clinical data
+            event_val = patient.get('event', 0)  # Default to 0 if no event data
+            if event_val is None:
+                event_val = 0
+            label = torch.tensor(event_val, dtype=torch.float32)
             return sub_stacks, label
         elif self.model_type == "time_to_event":
-            time_ = torch.tensor(patient['time'], dtype=torch.float32)
-            event_ = torch.tensor(patient['event'], dtype=torch.float32)
+            # Handle patients without clinical data
+            time_val = patient.get('time', 1.0)  # Default to 1.0 if no time data
+            event_val = patient.get('event', 0)  # Default to 0 if no event data
+            
+            if time_val is None:
+                time_val = 1.0
+            if event_val is None:
+                event_val = 0
+                
+            time_ = torch.tensor(time_val, dtype=torch.float32)
+            event_ = torch.tensor(event_val, dtype=torch.float32)
             return sub_stacks, time_, event_
 
     def load_axial_series(self, dicom_dir, patient_id, dataset_type):
@@ -370,100 +383,114 @@ class HCCDataModule:
         ])
 
     def _build_patient_list(self, csv_file, dicom_root, dataset_type):
-        """Builds the list of patient data dictionaries from a CSV."""
-        if not csv_file or not os.path.exists(csv_file):
-             print(f"[WARN] CSV file not found or not provided: {csv_file}")
-             return []
-             
-        df = pd.read_csv(csv_file)
-        patient_list = []
-        required_cols = ['Deidentified ID', 'time', 'event']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns in {csv_file}: {missing_cols}")
-
-        # Track seen patient IDs to handle duplicates
-        seen_patients = set()
-        skipped_missing = 0
-        skipped_duplicates = 0
+        """Builds the list of patient data dictionaries from DICOM directories and CSV.
+        Includes ALL patients from DICOM directories, even if missing from CSV."""
         
-        for _, row in df.iterrows():
-            # Use MRI Accession number if available, otherwise use Deidentified ID
-            accession_num = row.get('Pre op MRI Accession number', None)
-            if pd.isna(accession_num) or str(accession_num).strip() == '':
-                # Fallback to Deidentified ID for patients without accession numbers
-                patient_id = str(row['Deidentified ID'])
-                print(f"[INFO] Using Deidentified ID {patient_id} (no accession number available)")
+        # First, get all available DICOM directories
+        if not dicom_root or not os.path.exists(dicom_root):
+            print(f"[WARN] DICOM root not found: {dicom_root}")
+            return []
+            
+        all_dicom_items = os.listdir(dicom_root)
+        # Filter to only directories (exclude .txt, .csv files)
+        dicom_directories = []
+        for item in all_dicom_items:
+            full_path = os.path.join(dicom_root, item)
+            if os.path.isdir(full_path):
+                dicom_directories.append(item)
+        
+        print(f"Found {len(dicom_directories)} DICOM patient directories")
+        
+        # Load CSV data if available
+        csv_data = {}
+        if csv_file and os.path.exists(csv_file):
+            df = pd.read_csv(csv_file)
+            required_cols = ['Deidentified ID', 'time', 'event']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                print(f"[WARN] Missing columns in CSV: {missing_cols}")
             else:
-                patient_id = str(accession_num)
+                # Build lookup for CSV data by accession number
+                for _, row in df.iterrows():
+                    acc_num = row.get('Pre op MRI Accession number')
+                    if pd.notna(acc_num):
+                        acc_num = str(acc_num)
+                        if acc_num not in csv_data:  # Handle duplicates by keeping first occurrence
+                            csv_data[acc_num] = {
+                                'patient_id': row['Deidentified ID'],
+                                'time': row['time'],
+                                'event': row['event'],
+                                'dataset_type': dataset_type
+                            }
+        
+        # Build patient list from ALL DICOM directories
+        patient_list = []
+        csv_matched = 0
+        dicom_only = 0
+        
+        for dicom_dir in dicom_directories:
+            dicom_path = os.path.join(dicom_root, dicom_dir)
             
-            # Handle duplicates by using a combination of IDs to create unique entries
-            unique_key = f"{patient_id}_{row['Deidentified ID']}"
-            if unique_key in seen_patients:
-                print(f"[WARN] Skipping duplicate patient: {patient_id} (Deidentified ID: {row['Deidentified ID']})")
-                skipped_duplicates += 1
-                continue
-            seen_patients.add(unique_key)
+            if dicom_dir in csv_data:
+                # Patient has both DICOM and CSV data
+                patient_entry = csv_data[dicom_dir].copy()
+                patient_entry.update({
+                    'dicom_dir': dicom_path,
+                    'has_images': True,
+                    'has_clinical_data': True
+                })
+                csv_matched += 1
+            else:
+                # Patient has DICOM only (missing from CSV)
+                patient_entry = {
+                    'patient_id': f'DICOM_ONLY_{dicom_dir}',
+                    'dicom_dir': dicom_path,
+                    'time': None,  # No survival data
+                    'event': None,  # No event data
+                    'dataset_type': dataset_type,
+                    'has_images': True,
+                    'has_clinical_data': False
+                }
+                dicom_only += 1
             
-            pat_dicom_dir = os.path.join(dicom_root, patient_id)
-            
-            # Basic check if directory exists
-            # More thorough check happens in HCCDicomDataset._has_valid_images
-                 
-            data_entry = {
-                'patient_id': patient_id,
-                'deidentified_id': str(row['Deidentified ID']),  # Keep both IDs for reference
-                'dicom_dir': pat_dicom_dir, # Specific dicom dir for this patient
-                'dataset_type': dataset_type, # NYU
-                'source': dataset_type # Use dataset_type as source identifier
-            }
-            if self.model_type == "linear":
-                data_entry['event'] = row['event'] # Use event as label for binary
-            elif self.model_type == "time_to_event":
-                data_entry['time'] = row['time']
-                data_entry['event'] = row['event']
-            
-            patient_list.append(data_entry)
-            
-        print(f"Found {len(patient_list)} initial patient entries in {dataset_type} ({csv_file})")
-        if skipped_duplicates > 0:
-            print(f"Skipped {skipped_duplicates} duplicate entries")
+            patient_list.append(patient_entry)
+        
+        print(f"Built patient list: {len(patient_list)} total patients")
+        print(f"  - {csv_matched} patients with both DICOM and clinical data")
+        print(f"  - {dicom_only} patients with DICOM only (missing from CSV)")
+        
         return patient_list
 
     def _filter_patient_list(self, patient_list):
-         """Filters a list of patient data based on image validity, but includes patients with clinical data even without images."""
-         filtered_list = []
-         no_images_but_included = 0
-         excluded_completely = 0
-         
-         print(f"Filtering {len(patient_list)} patients for valid images...")
-         # Use a dummy dataset instance just for the filtering method
-         temp_ds = HCCDicomDataset([], transform=self.transform) 
-         for entry in tqdm(patient_list, desc="Filtering Patients"):
-             has_images = temp_ds._has_valid_images(entry['dicom_dir'], entry['dataset_type'])
-             
-             if has_images:
-                 # Patient has valid images - include normally
-                 filtered_list.append(entry)
-             else:
-                 # Patient doesn't have images - check if we should include for clinical data only
-                 if self._should_include_clinical_only(entry):
-                     # Mark this patient as having no images but include for clinical data
-                     entry['has_images'] = False
-                     filtered_list.append(entry)
-                     no_images_but_included += 1
-                     print(f"[INFO] Including patient {entry['patient_id']} without images for clinical data (Event: {entry.get('event', 'N/A')}, Time: {entry.get('time', 'N/A')})")
-                 else:
-                     excluded_completely += 1
-                     if DEBUG:
-                         print(f"[DEBUG] Completely excluding patient {entry['patient_id']} ({entry['dataset_type']}) - no images and insufficient clinical data.")
-         
-         print(f"Retained {len(filtered_list)} patients after filtering.")
-         if no_images_but_included > 0:
-             print(f"Included {no_images_but_included} patients without images for clinical data only.")
-         if excluded_completely > 0:
-             print(f"Excluded {excluded_completely} patients due to insufficient data.")
-         return filtered_list
+        """Include ALL patients without filtering - user wants every patient included.
+        Just verify images exist but don't exclude patients during preprocessing."""
+        
+        print(f"Processing {len(patient_list)} patients for the dataset...")
+        
+        # Create a temporary dataset instance for image validation
+        temp_dataset = HCCDicomDataset([], model_type=self.model_type, transform=self.transform)
+        
+        # Just verify image availability but include all patients
+        patients_with_images = 0
+        patients_without_images = 0
+        
+        for entry in tqdm(patient_list, desc="Verifying Patients"):
+            # Check if patient has valid images using the dataset method
+            has_valid_images = temp_dataset._has_valid_images(entry['dicom_dir'], entry['dataset_type'])
+            entry['has_images'] = has_valid_images
+            
+            if has_valid_images:
+                patients_with_images += 1
+            else:
+                patients_without_images += 1
+                print(f"[INFO] Patient {entry['patient_id']} has no valid images but will be included")
+        
+        print(f"Dataset includes ALL {len(patient_list)} patients:")
+        print(f"  - {patients_with_images} patients with valid images")
+        print(f"  - {patients_without_images} patients without valid images (will use zero tensors)")
+        
+        # Return ALL patients - no filtering
+        return patient_list
 
     def _should_include_clinical_only(self, patient_entry):
         """Determine if a patient should be included even without images based on clinical data quality."""
@@ -521,24 +548,45 @@ class HCCDataModule:
 
         # Setup splits based on whether cross_validation is enabled
         if self.cross_validation:
-            # Create cross-validation splits on the selected patient list (self.all_patients)
-            patient_indices = list(range(len(self.all_patients)))
-            patient_events = [p['event'] for p in self.all_patients]
+            # For cross-validation, only use patients with clinical data (not None events)
+            # but keep all patients in the overall dataset for feature extraction
+            cv_patients = [p for p in self.all_patients if p.get('event') is not None]
+            cv_indices = [i for i, p in enumerate(self.all_patients) if p.get('event') is not None]
+            patient_events = [p['event'] for p in cv_patients]
+            
+            print(f"Using {len(cv_patients)} patients with clinical data for cross-validation splits")
+            print(f"(Total dataset includes {len(self.all_patients)} patients, including {len(self.all_patients) - len(cv_patients)} DICOM-only patients)")
 
             if self.leave_one_out:
                 from sklearn.model_selection import LeaveOneOut
                 self.cv_splitter = LeaveOneOut()
-                self.cv_splits = list(self.cv_splitter.split(patient_indices))
+                # Create splits based on the filtered CV patients, then map back to original indices
+                temp_splits = list(self.cv_splitter.split(range(len(cv_patients))))
+                self.cv_splits = []
+                for train_temp, test_temp in temp_splits:
+                    train_orig = [cv_indices[i] for i in train_temp]
+                    test_orig = [cv_indices[i] for i in test_temp]
+                    self.cv_splits.append((train_orig, test_orig))
             else:
                 from sklearn.model_selection import StratifiedKFold, KFold
                 # Fall back to stratifying on event label
                 if len(np.unique(patient_events)) < 2 or any(np.bincount(patient_events) < self.cv_folds):
                     print("[WARN] Stratification on events not possible; using KFold instead.")
                     kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                    self.cv_splits = list(kf.split(patient_indices))
+                    temp_splits = list(kf.split(range(len(cv_patients))))
+                    self.cv_splits = []
+                    for train_temp, test_temp in temp_splits:
+                        train_orig = [cv_indices[i] for i in train_temp]
+                        test_orig = [cv_indices[i] for i in test_temp]
+                        self.cv_splits.append((train_orig, test_orig))
                 else:
                     skf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-                    self.cv_splits = list(skf.split(patient_indices, patient_events))
+                    temp_splits = list(skf.split(range(len(cv_patients)), patient_events))
+                    self.cv_splits = []
+                    for train_temp, test_temp in temp_splits:
+                        train_orig = [cv_indices[i] for i in train_temp]
+                        test_orig = [cv_indices[i] for i in test_temp]
+                        self.cv_splits.append((train_orig, test_orig))
 
             print(f"Created {len(self.cv_splits)} CV splits.")
             self.current_fold = -1 # Will be incremented in _setup_fold
@@ -548,22 +596,33 @@ class HCCDataModule:
             self.val_dataset = None
             self.test_dataset = None
         else:
-            # Standard train/val/test split
+            # Standard train/val/test split - also filter patients with clinical data
+            cv_patients = [p for p in self.all_patients if p.get('event') is not None]
+            cv_indices = [i for i, p in enumerate(self.all_patients) if p.get('event') is not None]
+            
+            print(f"Using {len(cv_patients)} patients with clinical data for train/val/test splits")
+            
             from sklearn.model_selection import train_test_split
-            train_indices, test_indices = train_test_split(
-                list(range(len(self.all_patients))),
+            train_temp, test_temp = train_test_split(
+                list(range(len(cv_patients))),
                 test_size=0.2,
-                stratify=[p['event'] for p in self.all_patients],
+                stratify=[p['event'] for p in cv_patients],
                 random_state=self.random_state
             )
             
+            # Map back to original indices
+            train_indices = [cv_indices[i] for i in train_temp]
+            test_indices = [cv_indices[i] for i in test_temp]
+            
             if self.use_validation:
-                train_indices, val_indices = train_test_split(
-                    train_indices,
+                train_temp, val_temp = train_test_split(
+                    train_temp,
                     test_size=0.2,  # 20% of remaining for validation
-                    stratify=[self.all_patients[i]['event'] for i in train_indices],
+                    stratify=[cv_patients[i]['event'] for i in train_temp],
                     random_state=self.random_state
                 )
+                val_indices = [cv_indices[i] for i in val_temp]
+                train_indices = [cv_indices[i] for i in train_temp]
                 self.val_indices = val_indices
             else:
                 self.val_indices = []
