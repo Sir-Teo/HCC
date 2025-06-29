@@ -22,9 +22,6 @@ import json # Add json import
 from data.dataset import HCCDataModule, HCCDicomDataset # Use the updated DataModule
 from models.dino import load_dinov2_model
 from models.mlp import CustomMLP, CenteredModel, CoxPHWithL1 # Keep survival models
-# Removed old helpers, will use adapted versions
-# from utils.helpers import extract_features, validate_survival_data, upsample_training_data 
-# from callbacks.custom_callbacks import GradientClippingCallback, LossLogger, ParamCheckerCallback # Callbacks handled differently or integrated
 from utils.plotting import (plot_cv_metrics, plot_survival_functions, plot_brier_score,
                       plot_risk_score_distribution, plot_kaplan_meier, plot_calibration_plot,
                       plot_multi_calibration, plot_cumulative_hazard, plot_survival_probability_distribution) # Keep plotting utils
@@ -112,11 +109,11 @@ def extract_features(data_loader, model, device):
         if len(patient_info) != num_patients_processed:
              print(f"[WARN] Mismatch between processed features ({num_patients_processed}) and retrieved patient info ({len(patient_info)}). Check dataloader/dataset logic.")
              # Fallback or error handling might be needed here
-             patient_info = [{'patient_id': f'processed_{i}', 'dataset_type': 'Unknown'} for i in range(num_patients_processed)]
+             patient_info = [{'patient_id': f'processed_{i}', 'dataset_type': 'NYU'} for i in range(num_patients_processed)]
     else:
         print("[WARN] Could not retrieve patient info from dataset in extract_features.")
         num_patients_processed = features.shape[0]
-        patient_info = [{'patient_id': f'unknown_{i}', 'dataset_type': 'Unknown'} for i in range(num_patients_processed)]
+        patient_info = [{'patient_id': f'unknown_{i}', 'dataset_type': 'NYU'} for i in range(num_patients_processed)]
         
     return features, durations, events, patient_info
 
@@ -162,37 +159,6 @@ def upsample_training_data(x_train, durations, events):
     print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples.")
     return x_train_upsampled, durations_upsampled, events_upsampled
     
-# --- Upsampling by Dataset for Survival Data ---
-def upsample_by_dataset(x_train, durations, events, patient_info):
-    """
-    Upsample the minority class within each dataset (e.g., TCGA, NYU) separately.
-    """
-    # Group sample indices by dataset_type
-    groups = {}
-    for idx, info in enumerate(patient_info):
-        ds = info.get('dataset_type', 'Unknown')
-        groups.setdefault(ds, []).append(idx)
-    x_parts, d_parts, e_parts = [], [], []
-    for ds, idxs in groups.items():
-        X = x_train[idxs]
-        D = durations[idxs]
-        E = events[idxs]
-        # Upsample within this dataset group
-        X_up, D_up, E_up = upsample_training_data(X, D, E)
-        x_parts.append(X_up)
-        d_parts.append(D_up)
-        e_parts.append(E_up)
-    # Concatenate upsampled groups
-    if x_parts:
-        x_new = np.concatenate(x_parts, axis=0)
-        d_new = np.concatenate(d_parts, axis=0)
-        e_new = np.concatenate(e_parts, axis=0)
-        # Shuffle combined samples
-        perm = np.random.permutation(len(e_new))
-        return x_new[perm], d_new[perm], e_new[perm]
-    # Fallback if no upsampling done
-    return x_train, durations, events
-
 # --- Data Validation --- 
 def validate_survival_data(durations, events):
      # Basic checks
@@ -202,13 +168,9 @@ def validate_survival_data(durations, events):
           print("[WARN] Found event indicators other than 0 or 1.")
      # Add more checks if needed (e.g., from original train.py)
 
-# Removed old train_and_evaluate function
-
 def cross_validation_mode(args):
     """
-    Perform cross-validation on the combined TCGA and NYU dataset for survival analysis.
-    Train on combined data within each fold.
-    Aggregate and report test metrics (C-index) separately for TCGA and NYU sources.
+    Perform cross-validation on the NYU dataset for survival analysis.
     """
     hyperparams = {
         'learning_rate': args.learning_rate,
@@ -220,10 +182,8 @@ def cross_validation_mode(args):
 
     # --- Data Module Setup --- 
     data_module = HCCDataModule(
-        train_csv_file=args.tcga_csv_file, # TCGA csv
-        test_csv_file=args.nyu_csv_file,   # NYU csv
-        train_dicom_root=args.tcga_dicom_root, # TCGA root
-        test_dicom_root=args.nyu_dicom_root,   # NYU root
+        csv_file=args.nyu_csv_file,   # NYU csv only
+        dicom_root=args.nyu_dicom_root,   # NYU root only
         model_type="time_to_event", # Set for survival
         batch_size=args.batch_size,
         num_slices=args.num_slices,
@@ -232,52 +192,11 @@ def cross_validation_mode(args):
         preprocessed_root=args.preprocessed_root,
         cross_validation=True,
         cv_folds=args.cv_folds,
-        cv_mode=args.cv_mode,
         leave_one_out=args.leave_one_out,
         random_state=42,
         use_validation=True # Use validation set within folds
     )
-    data_module.setup() # Combines, filters, preprocesses, splits
-
-    # --- Cross-Dataset Prediction Mode ---
-    # For cross-dataset prediction (when args.cross_predict is not None)
-    # we'll load a separate dataset for testing and override the test_dataloader
-    cross_predict_data_module = None
-    if args.cross_predict:
-        print(f"\n===== Cross-Dataset Prediction Mode: Training on {args.cv_mode}, Testing on {args.cross_predict} =====")
-        # Create a separate data module for the test dataset
-        cross_predict_data_module = HCCDataModule(
-            train_csv_file=args.tcga_csv_file,
-            test_csv_file=args.nyu_csv_file,
-            train_dicom_root=args.tcga_dicom_root,
-            test_dicom_root=args.nyu_dicom_root,
-            model_type="time_to_event",
-            batch_size=args.batch_size,
-            num_slices=args.num_slices,
-            num_samples=args.num_samples_per_patient,
-            num_workers=args.num_workers,
-            preprocessed_root=args.preprocessed_root,
-            cross_validation=False,  # Don't need CV for this
-            cv_mode=args.cross_predict,  # Use the cross_predict value as the mode
-            random_state=42
-        )
-        cross_predict_data_module.setup()
-        
-        # Create a dataset containing ALL patients from the cross_predict source
-        cross_predict_all_patients = cross_predict_data_module.all_patients
-        print(f"Loaded {len(cross_predict_all_patients)} patients from {args.cross_predict} source for cross-dataset testing.")
-        
-        # Create a custom test dataset with all patients from cross_predict source
-        cross_predict_test_dataset = HCCDicomDataset(
-            patient_data_list=cross_predict_all_patients,
-            model_type="time_to_event",
-            transform=None,
-            num_slices=args.num_slices,
-            num_samples=args.num_samples_per_patient,
-            preprocessed_root=args.preprocessed_root
-        )
-        # Store this for later use
-        cross_predict_data_module.full_test_dataset = cross_predict_test_dataset
+    data_module.setup() # Loads, filters, preprocesses, splits
 
     # --- Model Setup --- 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -322,28 +241,18 @@ def cross_validation_mode(args):
     # --- Cross-Validation Loop --- 
     current_fold = -1 
     while True:
+        # Set up the next fold first
+        if not data_module.next_fold():
+            print("\n===== Finished all folds =====")
+            break
+        
         current_fold += 1
-        print(f"\n===== Processing Fold {current_fold + 1}/{data_module.get_total_folds()} =====")
+        print(f"\n===== Processing Fold {current_fold}/{data_module.get_total_folds()} =====")
 
         # Get dataloaders for current fold 
         train_loader = data_module.train_dataloader()
         val_loader = data_module.val_dataloader() # Can be None
-        
-        # Use the cross-dataset test loader if in cross prediction mode
-        if args.cross_predict and cross_predict_data_module:
-            # Use the full test dataset we created (all patients from cross_predict source)
-            test_loader = DataLoader(
-                cross_predict_data_module.full_test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                collate_fn=data_module.skip_none_collate,
-                drop_last=False,
-                pin_memory=True
-            )
-            print(f"Using all {len(cross_predict_data_module.full_test_dataset)} patients from {args.cross_predict} for cross-dataset prediction")
-        else:
-            test_loader = data_module.test_dataloader()
+        test_loader = data_module.test_dataloader()
 
         # Add fold index to dataset for description
         if hasattr(train_loader.dataset, '__fold_idx__'): train_loader.dataset.__fold_idx__ = current_fold
@@ -357,20 +266,14 @@ def cross_validation_mode(args):
 
         # Handle empty datasets after extraction
         if x_train.size == 0 or y_train_durations.size == 0:
-            print(f"[WARN] Fold {current_fold + 1}: No training data extracted. Skipping fold.")
-            if not data_module.next_fold():
-                break
-            else:
-                continue
+            print(f"[WARN] Fold {current_fold}: No training data extracted. Skipping fold.")
+            continue
         if x_test.size == 0 or y_test_durations.size == 0:
-            print(f"[WARN] Fold {current_fold + 1}: No test data extracted. Skipping fold.")
-            if not data_module.next_fold():
-                break
-            else:
-                continue
+            print(f"[WARN] Fold {current_fold}: No test data extracted. Skipping fold.")
+            continue
         has_validation_data = x_val.size > 0 and y_val_durations.size > 0
         if not has_validation_data:
-            print(f"[INFO] Fold {current_fold + 1}: No validation data available or extracted.")
+            print(f"[INFO] Fold {current_fold}: No validation data available or extracted.")
             # Disable early stopping if no validation data
             use_early_stopping_fold = False
         else:
@@ -427,100 +330,67 @@ def cross_validation_mode(args):
         x_test_tensor = torch.from_numpy(x_test_scaled.transpose(0, 2, 1))
         x_test_final = slice_pool(x_test_tensor).squeeze(-1).numpy()
 
-        print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
+        print(f"[INFO] Fold {current_fold}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
-        # Dataset-level upsampling based on method
+        # Upsampling based on method
         if args.upsampling and args.upsampling_method == 'random':
-            print(f"[INFO] Fold {current_fold + 1}: Applying random upsampling per dataset for survival")
-            x_train_final, y_train_durations, y_train_events = upsample_by_dataset(
-                x_train_final, y_train_durations, y_train_events, train_patient_info)
+            print(f"[INFO] Fold {current_fold}: Applying random upsampling for survival")
+            x_train_final, y_train_durations, y_train_events = upsample_training_data(
+                x_train_final, y_train_durations, y_train_events)
             print(f"[INFO] After random upsampling: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
         elif args.upsampling and args.upsampling_method == 'smote':
-            print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE per dataset for survival (adaptive k_neighbors)")
-            parts_X, parts_y, parts_dur = [], [], []
-            for ds in {pi['dataset_type'] for pi in train_patient_info}:
-                idxs = [i for i,pi in enumerate(train_patient_info) if pi['dataset_type']==ds]
-                Xg = x_train_final[idxs]
-                Eg = y_train_events[idxs]
-                Dg = y_train_durations[idxs]
-                # only apply SMOTE if both event and non-event present and enough minority samples
-                classes, counts = np.unique(Eg, return_counts=True)
-                if len(classes) > 1 and counts.min() > 1:
-                    minority_label = classes[np.argmin(counts)]
-                    minority_count = counts.min()
-                    k = min(minority_count - 1, 5)
-                    if k < 1:
-                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: Not enough minority samples ({minority_count}) for SMOTE. Skipping.")
-                        X_res, y_res = Xg, Eg
-                    else:
-                        sm_group = SMOTE(random_state=42, k_neighbors=k)
-                        try:
-                            X_res, y_res = sm_group.fit_resample(Xg, Eg)
-                        except ValueError as e:
-                            print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: SMOTE error {e}. Skipping SMOTE for this group.")
-                            X_res, y_res = Xg, Eg
-                    # assign durations for synthetic minority samples
-                    n_old = len(Eg)
+            print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE for survival (adaptive k_neighbors)")
+            # SMOTE implementation for survival data
+            classes, counts = np.unique(y_train_events, return_counts=True)
+            if len(classes) > 1 and counts.min() > 1:
+                minority_label = classes[np.argmin(counts)]
+                minority_count = counts.min()
+                k = min(minority_count - 1, 5)
+                if k < 1:
+                    print(f"[WARN] Fold {current_fold + 1}: Not enough minority samples ({minority_count}) for SMOTE. Skipping.")
+                else:
+                    sm = SMOTE(random_state=42, k_neighbors=k)
+                    try:
+                        X_res, y_res = sm.fit_resample(x_train_final, y_train_events)
+                        # assign durations for synthetic minority samples
+                        n_old = len(y_train_events)
+                        n_new = len(y_res) - n_old
+                        if n_new > 0:
+                            dur_cands = y_train_durations[y_train_events == minority_label]
+                            if len(dur_cands) > 0:
+                                new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
+                            else:
+                                new_durs = np.zeros(n_new, dtype=y_train_durations.dtype)
+                            y_train_durations = np.concatenate([y_train_durations, new_durs])
+                        x_train_final = X_res
+                        y_train_events = y_res
+                    except ValueError as e:
+                        print(f"[WARN] Fold {current_fold + 1}: SMOTE error {e}. Skipping SMOTE.")
+            print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
+        elif args.upsampling and args.upsampling_method == 'adasyn':
+            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN for survival")
+            classes, counts = np.unique(y_train_events, return_counts=True)
+            if len(classes) > 1:
+                minority_label = classes[np.argmin(counts)]
+                adasyn = ADASYN(random_state=42)
+                try:
+                    X_res, y_res = adasyn.fit_resample(x_train_final, y_train_events)
+                    n_old = len(y_train_events)
                     n_new = len(y_res) - n_old
                     if n_new > 0:
-                        dur_cands = Dg[Eg == minority_label]
+                        dur_cands = y_train_durations[y_train_events == minority_label]
                         if len(dur_cands) > 0:
                             new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
                         else:
-                            new_durs = np.zeros(n_new, dtype=Dg.dtype)
-                        D_res = np.concatenate([Dg, new_durs])
-                    else:
-                        D_res = Dg
-                else:
-                    # insufficient classes or too few samples
-                    X_res, y_res, D_res = Xg, Eg, Dg
-                parts_X.append(X_res)
-                parts_y.append(y_res)
-                parts_dur.append(D_res)
-            # recombine all groups
-            x_train_final = np.vstack(parts_X)
-            y_train_events = np.concatenate(parts_y)
-            y_train_durations = np.concatenate(parts_dur)
-            print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
-        elif args.upsampling and args.upsampling_method == 'adasyn':
-            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN per dataset for survival (adaptive synthetic sampling)")
-            parts_X, parts_y, parts_dur = [], [], []
-            for ds in {pi['dataset_type'] for pi in train_patient_info}:
-                idxs = [i for i,pi in enumerate(train_patient_info) if pi['dataset_type']==ds]
-                Xg = x_train_final[idxs]
-                Eg = y_train_events[idxs]
-                Dg = y_train_durations[idxs]
-                classes, counts = np.unique(Eg, return_counts=True)
-                if len(classes) > 1:
-                    minority_label = classes[np.argmin(counts)]
-                    adasyn_group = ADASYN(random_state=42)
-                    try:
-                        X_res, y_res = adasyn_group.fit_resample(Xg, Eg)
-                    except ValueError as e:
-                        print(f"[WARN] Fold {current_fold + 1}, dataset {ds}: ADASYN error {e}. Skipping ADASYN for this group.")
-                        X_res, y_res = Xg, Eg
-                else:
-                    X_res, y_res = Xg, Eg
-                n_old = len(Eg)
-                n_new = len(y_res) - n_old
-                if n_new > 0:
-                    dur_cands = Dg[Eg == minority_label]
-                    if len(dur_cands) > 0:
-                        new_durs = np.random.choice(dur_cands, size=n_new, replace=True)
-                    else:
-                        new_durs = np.zeros(n_new, dtype=Dg.dtype)
-                    D_res = np.concatenate([Dg, new_durs])
-                else:
-                    D_res = Dg
-                parts_X.append(X_res)
-                parts_y.append(y_res)
-                parts_dur.append(D_res)
-            x_train_final = np.vstack(parts_X)
-            y_train_events = np.concatenate(parts_y)
-            y_train_durations = np.concatenate(parts_dur)
+                            new_durs = np.zeros(n_new, dtype=y_train_durations.dtype)
+                        y_train_durations = np.concatenate([y_train_durations, new_durs])
+                    x_train_final = X_res
+                    y_train_events = y_res
+                except ValueError as e:
+                    print(f"[WARN] Fold {current_fold + 1}: ADASYN error {e}. Skipping ADASYN.")
             print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(y_train_events.sum())}")
 
-        # --- Survival Model Training --- (Corrected Indentation Starts Here)
+        # --- Survival Model Training --- 
         in_features = x_train_final.shape[1]
         out_features = 1 # Cox model has 1 output (log hazard ratio)
 
@@ -539,7 +409,6 @@ def cross_validation_mode(args):
         # Use Adam optimizer by default from pycox
         model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
         model.optimizer.set_lr(hyperparams['learning_rate'])
-        # Note: pycox Adam usually doesn't use weight_decay directly
 
         # Prepare validation data tuple for pycox fit method 
         val_data_pycox = None
@@ -604,33 +473,22 @@ def cross_validation_mode(args):
         else:
             # In LOOCV mode, we don't calculate C-index per fold
             print(f"[Fold {current_fold + 1}] LOOCV Fold Complete. Storing prediction.")
-            # We still need to append something or handle the list later
-            # Let's append NaN so the list structure is maintained, but filter later
             fold_test_cindices.append(np.nan) 
 
         # --- Store Fold Results --- 
         for i in range(len(test_patient_info)):
             patient_meta = test_patient_info[i]
-            # Update dataset_type for cross prediction mode
-            dataset_type = patient_meta.get('dataset_type', 'Unknown')
-            if args.cross_predict:
-                # Override dataset_type with cross_predict value
-                dataset_type = args.cross_predict.upper()
+            dataset_type = patient_meta.get('dataset_type', 'NYU')
                 
             fold_results = {
                 "patient_id": patient_meta['patient_id'],
-                "fold": current_fold + 1,
+                "fold": current_fold,
                 "predicted_risk_score": test_risk_scores[i],
                 "duration": y_test_true_durations[i],
                 "event_indicator": int(y_test_true_events[i]),
                 "dataset_type": dataset_type
             }
             all_fold_results.append(fold_results)
-
-        # --- Exit after one fold if in cross-dataset prediction mode ---
-        if args.cross_predict:
-            print(f"\n===== Completed cross-dataset prediction (Train: {args.cv_mode}, Test: {args.cross_predict}) =====")
-            break
             
         # --- Move to Next Fold --- 
         if not data_module.next_fold():
@@ -644,10 +502,7 @@ def cross_validation_mode(args):
 
     final_predictions_df = pd.DataFrame(all_fold_results)
 
-    if args.cross_predict:
-        total_patients_expected = len(cross_predict_data_module.all_patients)
-    else:
-        total_patients_expected = len(data_module.all_patients)
+    total_patients_expected = len(data_module.all_patients)
         
     if len(final_predictions_df) != total_patients_expected:
         print(f"[WARN] Final predictions DF has {len(final_predictions_df)} rows, expected {total_patients_expected}. Check patient processing.")
@@ -655,11 +510,7 @@ def cross_validation_mode(args):
         print(f"Final predictions DF contains results for all {len(final_predictions_df)} patients.")
 
     # --- Save Final Predictions --- 
-    # Update filename for cross-dataset prediction mode
-    if args.cross_predict:
-        final_csv_path = os.path.join(args.output_dir, f"final_predictions_{args.cv_mode}_to_{args.cross_predict}_survival.csv")
-    else:
-        final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_survival.csv")
+    final_csv_path = os.path.join(args.output_dir, "final_cv_predictions_survival.csv")
         
     final_predictions_df.sort_values(by=["dataset_type", "patient_id"], inplace=True)
     final_predictions_df.to_csv(final_csv_path, index=False)
@@ -688,40 +539,10 @@ def cross_validation_mode(args):
     # Overall (or LOOCV aggregated) C-Index
     desc = "LOOCV Aggregated" if args.leave_one_out else "Overall Test Set (Aggregated)"
     overall_cindex = calculate_cindex(y_durations_all, y_pred_scores_all, y_events_all, desc)
-    
-    # Separate metrics only if NOT LOOCV or cross-predict
-    tcga_cindex = np.nan
-    nyu_cindex = np.nan
-    if not args.leave_one_out and not args.cross_predict:
-        # TCGA Metrics
-        tcga_df = final_predictions_df[final_predictions_df["dataset_type"] == "TCGA"]
-        tcga_cindex = calculate_cindex(tcga_df["duration"].values, 
-                                    tcga_df["predicted_risk_score"].values, 
-                                    tcga_df["event_indicator"].values, 
-                                    "TCGA Test Set (Aggregated)")
-
-        # NYU Metrics
-        nyu_df = final_predictions_df[final_predictions_df["dataset_type"] == "NYU"]
-        nyu_cindex = calculate_cindex(nyu_df["duration"].values, 
-                                nyu_df["predicted_risk_score"].values, 
-                                nyu_df["event_indicator"].values, 
-                                "NYU Test Set (Aggregated)")
-    elif args.leave_one_out:
-        # In LOOCV mode, only the aggregated C-index is meaningful
-        print("\n--- Skipping per-dataset C-Index calculation in LOOCV mode --- ")
-        # return # Original code returned here, but we need to save summary
-    elif args.cross_predict:
-        print("\n--- Skipping separate TCGA/NYU C-Index calculation in cross-prediction mode --- ")
-        # Calculate C-index for the specific target dataset used in cross-prediction
-        target_cindex = calculate_cindex(y_durations_all, y_pred_scores_all, y_events_all, f"{args.cross_predict.upper()} Test Set (Cross-Prediction Target)")
-        if args.cross_predict.upper() == 'TCGA':
-             tcga_cindex = target_cindex
-        elif args.cross_predict.upper() == 'NYU':
-             nyu_cindex = target_cindex
              
-    # --- Per-Fold C-Index Summary (Only if not LOOCV and not cross-predict) --- 
+    # --- Per-Fold C-Index Summary (Only if not LOOCV) --- 
     fold_stats = {} # Initialize fold stats dict
-    if not args.leave_one_out and not args.cross_predict:
+    if not args.leave_one_out:
         valid_fold_cindices = [c for c in fold_test_cindices if not np.isnan(c)]
         if valid_fold_cindices:
             mean_cindex = np.mean(valid_fold_cindices)
@@ -750,8 +571,6 @@ def cross_validation_mode(args):
             "hyperparameters": vars(args),
             "metrics": {
                 "overall_cindex": overall_cindex,
-                "tcga_cindex": tcga_cindex, # Will be NaN if not applicable
-                "nyu_cindex": nyu_cindex,   # Will be NaN if not applicable
                 "cv_fold_stats": fold_stats if fold_stats else None # Include CV stats if available
             }
         }
@@ -785,29 +604,25 @@ def main(args):
     if args.cross_validation:
         cross_validation_mode(args)
     else:
-        # Standard train/val/test split mode (using combined data)
+        # Standard train/val/test split mode 
         print("Running in standard train/val/test mode (not cross-validation)")
         print("[WARN] Standard train/val/test mode not fully implemented yet for survival.")
-        # Needs implementation: Setup DataModule with cross_validation=False, 
-        # get loaders, run single training/evaluation pass similar to inside CV loop.
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CoxPH survival model with DINOv2 features using combined datasets and cross-validation")
+    parser = argparse.ArgumentParser(description="Train CoxPH survival model with DINOv2 features using NYU dataset and cross-validation")
     
-    # Updated arguments for combined dataset handling
-    parser.add_argument("--tcga_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC/data/TCGA/manifest-4lZjKqlp5793425118292424834/TCGA-LIHC", help="Path to the TCGA DICOM root directory.")
+    # NYU-only arguments
     parser.add_argument("--nyu_dicom_root", type=str, default="/gpfs/data/mankowskilab/HCC_Recurrence/dicom", help="Path to the NYU DICOM root directory.")
-    parser.add_argument("--tcga_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/tcga.csv", help="Path to the TCGA CSV metadata file.")
-    parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/nyu_recurrence.csv", help="Path to the NYU CSV metadata file.") # Adjust default NYU path
+    parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv", help="Path to the NYU CSV metadata file.")
     
-    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory to store/load preprocessed tensors (will have tcga/ and nyu/ subfolders). Set to None or empty string to disable.')
+    parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory to store/load preprocessed tensors. Set to None or empty string to disable.')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--num_slices', type=int, default=32, help='Number of slices per patient sample')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
     parser.add_argument('--epochs', type=int, default=100, help='Max epochs per fold')
-    parser.add_argument('--output_dir', type=str, default='checkpoints_survival_combined_cv', help='Base output directory')
+    parser.add_argument('--output_dir', type=str, default='checkpoints_survival_cv', help='Base output directory')
     parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping (NOTE: Manual loop needed for this with pycox fit)')
+    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--center_risk', action='store_true', help='Center risk scores (for CenteredModel wrapper)')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for MLP')
     parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Number of slice samples per patient series')
@@ -819,13 +634,9 @@ if __name__ == "__main__":
     parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
     parser.add_argument('--early_stopping_patience', type=int, default=20, help="Patience epochs for early stopping.")
-    parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable combined cross validation mode")
+    parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable cross validation mode")
     parser.add_argument('--cv_folds', type=int, default=10, help="Number of CV folds")
-    parser.add_argument('--cv_mode', type=str, default='combined', choices=['combined', 'tcga', 'nyu'], 
-                        help="Dataset mode for cross-validation: 'combined', 'tcga' (uses tcga_csv_file), 'nyu' (uses nyu_csv_file)")
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
-    parser.add_argument('--cross_predict', type=str, choices=['tcga', 'nyu'], default=None, 
-                        help="Train on cv_mode dataset and predict on this dataset")
     
     args = parser.parse_args()
 
@@ -838,18 +649,12 @@ if __name__ == "__main__":
     else:
          print("Preprocessing disabled (preprocessed_root is None).")
 
-
     # Create unique output directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Include cv_mode in the run name
-    run_name = f"run_{timestamp}_mode{args.cv_mode}_lr{args.learning_rate}_bs{args.batch_size}_net{args.coxph_net}"
+    run_name = f"run_{timestamp}_lr{args.learning_rate}_bs{args.batch_size}_net{args.coxph_net}"
     if args.upsampling: run_name += "_upsampled"
     if args.leave_one_out: run_name += "_loocv"
     else: run_name += f"_{args.cv_folds}fold"
-    
-    # Add cross-prediction tag if applicable
-    if args.cross_predict:
-        run_name += f"_cross_{args.cross_predict}"
         
     args.output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)
