@@ -238,7 +238,7 @@ def cross_validation_mode(args):
     all_fold_results = [] # Store results dict for each test patient
     fold_test_cindices = [] # Store C-index per fold
 
-    # --- Cross-Validation Loop ---
+    # --- Cross-Validation Loop --- 
     total_folds = data_module.get_total_folds()
     print(f"[INFO] Starting cross-validation with {total_folds} folds…")
 
@@ -488,7 +488,7 @@ def cross_validation_mode(args):
                 "dataset_type": dataset_type
             }
             all_fold_results.append(fold_results)
-            
+
     # --- Aggregation and Final Reporting --- 
     if not all_fold_results:
         print("[ERROR] No results collected. Exiting.")

@@ -88,11 +88,12 @@ for script_name in "train.py" "train_binary.py"; do
         base_output_dir="$BASE_OUTPUT_DIR_SURVIVAL"
     else # train_binary.py
         base_output_dir="$BASE_OUTPUT_DIR_BINARY"
-        # Binary-specific args (optimized based on best results)
-        specific_args+=("--model_arch ultra_precision")  # Use new ultra-precision architecture
+        # Binary-specific args (optimized for extreme imbalance and precision)
+        specific_args+=("--model_arch precision_weighted_ensemble")  # Use new ensemble architecture
         specific_args+=("--dropout 0.3")
         specific_args+=("--precision_recall_focal")  # Use new precision-recall focal loss
         specific_args+=("--focal_gamma 2.0")
+        specific_args+=("--upsampling_method adasyn")  # Use advanced upsampling
     fi
 
     for fold_strat in "7fold" "loocv"; do
@@ -134,7 +135,7 @@ for script_name in "train.py" "train_binary.py"; do
 
         # Enable internal hyper-parameter search for binary classification jobs
         if [ "$script_name" == "train_binary.py" ]; then
-            PYTHON_CMD="$PYTHON_CMD --hyper_search_iters 30"  # More trials for new precision architectures
+            PYTHON_CMD="$PYTHON_CMD --hyper_search_iters 50"  # More trials for precision optimization
         fi
 
         # --- Create Temporary Job Script ---

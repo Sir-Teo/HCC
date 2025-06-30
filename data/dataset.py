@@ -725,25 +725,54 @@ class HCCDataModule:
         fold_test_patients = [] if mock_test_mode else [self.all_patients[i] for i in test_indices]
 
         # Split training data into train and validation sets
+        # For extreme imbalance (very few positives), preserve all positives in training
         if len(fold_train_val_patients) > 1 and self.use_validation:
-             try:
-                 fold_train_patients, fold_val_patients = train_test_split(
-                     fold_train_val_patients,
-                     test_size=0.2,
-                     random_state=self.random_state,
-                     stratify=[p['event'] for p in fold_train_val_patients]
-                 )
-             except ValueError as e:
-                 # Handle cases where stratification isn't possible (e.g., only one class in split)
-                 print(f"[WARN] Stratification failed for fold {fold_idx} validation split: {e}. Splitting without stratification.")
-                 fold_train_patients, fold_val_patients = train_test_split(
-                     fold_train_val_patients,
-                     test_size=0.2,
-                     random_state=self.random_state
-                 )
+            # Count positives in the fold_train_val_patients
+            positive_count = sum(p['event'] for p in fold_train_val_patients)
+            
+            # If we have very few positives (≤6), keep them all in training
+            # and create validation set from negatives only
+            if positive_count <= 6:
+                print(f"[INFO] Fold {fold_idx+1}: Extreme imbalance detected ({positive_count} positives). Keeping all positives in training.")
+                
+                # Separate positives and negatives
+                positive_patients = [p for p in fold_train_val_patients if p['event'] == 1]
+                negative_patients = [p for p in fold_train_val_patients if p['event'] == 0]
+                
+                # Keep all positives in training, split negatives for validation
+                if len(negative_patients) >= 5:  # Need at least some negatives for validation
+                    negative_train, negative_val = train_test_split(
+                        negative_patients,
+                        test_size=min(0.2, 20 / len(negative_patients)),  # Cap at 20 negatives for val
+                        random_state=self.random_state
+                    )
+                    fold_train_patients = positive_patients + negative_train
+                    fold_val_patients = negative_val
+                else:
+                    # Too few negatives to split, skip validation for this fold
+                    fold_train_patients = fold_train_val_patients
+                    fold_val_patients = []
+                    print(f"[INFO] Fold {fold_idx+1}: Too few negatives for validation split. Skipping validation.")
+            else:
+                # Normal stratified split for cases with more positives
+                try:
+                    fold_train_patients, fold_val_patients = train_test_split(
+                        fold_train_val_patients,
+                        test_size=0.2,
+                        random_state=self.random_state,
+                        stratify=[p['event'] for p in fold_train_val_patients]
+                    )
+                except ValueError as e:
+                    # Handle cases where stratification isn't possible
+                    print(f"[WARN] Stratification failed for fold {fold_idx} validation split: {e}. Splitting without stratification.")
+                    fold_train_patients, fold_val_patients = train_test_split(
+                        fold_train_val_patients,
+                        test_size=0.2,
+                        random_state=self.random_state
+                    )
         else:
-             fold_train_patients = fold_train_val_patients
-             fold_val_patients = [] # No validation split if only 1 sample or validation disabled
+            fold_train_patients = fold_train_val_patients
+            fold_val_patients = [] # No validation split if only 1 sample or validation disabled
 
         # Create datasets for this fold using the patient lists
         self.train_dataset = HCCDicomDataset(

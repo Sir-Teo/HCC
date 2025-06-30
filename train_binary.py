@@ -565,9 +565,11 @@ def upsample_training_data(x_train, events):
     if len(idx_event_1) < len(idx_event_0):
         minority_idx = idx_event_1
         majority_idx = idx_event_0
+        minority_label = 1
     else:
         minority_idx = idx_event_0
         majority_idx = idx_event_1
+        minority_label = 0
 
     n_to_sample = n_majority - n_minority
     sampled_minority_idx = np.random.choice(minority_idx, size=n_to_sample, replace=True)
@@ -582,6 +584,162 @@ def upsample_training_data(x_train, events):
 
     print(f"Upsampled training data from {len(events)} to {len(events_upsampled)} samples. Minority class originally had {n_minority} samples.")
     return x_train_upsampled, events_upsampled
+
+def advanced_upsample_training_data(x_train_final, y_train_events, target_ratio=0.3, noise_std=0.1):
+    """
+    Advanced upsampling for extreme imbalance using multiple techniques.
+    Specifically designed for cases where SMOTE/ADASYN fail due to too few samples.
+    
+    Args:
+        x_train_final: Feature matrix [n_samples, n_features] 
+        y_train_events: Binary labels [n_samples]
+        target_ratio: Target positive ratio (default 0.3 = 30% positive)
+        noise_std: Standard deviation for noise injection
+    
+    Returns:
+        Upsampled features and labels
+    """
+    
+    positive_mask = y_train_events == 1
+    negative_mask = y_train_events == 0
+    
+    n_positive = positive_mask.sum()
+    n_negative = negative_mask.sum()
+    
+    if n_positive == 0:
+        print("[WARN] No positive samples found. Skipping upsampling.")
+        return x_train_final, y_train_events
+    
+    print(f"[INFO] Original distribution: {n_positive} positive, {n_negative} negative")
+    
+    # Calculate target number of positive samples
+    target_positive = int(n_negative * target_ratio / (1 - target_ratio))
+    samples_needed = max(0, target_positive - n_positive)
+    
+    if samples_needed == 0:
+        print("[INFO] Already sufficient positive samples")
+        return x_train_final, y_train_events
+    
+    print(f"[INFO] Need to generate {samples_needed} additional positive samples")
+    
+    # Get positive samples for augmentation
+    x_positive = x_train_final[positive_mask]
+    
+    # Track generated samples
+    generated_samples = []
+    generated_labels = []
+    generation_methods = []
+    
+    # Method 1: SMOTE (if possible)
+    if n_positive >= 2:
+        try:
+            k_neighbors = min(n_positive - 1, 2)  # Very conservative k
+            print(f"[INFO] Attempting SMOTE with k_neighbors={k_neighbors}")
+            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+            x_smote, y_smote = smote.fit_resample(x_train_final, y_train_events)
+            smote_generated = len(y_smote) - len(y_train_events)
+            if smote_generated > 0:
+                print(f"[INFO] SMOTE generated {smote_generated} samples")
+                # Extract only the new samples
+                new_samples = x_smote[len(x_train_final):]
+                generated_samples.append(new_samples)
+                generated_labels.extend([1] * len(new_samples))
+                generation_methods.extend(['smote'] * len(new_samples))
+        except Exception as e:
+            print(f"[WARN] SMOTE failed: {e}")
+    
+    # Method 2: Noise injection (always possible)
+    noise_samples = min(samples_needed // 3, n_positive * 2)  # Generate up to 2x original positive samples
+    if noise_samples > 0:
+        print(f"[INFO] Generating {noise_samples} samples via noise injection")
+        noise_features = []
+        for _ in range(noise_samples):
+            # Pick a random positive sample
+            base_idx = np.random.choice(len(x_positive))
+            base_sample = x_positive[base_idx].copy()
+            
+            # Add Gaussian noise
+            noise = np.random.normal(0, noise_std * np.std(x_positive, axis=0), base_sample.shape)
+            noisy_sample = base_sample + noise
+            noise_features.append(noisy_sample)
+        
+        if noise_features:
+            generated_samples.append(np.array(noise_features))
+            generated_labels.extend([1] * len(noise_features))
+            generation_methods.extend(['noise'] * len(noise_features))
+    
+    # Method 3: Feature perturbation
+    perturb_samples = min(samples_needed // 3, n_positive * 2)
+    if perturb_samples > 0:
+        print(f"[INFO] Generating {perturb_samples} samples via feature perturbation")
+        perturb_features = []
+        for _ in range(perturb_samples):
+            base_idx = np.random.choice(len(x_positive))
+            base_sample = x_positive[base_idx].copy()
+            
+            # Randomly perturb a subset of features
+            n_features_to_perturb = max(1, len(base_sample) // 10)  # Perturb 10% of features
+            feature_indices = np.random.choice(len(base_sample), n_features_to_perturb, replace=False)
+            
+            for idx in feature_indices:
+                # Perturb based on feature's variance in positive samples
+                feature_std = np.std(x_positive[:, idx])
+                perturbation = np.random.normal(0, feature_std * 0.2)  # 20% of std
+                base_sample[idx] += perturbation
+            
+            perturb_features.append(base_sample)
+        
+        if perturb_features:
+            generated_samples.append(np.array(perturb_features))
+            generated_labels.extend([1] * len(perturb_features))
+            generation_methods.extend(['perturbation'] * len(perturb_features))
+    
+    # Method 4: Mixup between positive samples
+    mixup_samples = min(samples_needed // 3, n_positive * 2)
+    if mixup_samples > 0 and n_positive >= 2:
+        print(f"[INFO] Generating {mixup_samples} samples via mixup")
+        mixup_features = []
+        for _ in range(mixup_samples):
+            # Pick two random positive samples
+            idx1, idx2 = np.random.choice(len(x_positive), 2, replace=False)
+            
+            # Random mixing coefficient
+            alpha = np.random.beta(0.2, 0.2)  # Beta distribution for mixing
+            
+            mixed_sample = alpha * x_positive[idx1] + (1 - alpha) * x_positive[idx2]
+            mixup_features.append(mixed_sample)
+        
+        if mixup_features:
+            generated_samples.append(np.array(mixup_features))
+            generated_labels.extend([1] * len(mixup_features))
+            generation_methods.extend(['mixup'] * len(mixup_features))
+    
+    # Combine all generated samples
+    if generated_samples:
+        all_generated = np.vstack(generated_samples)
+        
+        # Combine with original data
+        x_final = np.vstack([x_train_final, all_generated])
+        y_final = np.concatenate([y_train_events, generated_labels])
+        
+        # Print generation summary
+        from collections import Counter
+        method_counts = Counter(generation_methods)
+        print(f"[INFO] Generated {len(generated_labels)} samples via:")
+        for method, count in method_counts.items():
+            print(f"  - {method}: {count} samples")
+        
+        # Final statistics
+        final_positive = (y_final == 1).sum()
+        final_negative = (y_final == 0).sum()
+        final_ratio = final_positive / (final_positive + final_negative)
+        print(f"[INFO] Final upsampled data: {len(y_final)} samples ({final_positive} positive, {final_negative} negative)")
+        print(f"[INFO] Positive ratio: {final_ratio:.3f}")
+        
+        return x_final.astype(np.float32), y_final.astype(np.float32)
+    else:
+        print("[WARN] No samples could be generated")
+        return x_train_final, y_train_events
 
 def upsample_df(df, target_column='event'): # Keep this utility? Maybe not needed if upsampling features directly.
     df_majority = df[df[target_column] == 0]
@@ -633,7 +791,7 @@ def cross_validation_mode(args):
     all_fold_results = [] # Store results dictionary for each test patient
     fold_test_accuracies = [] # Store accuracy per fold for averaging
 
-    # --- Cross-Validation Loop ---
+    # --- Cross-Validation Loop --- 
     total_folds = data_module.get_total_folds()
     print(f"[INFO] Starting cross-validation with {total_folds} folds…")
 
@@ -743,34 +901,48 @@ def cross_validation_mode(args):
         x_test_final = slice_pool(x_test_tensor).squeeze(-1).numpy()
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
-        # SMOTE upsampling (optional)
-        if args.upsampling and args.upsampling_method == 'smote':
-            print(f"[INFO] Fold {current_fold + 1}: Applying SMOTE upsampling for binary...")
+
+        
+        # Advanced upsampling for extreme imbalance
+        if args.upsampling and args.upsampling_method in ['smote', 'adasyn']:
+            print(f"[INFO] Fold {current_fold + 1}: Applying advanced upsampling for extreme imbalance...")
+            
             classes, counts = np.unique(y_train_events, return_counts=True)
             if len(classes) > 1:
                 n_minority = counts.min()
-                k = min(5, n_minority - 1)
-                if k >= 1:
-                    smote = SMOTE(random_state=42, k_neighbors=k)
-                    x_train_final, y_train_events = smote.fit_resample(x_train_final, y_train_events)
-                else:
-                    print(f"[WARN] Fold {current_fold + 1}: minority class too small for SMOTE (n_minority={n_minority}). Skipping SMOTE.")
+                success = False
+                
+                # Try SMOTE first if enough samples
+                if args.upsampling_method == 'smote' and n_minority >= 2:
+                    k = min(5, n_minority - 1)
+                    if k >= 1:
+                        try:
+                            smote = SMOTE(random_state=42, k_neighbors=k)
+                            x_train_final, y_train_events = smote.fit_resample(x_train_final, y_train_events)
+                            print(f"[INFO] SMOTE successful: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
+                            success = True
+                        except Exception as e:
+                            print(f"[WARN] SMOTE failed: {e}")
+                
+                # Try ADASYN if SMOTE failed or was requested
+                if not success and args.upsampling_method == 'adasyn' and n_minority >= 2:
+                    try:
+                        adasyn = ADASYN(random_state=42)
+                        x_train_final, y_train_events = adasyn.fit_resample(x_train_final, y_train_events)
+                        print(f"[INFO] ADASYN successful: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
+                        success = True
+                    except Exception as e:
+                        print(f"[WARN] ADASYN failed: {e}")
+                
+                # Fall back to advanced upsampling if standard methods failed
+                if not success:
+                    print(f"[INFO] Standard methods failed, using advanced upsampling techniques...")
+                    x_train_final, y_train_events = advanced_upsample_training_data(
+                        x_train_final, y_train_events, target_ratio=0.2, noise_std=0.1
+                    )
+                    print(f"[INFO] Advanced upsampling successful: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
             else:
-                print(f"[WARN] Fold {current_fold + 1}: single-class. Skipping SMOTE.")
-            print(f"[INFO] After SMOTE: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
-        # ADASYN upsampling (optional)
-        if args.upsampling and args.upsampling_method == 'adasyn':
-            print(f"[INFO] Fold {current_fold + 1}: Applying ADASYN upsampling for binary...")
-            classes, counts = np.unique(y_train_events, return_counts=True)
-            if len(classes) > 1:
-                adasyn = ADASYN(random_state=42)
-                try:
-                    x_train_final, y_train_events = adasyn.fit_resample(x_train_final, y_train_events)
-                except ValueError as e:
-                    print(f"[WARN] Fold {current_fold + 1}: ADASYN error {e}. Skipping ADASYN.")
-            else:
-                print(f"[WARN] Fold {current_fold + 1}: single-class. Skipping ADASYN.")
-            print(f"[INFO] After ADASYN: Train {x_train_final.shape}, events {int(sum(y_train_events))}")
+                print(f"[WARN] Fold {current_fold + 1}: single-class. Skipping upsampling.")
         # --- Model Training --- 
         in_features = x_train_final.shape[1]
         # Build requested architecture
@@ -840,10 +1012,10 @@ def cross_validation_mode(args):
         elif args.label_smoothing > 0:
             criterion = LabelSmoothingBCE(smoothing=args.label_smoothing, pos_weight=pos_weight)
         else:
-            if pos_weight is not None:
-                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            else:
-                criterion = torch.nn.BCEWithLogitsLoss()
+                if pos_weight is not None:
+                    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+                else:
+                    criterion = torch.nn.BCEWithLogitsLoss()
 
         # Prepare training, validation and test tensors
         train_tensor_x = torch.tensor(x_train_final, dtype=torch.float32).to(device)
@@ -904,17 +1076,22 @@ def cross_validation_mode(args):
             
             # --- Early Stopping & Model Checkpointing --- 
             if args.early_stopping and has_validation_data:
-                # Compute precision-recall based metric for early stopping
+                # Compute precision-focused metric for early stopping
                 if val_accuracy_epoch is not None:
                     with torch.no_grad():
                         val_logits = net(val_tensor_x)
                         val_probs = torch.sigmoid(val_logits).cpu().numpy().flatten()
                         val_true = val_tensor_y.cpu().numpy().flatten()
                         
-                    # Calculate AUPRC as early stopping metric
+                    # Use precision-focused threshold tuning for early stopping
                     if len(np.unique(val_true)) > 1:
-                        val_auprc = average_precision_score(val_true, val_probs)
-                        current_metric_for_stopping = -val_auprc  # Negative for minimization
+                        # Get precision-focused metric
+                        _, best_precision, best_recall, best_f1 = precision_focused_threshold_tuning(
+                            val_true, val_probs, min_recall=0.2, precision_weight=0.8
+                        )
+                        # Use a combination of precision and F1 for early stopping
+                        precision_f1_metric = 0.7 * best_precision + 0.3 * best_f1
+                        current_metric_for_stopping = -precision_f1_metric  # Negative for minimization
                     else:
                         current_metric_for_stopping = val_loss_epoch
                 else:
@@ -924,9 +1101,11 @@ def cross_validation_mode(args):
                     best_val_loss = current_metric_for_stopping
                     best_model_state = net.state_dict().copy() # Save best model
                     epochs_no_improve = 0
-                    metric_name = "AUPRC" if val_accuracy_epoch is not None else "Loss"
-                    metric_val = -current_metric_for_stopping if val_accuracy_epoch is not None else current_metric_for_stopping
-                    print(f"[Fold {current_fold + 1}] New best validation {metric_name}: {metric_val:.4f}. Saving model.")
+                    if val_accuracy_epoch is not None and len(np.unique(val_true)) > 1:
+                        metric_val = -current_metric_for_stopping
+                        print(f"[Fold {current_fold + 1}] New best validation metric: {metric_val:.4f} (Precision: {best_precision:.4f}, F1: {best_f1:.4f}). Saving model.")
+                    else:
+                        print(f"[Fold {current_fold + 1}] New best validation loss: {current_metric_for_stopping:.4f}. Saving model.")
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= patience:
@@ -961,40 +1140,25 @@ def cross_validation_mode(args):
                 print(f"[Fold {current_fold + 1}] Validation AUPRC (scores): {best_score_pr:.4f}")
                 metric_to_optimize = 'f1'
 
-            # Initialize tracking variables for best threshold search
-            best_score, best_thr = 0.0, 0.5
-            
-            # Also track precision-focused threshold
-            best_precision_score, best_precision_thr = 0.0, 0.5
-
-            for t in np.linspace(0.05, 0.95, 181):  # Finer grid for better precision
-                preds = (val_probs_full >= t).astype(int)
-                if metric_to_optimize == 'f1':
-                    score = f1_score(val_true, preds, zero_division=0)
-                else:
-                    score = accuracy_score(val_true, preds)
-                    
-                # Track precision-focused metric
-                precision = precision_score(val_true, preds, zero_division=0)
-                recall = recall_score(val_true, preds, zero_division=0)
-                # Precision-recall balance with precision emphasis
-                pr_balance = 0.7 * precision + 0.3 * recall if (precision + recall) > 0 else 0
-                
-                if score > best_score:
-                    best_score, best_thr = score, t
-                    
-                if pr_balance > best_precision_score:
-                    best_precision_score, best_precision_thr = pr_balance, t
-                    
-            print(f"[Fold {current_fold + 1}] Best threshold‐tuned F1 {best_score:.4f} at threshold {best_thr:.2f}")
-            print(f"[Fold {current_fold + 1}] Best precision-focused score {best_precision_score:.4f} at threshold {best_precision_thr:.2f}")
-            
-            # Use precision-focused threshold if it's significantly better
-            if best_precision_score > 0.8 * best_score:
-                threshold = best_precision_thr
-                print(f"[Fold {current_fold + 1}] Using precision-focused threshold: {threshold:.2f}")
+            # Use precision-focused threshold tuning
+            if len(np.unique(val_true)) > 1:
+                best_threshold, best_precision, best_recall, best_f1 = precision_focused_threshold_tuning(
+                    val_true, val_probs_full, min_recall=0.2, precision_weight=0.8
+                )
+                threshold = best_threshold
+                print(f"[Fold {current_fold + 1}] Precision-focused threshold tuning:")
+                print(f"[Fold {current_fold + 1}] Best threshold: {best_threshold:.3f}")
+                print(f"[Fold {current_fold + 1}] Precision: {best_precision:.4f}, Recall: {best_recall:.4f}, F1: {best_f1:.4f}")
             else:
+                # Fallback to simple F1 optimization if only one class in validation
+                best_score, best_thr = 0.0, 0.5
+                for t in np.linspace(0.05, 0.95, 181):
+                    preds = (val_probs_full >= t).astype(int)
+                    score = f1_score(val_true, preds, zero_division=0)
+                    if score > best_score:
+                        best_score, best_thr = score, t
                 threshold = best_thr
+                print(f"[Fold {current_fold + 1}] Fallback F1 threshold: {best_thr:.3f} (F1: {best_score:.4f})")
 
         # --- Final Evaluation on Test Set ---
         net.eval()
@@ -1025,7 +1189,7 @@ def cross_validation_mode(args):
             }
             all_fold_results.append(fold_results)
 
-    print("\n===== Finished all folds =====")
+    print(f"\n===== Finished all {total_folds} folds =====")
 
     # --- Aggregation and Final Reporting --- 
     if not all_fold_results:
@@ -1137,6 +1301,53 @@ def cross_validation_mode(args):
     except Exception as e:
         print(f"[ERROR] Failed to save run summary: {e}")
 
+def precision_focused_threshold_tuning(y_true, y_scores, min_recall=0.3, precision_weight=0.7):
+    """
+    Precision-focused threshold tuning that optimizes for precision while maintaining minimum recall.
+    
+    Args:
+        y_true: True binary labels
+        y_scores: Predicted probability scores
+        min_recall: Minimum acceptable recall (default 0.3)
+        precision_weight: Weight for precision vs F1 (default 0.7 = 70% precision emphasis)
+    
+    Returns:
+        tuple: (best_threshold, best_precision, best_recall, best_f1)
+    """
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_score = -1
+    best_threshold = 0.5
+    best_precision = 0
+    best_recall = 0
+    best_f1 = 0
+    
+    for threshold in thresholds:
+        y_pred = (y_scores >= threshold).astype(int)
+        
+        if np.sum(y_pred) == 0:  # No positive predictions
+            continue
+            
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        
+        # Skip if recall is too low
+        if recall < min_recall:
+            continue
+        
+        # Precision-focused scoring with minimum recall constraint
+        # Combine precision and F1 with heavy emphasis on precision
+        score = precision_weight * precision + (1 - precision_weight) * f1
+        
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_precision = precision
+            best_recall = recall
+            best_f1 = f1
+    
+    return best_threshold, best_precision, best_recall, best_f1
+
 def main(args):
     # If hyper-parameter search is requested, training will be handled later.
     if args.hyper_search_iters <= 1:
@@ -1163,10 +1374,10 @@ def main(args):
         lr_sample = 10 ** random.uniform(-7, -3)
         trial_args.learning_rate = lr_sample
 
-        # Model architecture choice - bias towards successful architectures
+        # Model architecture choice - heavily bias towards precision-focused architectures
         trial_args.model_arch = random.choices(
             ['linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced'], 
-            weights=[0.05, 0.1, 0.2, 0.3, 0.25, 0.1, 0.05]  # Heavily favor new precision architectures
+            weights=[0.02, 0.05, 0.13, 0.35, 0.30, 0.12, 0.03]  # Heavily favor precision architectures for extreme imbalance
         )[0]
         
         if trial_args.model_arch in ['mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced']:
@@ -1194,7 +1405,7 @@ def main(args):
 
         # Loss function strategy - bias towards precision-focused losses
         loss_strategy = random.choices(['focal', 'precision_recall_focal', 'cost_sensitive', 'label_smooth', 'standard'], 
-                                     weights=[0.3, 0.3, 0.2, 0.1, 0.1])[0]
+                                     weights=[0.2, 0.5, 0.25, 0.03, 0.02])[0]  # Heavily favor precision-focused losses
         
         if loss_strategy == 'focal':
             trial_args.focal_loss = True
