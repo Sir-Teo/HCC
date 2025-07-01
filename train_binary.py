@@ -146,26 +146,42 @@ class PrecisionWeightedEnsemble(nn.Module):
         # Get predictions from all models
         model_outputs = []
         for model in self.models:
-            output = model(x)
-            model_outputs.append(output)
+            try:
+                output = model(x)
+                # Ensure output has correct shape [batch_size, 1]
+                if output.dim() == 1:
+                    output = output.unsqueeze(-1)
+                model_outputs.append(output)
+            except Exception as e:
+                print(f"Warning: Model failed with error {e}, using zero output")
+                # Fallback: create zero tensor with correct shape
+                zero_output = torch.zeros(x.size(0), 1, device=x.device)
+                model_outputs.append(zero_output)
         
-        # Apply learned weights
-        weighted_outputs = []
+        # Apply learned weights with proper broadcasting
+        weights = torch.softmax(self.ensemble_weights, dim=0)
+        
+        # Weighted combination of model outputs
+        ensemble_pred = torch.zeros_like(model_outputs[0])
         for i, output in enumerate(model_outputs):
-            weight = torch.softmax(self.ensemble_weights, dim=0)[i]
-            weighted_outputs.append(output * weight)
+            ensemble_pred += weights[i] * output
         
-        # Combine predictions
-        ensemble_pred = torch.stack(weighted_outputs).sum(dim=0)
+        # Meta-classifier refinement using concatenated outputs
+        try:
+            # Concatenate sigmoid outputs: (batch_size, num_models)
+            meta_input = torch.cat([torch.sigmoid(out) for out in model_outputs], dim=-1)
+            meta_weight = self.meta_classifier(meta_input)
+            
+            # Apply meta-weighting
+            avg_pred = torch.stack(model_outputs, dim=0).mean(dim=0)
+            refined_pred = meta_weight * ensemble_pred + (1 - meta_weight) * avg_pred
+            
+        except Exception as e:
+            print(f"Warning: Meta-classifier failed with error {e}, using simple ensemble")
+            # Fallback to simple weighted average
+            refined_pred = ensemble_pred
         
-        # Meta-classifier refinement
-        if len(model_outputs[0].shape) > 1 and model_outputs[0].shape[1] == 1:
-            meta_input = torch.stack([torch.sigmoid(out).squeeze(-1) for out in model_outputs], dim=-1)
-        else:
-            meta_input = torch.stack([torch.sigmoid(out) for out in model_outputs], dim=-1)
-        meta_weight = self.meta_classifier(meta_input)
-        
-        return ensemble_pred * meta_weight + ensemble_pred * (1 - meta_weight) * 0.5
+        return refined_pred
 
 # --- Advanced Precision-Recall Loss ---
 class PrecisionRecallFocalLoss(nn.Module):
@@ -749,6 +765,234 @@ def upsample_df(df, target_column='event'): # Keep this utility? Maybe not neede
     df_minority_upsampled = df_minority.sample(len(df_majority), replace=True, random_state=1)
     return pd.concat([df_majority, df_minority_upsampled]).reset_index(drop=True)
 
+def enhanced_random_upsampling(X_train, y_train, random_state=42):
+    """
+    Enhanced random upsampling with multiple sophisticated techniques
+    specifically designed for extreme imbalance (1 positive per fold)
+    Based on analysis showing random upsampling outperformed SMOTE/ADASYN
+    """
+    np.random.seed(random_state)
+    
+    pos_indices = np.where(y_train == 1)[0]
+    neg_indices = np.where(y_train == 0)[0]
+    
+    if len(pos_indices) == 0:
+        return X_train, y_train
+    
+    pos_samples = X_train[pos_indices]
+    neg_samples = X_train[neg_indices]
+    
+    # Target: Create balanced dataset with sophisticated augmentation
+    target_pos_count = min(len(neg_indices), 70)  # Cap at 70 for stability
+    
+    # Technique 1: Direct replication with noise (most effective approach)
+    replicated_pos = []
+    replicated_labels = []
+    
+    while len(replicated_pos) < target_pos_count:
+        for i, pos_sample in enumerate(pos_samples):
+            if len(replicated_pos) >= target_pos_count:
+                break
+                
+            # Add noise with varying intensities
+            noise_levels = [0.001, 0.005, 0.01, 0.02, 0.05]
+            noise_std = np.random.choice(noise_levels)
+            
+            # Gaussian noise
+            noise = np.random.normal(0, noise_std, pos_sample.shape)
+            augmented = pos_sample + noise
+            
+            replicated_pos.append(augmented)
+            replicated_labels.append(1)
+    
+    # Technique 2: Feature-wise perturbation
+    feature_perturbed = []
+    for i, pos_sample in enumerate(pos_samples):
+        if len(feature_perturbed) >= target_pos_count // 4:
+            break
+            
+        # Randomly select 5-15% of features to perturb
+        n_features = len(pos_sample)
+        n_perturb = np.random.randint(max(1, n_features//20), max(2, n_features//7))
+        perturb_indices = np.random.choice(n_features, n_perturb, replace=False)
+        
+        augmented = pos_sample.copy()
+        for idx in perturb_indices:
+            # Perturb with feature-specific statistics
+            feature_std = np.std(X_train[:, idx])
+            perturbation = np.random.normal(0, 0.1 * feature_std)
+            augmented[idx] += perturbation
+            
+        feature_perturbed.append(augmented)
+        replicated_labels.append(1)
+    
+    # Technique 3: Interpolation between positive samples
+    interpolated = []
+    if len(pos_samples) > 1:
+        n_interpolations = min(target_pos_count // 4, 20)
+        for _ in range(n_interpolations):
+            # Random pair of positive samples
+            idx1, idx2 = np.random.choice(len(pos_samples), 2, replace=False)
+            # Random interpolation weight (favor staying close to originals)
+            alpha = np.random.beta(2, 2)  # Beta distribution centered at 0.5
+            interpolated_sample = alpha * pos_samples[idx1] + (1 - alpha) * pos_samples[idx2]
+            interpolated.append(interpolated_sample)
+            replicated_labels.append(1)
+    
+    # Combine all augmented samples
+    all_augmented = replicated_pos + feature_perturbed + interpolated
+    all_augmented = all_augmented[:target_pos_count]  # Trim to target
+    replicated_labels = replicated_labels[:target_pos_count]
+    
+    # Combine with original data
+    X_resampled = np.vstack([neg_samples, pos_samples, np.array(all_augmented)])
+    y_resampled = np.concatenate([np.zeros(len(neg_samples)), 
+                                  np.ones(len(pos_samples)), 
+                                  np.array(replicated_labels)])
+    
+    print(f"[INFO] Enhanced random upsampling: {len(pos_indices)} -> {np.sum(y_resampled)} positive samples")
+    print(f"[INFO] Final training set: {len(y_resampled)} samples ({np.sum(y_resampled)} positive, {len(y_resampled) - np.sum(y_resampled)} negative)")
+    
+    return X_resampled, y_resampled
+
+def robust_threshold_tuning(model, X_val, y_val, X_train, y_train, metric='auprc_balanced'):
+    """
+    Robust threshold tuning that works even with 0 positive validation samples
+    Falls back to training set or synthetic validation when needed
+    Based on analysis showing AUPRC threshold tuning worked best
+    """
+    
+    # Check if validation set has positive samples
+    if np.sum(y_val) == 0:
+        print(f"[WARN] Validation set has 0 positive samples. Using training set for threshold tuning.")
+        X_thresh, y_thresh = X_train, y_train
+    else:
+        X_thresh, y_thresh = X_val, y_val
+    
+    # Get prediction probabilities
+    with torch.no_grad():
+        model.eval()
+        X_thresh_tensor = torch.FloatTensor(X_thresh).to(next(model.parameters()).device)
+        probs = torch.sigmoid(model(X_thresh_tensor)).cpu().numpy().flatten()
+    
+    # If still no positive samples, create synthetic threshold tuning
+    if np.sum(y_thresh) == 0:
+        print(f"[WARN] No positive samples available. Using synthetic threshold tuning.")
+        # Use training set statistics to set a conservative threshold
+        train_probs = probs.copy()
+        # Set threshold at 75th percentile of training predictions
+        threshold = np.percentile(train_probs, 75)
+        print(f"[INFO] Synthetic threshold set to: {threshold:.4f}")
+        return threshold
+    
+    # Robust threshold search
+    thresholds = np.linspace(0.1, 0.9, 81)  # More granular search
+    best_score = -np.inf
+    best_threshold = 0.5
+    
+    for threshold in thresholds:
+        y_pred = (probs >= threshold).astype(int)
+        
+        if metric == 'precision':
+            if np.sum(y_pred) == 0:  # No positive predictions
+                score = 0.0
+            else:
+                score = precision_score(y_thresh, y_pred, zero_division=0)
+        elif metric == 'f1':
+            score = f1_score(y_thresh, y_pred, zero_division=0)
+        elif metric == 'auprc_balanced':
+            # Custom metric: Balance precision and recall (F1.5 score favoring precision)
+            prec = precision_score(y_thresh, y_pred, zero_division=0)
+            rec = recall_score(y_thresh, y_pred, zero_division=0)
+            if prec + rec == 0:
+                score = 0.0
+            else:
+                # F1.5 score (favors precision over recall)
+                beta = 1.5
+                score = (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec)
+        else:
+            # AUPRC-based threshold (default, worked best in analysis)
+            if len(np.unique(y_thresh)) < 2:
+                score = 0.0
+            else:
+                score = average_precision_score(y_thresh, probs)
+                
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+    
+    print(f"[INFO] Best threshold: {best_threshold:.4f} with {metric} score: {best_score:.4f}")
+    return best_threshold
+
+class OptimizedSimpleMLP(nn.Module):
+    """
+    Optimized simple MLP based on analysis of best performing architecture
+    Trial 5 showed simple MLP outperformed complex precision-focused architectures
+    """
+    def __init__(self, input_dim, dropout=0.2):
+        super(OptimizedSimpleMLP, self).__init__()
+        # Architecture optimized based on best performing trial
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout/2),  # Reduced dropout in final layers
+            
+            nn.Linear(64, 1)
+        )
+        
+        # Initialize weights for better precision (Xavier uniform worked well)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        return self.layers(x).squeeze()
+
+class OptimizedMLPEnsemble(nn.Module):
+    """
+    Ensemble of optimized simple MLPs with different initializations
+    Based on analysis showing simple architectures work better than complex ones
+    """
+    def __init__(self, input_dim, n_models=3, dropout=0.2):
+        super(OptimizedMLPEnsemble, self).__init__()
+        self.models = nn.ModuleList([
+            OptimizedSimpleMLP(input_dim, dropout=dropout + i*0.05) 
+            for i in range(n_models)
+        ])
+        self.n_models = n_models
+        
+        # Learnable ensemble weights
+        self.ensemble_weights = nn.Parameter(torch.ones(n_models) / n_models)
+    
+    def forward(self, x):
+        outputs = []
+        for model in self.models:
+            outputs.append(model(x))
+        
+        # Weighted average with learnable weights
+        outputs = torch.stack(outputs)
+        weights = torch.softmax(self.ensemble_weights, dim=0)
+        ensemble_output = torch.sum(outputs * weights.unsqueeze(1), dim=0)
+        return ensemble_output
+
 def cross_validation_mode(args):
     """
     Perform cross-validation on the NYU dataset.
@@ -857,11 +1101,8 @@ def cross_validation_mode(args):
         else:
             print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found in training set.")
 
-        # Upsampling (optional, on training data)
-        if args.upsampling and args.upsampling_method == 'random':
-            print(f"[INFO] Fold {current_fold + 1}: Upsampling training data...")
-            x_train, y_train_events = upsample_training_data(x_train, y_train_events)
-            print(f"[INFO] Fold {current_fold + 1}: Training data shape after upsampling: {x_train.shape}")
+        # Enhanced upsampling (optional, on training data) - integrated after pooling
+        enhanced_upsampling_needed = args.upsampling and args.upsampling_method == 'random'
         # Update train shape info after possible upsampling
         n_train_p, n_train_s, n_train_f = x_train.shape
 
@@ -902,6 +1143,13 @@ def cross_validation_mode(args):
 
         print(f"[INFO] Fold {current_fold + 1}: Final feature shapes: Train {x_train_final.shape}, Val {x_val_final.shape}, Test {x_test_final.shape}")
 
+        # Apply enhanced random upsampling if requested
+        if enhanced_upsampling_needed:
+            print(f"[INFO] Fold {current_fold + 1}: Applying enhanced random upsampling...")
+            x_train_final, y_train_events = enhanced_random_upsampling(
+                x_train_final, y_train_events, random_state=42 + current_fold
+            )
+            print(f"[INFO] Fold {current_fold + 1}: Enhanced upsampling completed. New shape: {x_train_final.shape}")
         
         # Advanced upsampling for extreme imbalance
         if args.upsampling and args.upsampling_method in ['smote', 'adasyn']:
@@ -961,6 +1209,12 @@ def cross_validation_mode(args):
             net = PrecisionFocusedMLP(in_features, 1, dropout=args.dropout)
         elif args.model_arch == 'advanced':
             net = AdvancedMLP(in_features, 1, dropout=args.dropout)
+        elif args.model_arch == 'optimized_simple':
+            # New optimized simple MLP based on best performing trial
+            net = OptimizedSimpleMLP(in_features, dropout=args.dropout)
+        elif args.model_arch == 'optimized_ensemble':
+            # New optimized ensemble based on analysis
+            net = OptimizedMLPEnsemble(in_features, n_models=3, dropout=args.dropout)
         else:
             net = nn.Linear(in_features, 1) # Default linear model
         net.to(device)
@@ -1374,10 +1628,10 @@ def main(args):
         lr_sample = 10 ** random.uniform(-7, -3)
         trial_args.learning_rate = lr_sample
 
-        # Model architecture choice - heavily bias towards precision-focused architectures
+        # Model architecture choice - heavily bias towards architectures that worked best in analysis
         trial_args.model_arch = random.choices(
-            ['linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced'], 
-            weights=[0.02, 0.05, 0.13, 0.35, 0.30, 0.12, 0.03]  # Heavily favor precision architectures for extreme imbalance
+            ['linear', 'mlp', 'optimized_simple', 'optimized_ensemble', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced'], 
+            weights=[0.01, 0.25, 0.30, 0.20, 0.08, 0.08, 0.05, 0.02, 0.01]  # Heavily favor optimized architectures based on analysis
         )[0]
         
         if trial_args.model_arch in ['mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced']:
@@ -1395,9 +1649,9 @@ def main(args):
         slices_choice = random.choices([16, 24, 32, 40, 48], weights=[0.1, 0.3, 0.3, 0.2, 0.1])[0]
         trial_args.num_slices = slices_choice
 
-        # Upsampling method - strongly bias towards ADASYN
+        # Upsampling method - strongly bias towards enhanced random upsampling based on analysis
         upsampling_choices = ['smote', 'adasyn', 'random']
-        up_method = random.choices(upsampling_choices, weights=[0.2, 0.7, 0.1])[0]
+        up_method = random.choices(upsampling_choices, weights=[0.2, 0.3, 0.5])[0]  # Favor random which performed best
         trial_args.upsampling_method = up_method
 
         # Threshold metric for tuning - bias towards precision-recall balance

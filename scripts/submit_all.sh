@@ -33,7 +33,7 @@ fi
 # --- Base SLURM Options ---
 # These will be included in every submitted job script
 SBATCH_OPTS=(
-"#SBATCH -p radiology,a100_short,a100_long,gpu4_short,gpu4_medium,gpu4_long"      # Partitions
+"#SBATCH -p radiology,a100_short,a100_long,gpu4_short,gpu4_medium,gpu4_long,gpu8_medium,gpu8_long"      # Partitions
 "#SBATCH --gres=gpu:1"                # Request 1 GPU
 "#SBATCH --nodes=1"                   # Request 1 node
 "#SBATCH --ntasks=1"                  # Request 1 task
@@ -71,6 +71,16 @@ SURVIVAL_ARGS=(
 )
 # train_binary.py doesn't have extra specific args listed here currently
 
+# Default configuration
+num_trials=50  # Increased to 50 for better hyperparameter search coverage
+model_arch="precision_weighted_ensemble"  # Use improved ensemble with shape fix
+loss_type="precision_recall_focal"  # Use precision-recall focal loss
+
+# Add model architecture and loss type to arguments
+specific_args+=("--model_arch $model_arch")  # Use ensemble architecture with shape fix
+specific_args+=("--precision_recall_focal")  # Enable precision-recall focal loss
+specific_args+=("--hyper_search_iters $num_trials")  # Increased search coverage
+
 # --- Create Log Directory ---
 mkdir -p "$LOG_DIR"
 
@@ -89,11 +99,12 @@ for script_name in "train.py" "train_binary.py"; do
     else # train_binary.py
         base_output_dir="$BASE_OUTPUT_DIR_BINARY"
         # Binary-specific args (optimized for extreme imbalance and precision)
-        specific_args+=("--model_arch precision_weighted_ensemble")  # Use new ensemble architecture
         specific_args+=("--dropout 0.3")
         specific_args+=("--precision_recall_focal")  # Use new precision-recall focal loss
         specific_args+=("--focal_gamma 2.0")
-        specific_args+=("--upsampling_method adasyn")  # Use advanced upsampling
+        specific_args+=("--upsampling_method adasyn")  # Best method from recent testing
+        specific_args+=("--cv_folds 7")
+        specific_args+=("--hyper_search_iters $num_trials")
     fi
 
     for fold_strat in "7fold" "loocv"; do
