@@ -66,8 +66,8 @@ COMMON_ARGS=(
 SURVIVAL_ARGS=(
 "--center_risk"
 "--coxph_net mlp"
-"--alpha 0.5"
-"--gamma 0.5"
+"--alpha 0.1"  # Reduced from 0.5 for less aggressive regularization
+"--gamma 0.3"  # Reduced from 0.5 for more L2 regularization
 )
 # train_binary.py doesn't have extra specific args listed here currently
 
@@ -107,7 +107,7 @@ for script_name in "train.py" "train_binary.py"; do
         specific_args+=("--hyper_search_iters $num_trials")
     fi
 
-    for fold_strat in "7fold" "loocv"; do
+    for fold_strat in "7fold"; do
         echo "      Fold Strategy: $fold_strat"
 
         # --- Determine Fold Args ---
@@ -140,7 +140,7 @@ for script_name in "train.py" "train_binary.py"; do
 
         # Override learning rate for survival CV
         if [ "$script_name" == "train.py" ]; then
-            lr=1e-7
+            lr=1e-4  # Use improved default instead of 1e-7
             PYTHON_CMD="$PYTHON_CMD --learning_rate $lr"
         fi
 

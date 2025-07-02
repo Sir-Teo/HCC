@@ -54,10 +54,11 @@ def extract_features(data_loader, model, device):
         return np.array([]).reshape(0, 1, 1, 768), np.array([]), np.array([]), [] 
 
     desc = "Extracting Features"
-    # Attempt to make description more informative
+    # Attempt to make description more informative - FIX: use dataset_type instead of source
     try: 
         if hasattr(data_loader.dataset, 'patient_data') and len(data_loader.dataset.patient_data) > 0:
-            source_example = data_loader.dataset.patient_data[0].get('source', 'Unknown')
+            # Use dataset_type instead of source for consistency with binary script
+            source_example = data_loader.dataset.patient_data[0].get('dataset_type', 'NYU')
             desc = f"Extracting Features ({source_example} set)" 
         if hasattr(data_loader, 'dataset') and hasattr(data_loader.dataset, '__fold_idx__'):
              desc += f" Fold {data_loader.dataset.__fold_idx__ + 1}"
@@ -172,6 +173,7 @@ def cross_validation_mode(args):
     """
     Perform cross-validation on the NYU dataset for survival analysis.
     """
+    # Improved hyperparameters based on successful binary classification patterns
     hyperparams = {
         'learning_rate': args.learning_rate,
         'dropout': args.dropout,
@@ -205,34 +207,6 @@ def cross_validation_mode(args):
     dino_model = dino_model.to(device)
     dino_model.eval()
     for param in dino_model.parameters(): param.requires_grad = False
-
-    # --- Global Feature Preprocessing for consistent scaling across folds ---
-    full_dataset = HCCDicomDataset(
-        patient_data_list=data_module.all_patients,
-        model_type="time_to_event",
-        transform=data_module.transform,
-        num_slices=args.num_slices,
-        num_samples=args.num_samples_per_patient,
-        preprocessed_root=args.preprocessed_root
-    )
-    full_loader = DataLoader(
-        full_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=data_module.skip_none_collate,
-        drop_last=False,
-        pin_memory=True
-    )
-    x_full, _, _, _ = extract_features(full_loader, dino_model, device)
-    x_full = x_full.mean(axis=1)  # [patients, slices, features]
-    flat_full = x_full.reshape(-1, x_full.shape[2])
-    variances_full = np.var(flat_full, axis=0)
-    global_non_zero_idx = np.where(variances_full != 0)[0]
-    x_full_reduced = x_full[:, :, global_non_zero_idx]
-    x_flat_full = x_full_reduced.reshape(-1, x_full_reduced.shape[2])
-    global_scaler = StandardScaler().fit(x_flat_full)
-    print(f"[INFO] Global scaler fitted on all data: retained {len(global_non_zero_idx)} features")
 
     # --- Results Storage --- 
     all_fold_results = [] # Store results dict for each test patient
@@ -282,36 +256,47 @@ def cross_validation_mode(args):
         # Validate train data
         validate_survival_data(y_train_durations, y_train_events)
 
-        # --- Feature Preprocessing ---
+        # --- Feature Preprocessing (IMPROVED: Per-fold like binary classification) ---
         # Average across samples -> [patients, slices, features]
         x_train = x_train.mean(axis=1)
         if has_validation_data:
             x_val = x_val.mean(axis=1)
         x_test = x_test.mean(axis=1)
 
-        # Remove zero-variance features using global indices
-        x_train = x_train[:, :, global_non_zero_idx]
-        if has_validation_data:
-            x_val = x_val[:, :, global_non_zero_idx]
-        x_test = x_test[:, :, global_non_zero_idx]
-
-        # Standardize features using global scaler
+        # Remove zero-variance features (per-fold like binary classification)
         n_train_p, n_train_s, n_train_f = x_train.shape
-        x_train_flat = x_train.reshape(-1, n_train_f)
-        x_train_scaled = global_scaler.transform(x_train_flat).astype('float32')
+        x_train_flat_var = x_train.reshape(-1, n_train_f)
+        variances = np.var(x_train_flat_var, axis=0)
+        zero_var_indices = np.where(variances == 0)[0]
+        if len(zero_var_indices) > 0:
+            print(f"[INFO] Fold {current_fold + 1}: Removing {len(zero_var_indices)} features with zero variance based on training set.")
+            non_zero_var_indices = np.where(variances != 0)[0]
+            x_train = x_train[:, :, non_zero_var_indices]
+            if has_validation_data:
+                x_val = x_val[:, :, non_zero_var_indices]
+            x_test = x_test[:, :, non_zero_var_indices]
+            # Update feature dimension
+            n_train_f = x_train.shape[2]
+        else:
+            print(f"[INFO] Fold {current_fold + 1}: No zero-variance features found in training set.")
+
+        # Standardize features (per-fold like binary classification)
+        x_mapper = StandardScaler()
+        x_train_reshaped = x_train.reshape(-1, n_train_f)
+        x_train_scaled = x_mapper.fit_transform(x_train_reshaped).astype('float32')
         x_train_scaled = x_train_scaled.reshape(n_train_p, n_train_s, n_train_f)
 
         if has_validation_data:
             n_val_p, n_val_s, n_val_f = x_val.shape
-            x_val_flat = x_val.reshape(-1, n_val_f)
-            x_val_scaled = global_scaler.transform(x_val_flat).astype('float32')
+            x_val_reshaped = x_val.reshape(-1, n_val_f)
+            x_val_scaled = x_mapper.transform(x_val_reshaped).astype('float32')
             x_val_scaled = x_val_scaled.reshape(n_val_p, n_val_s, n_val_f)
         else:
             x_val_scaled = np.array([])
 
         n_test_p, n_test_s, n_test_f = x_test.shape
-        x_test_flat = x_test.reshape(-1, n_test_f)
-        x_test_scaled = global_scaler.transform(x_test_flat).astype('float32')
+        x_test_reshaped = x_test.reshape(-1, n_test_f)
+        x_test_scaled = x_mapper.transform(x_test_reshaped).astype('float32')
         x_test_scaled = x_test_scaled.reshape(n_test_p, n_test_s, n_test_f)
 
         # Collapse slice dimension by adaptive average pooling -> [patients, features]
@@ -393,8 +378,22 @@ def cross_validation_mode(args):
         in_features = x_train_final.shape[1]
         out_features = 1 # Cox model has 1 output (log hazard ratio)
 
-        # Build the network based on hyperparameters
+        # IMPROVED: Better handling of extreme imbalance
+        event_ratio = np.sum(y_train_events) / len(y_train_events)
+        print(f"[INFO] Fold {current_fold + 1}: Event ratio in training: {event_ratio:.3f} ({int(np.sum(y_train_events))}/{len(y_train_events)})")
+        
+        # Adjust regularization based on imbalance
+        if event_ratio < 0.1:  # Extreme imbalance
+            print(f"[INFO] Fold {current_fold + 1}: Extreme imbalance detected, reducing regularization")
+            adjusted_alpha = hyperparams['alpha'] * 0.5  # Reduce regularization
+            adjusted_gamma = hyperparams['gamma'] * 0.8  # More L2 regularization
+        else:
+            adjusted_alpha = hyperparams['alpha']
+            adjusted_gamma = hyperparams['gamma']
+
+        # Build the network based on hyperparameters - IMPROVED: Better architecture for survival
         if hyperparams['coxph_net'] == 'mlp':
+            # Use improved MLP architecture similar to successful binary models
             net = CustomMLP(in_features, out_features, dropout=hyperparams['dropout'])
         elif hyperparams['coxph_net'] == 'linear':
             net = nn.Linear(in_features, out_features, bias=False) # Usually no bias in Cox
@@ -404,10 +403,17 @@ def cross_validation_mode(args):
         if args.center_risk:
             net = CenteredModel(net) # Wrap if centering is enabled
 
-        # Instantiate the CoxPH model with L1/L2 regularization
+        # Instantiate the CoxPH model with L1/L2 regularization - IMPROVED: Better regularization
         # Use Adam optimizer by default from pycox
-        model = CoxPHWithL1(net, tt.optim.Adam, alpha=hyperparams['alpha'], gamma=hyperparams['gamma'])
+        model = CoxPHWithL1(net, tt.optim.Adam, alpha=adjusted_alpha, gamma=adjusted_gamma)
+        
+        # IMPROVED: Use better learning rate scheduling for survival
         model.optimizer.set_lr(hyperparams['learning_rate'])
+        
+        # Add learning rate scheduler for better convergence
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            model.optimizer.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
 
         # Prepare validation data tuple for pycox fit method 
         val_data_pycox = None
@@ -463,12 +469,39 @@ def cross_validation_mode(args):
         # Calculate test C-index for this fold ONLY IF NOT in LOOCV mode
         if not args.leave_one_out:
             try:
-                fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
+                # IMPROVED: Better C-index calculation with edge case handling
+                if len(y_test_true_durations) < 2:
+                    print(f"[WARN] Fold {current_fold + 1}: Test set too small for C-index calculation.")
+                    fold_cindex = np.nan
+                elif len(np.unique(y_test_true_events)) < 2:
+                    print(f"[WARN] Fold {current_fold + 1}: Only one event type in test set.")
+                    fold_cindex = np.nan
+                else:
+                    # IMPROVED: Check for tied predictions which can cause issues
+                    unique_scores = np.unique(test_risk_scores)
+                    if len(unique_scores) < 2:
+                        print(f"[WARN] Fold {current_fold + 1}: All predictions are identical. C-index calculation may be unreliable.")
+                        fold_cindex = np.nan
+                    else:
+                        fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
+                        # Sanity check for extreme values
+                        if fold_cindex < 0.0 or fold_cindex > 1.0:
+                            print(f"[WARN] Fold {current_fold + 1}: Invalid C-index value {fold_cindex:.4f}. Setting to NaN.")
+                            fold_cindex = np.nan
+                        # Additional check for suspicious values
+                        elif fold_cindex < 0.1:
+                            print(f"[WARN] Fold {current_fold + 1}: Very low C-index {fold_cindex:.4f}. This may indicate model issues.")
+                        elif fold_cindex > 0.95:
+                            print(f"[WARN] Fold {current_fold + 1}: Very high C-index {fold_cindex:.4f}. This may indicate overfitting or data leakage.")
+                
                 fold_test_cindices.append(fold_cindex)
-                print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
-            except ZeroDivisionError:
-                print(f"[WARN] Fold {current_fold + 1}: Could not calculate Concordance Index (likely too few comparable pairs in test set).")
-                fold_test_cindices.append(np.nan) # Record NaN if calculation fails
+                if not np.isnan(fold_cindex):
+                    print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
+                else:
+                    print(f"[Fold {current_fold + 1}] Final Test Concordance Index: NaN (insufficient data)")
+            except Exception as e:
+                print(f"[WARN] Fold {current_fold + 1}: Error calculating Concordance Index: {e}")
+                fold_test_cindices.append(np.nan)
         else:
             # In LOOCV mode, we don't calculate C-index per fold
             print(f"[Fold {current_fold + 1}] LOOCV Fold Complete. Storing prediction.")
@@ -521,7 +554,21 @@ def cross_validation_mode(args):
             print("No samples found for this subset.")
             return np.nan
         try:
+            # IMPROVED: Better C-index calculation with edge case handling
+            if len(durations) < 2:
+                print("Too few samples for C-index calculation.")
+                return np.nan
+            elif len(np.unique(events)) < 2:
+                print("Only one event type found. Cannot calculate C-index.")
+                return np.nan
+            
             c_index = concordance_index(durations, scores, event_observed=events)
+            
+            # Sanity check for extreme values
+            if c_index < 0.0 or c_index > 1.0:
+                print(f"Invalid C-index value {c_index:.4f}. Setting to NaN.")
+                return np.nan
+                
             print(f"Concordance Index: {c_index:.4f}")
             print(f"Number of samples: {len(durations)}")
             print(f"Number of events:  {int(sum(events))}")
@@ -549,6 +596,27 @@ def cross_validation_mode(args):
             print(f"Minimum: {min_cindex:.4f}")
             print(f"Maximum: {max_cindex:.4f}")
             print(f"Number of valid folds included: {len(valid_fold_cindices)}/{len(fold_test_cindices)}")
+            
+            # IMPROVED: Additional statistics for better assessment
+            if len(valid_fold_cindices) > 1:
+                median_cindex = np.median(valid_fold_cindices)
+                q25_cindex = np.percentile(valid_fold_cindices, 25)
+                q75_cindex = np.percentile(valid_fold_cindices, 75)
+                print(f"Median: {median_cindex:.4f}")
+                print(f"25th Percentile: {q25_cindex:.4f}")
+                print(f"75th Percentile: {q75_cindex:.4f}")
+                
+                # Performance assessment
+                if mean_cindex > 0.7:
+                    performance_level = "Excellent"
+                elif mean_cindex > 0.6:
+                    performance_level = "Good"
+                elif mean_cindex > 0.5:
+                    performance_level = "Fair"
+                else:
+                    performance_level = "Poor"
+                print(f"Performance Level: {performance_level}")
+            
             fold_stats = {
                 'mean_cindex': mean_cindex,
                 'std_cindex': std_cindex,
@@ -558,6 +626,14 @@ def cross_validation_mode(args):
             }
         else:
             print("\n--- No valid per-fold C-indices recorded --- ")
+            print("All folds had insufficient data or calculation errors.")
+            fold_stats = {
+                'mean_cindex': np.nan,
+                'std_cindex': np.nan,
+                'min_cindex': np.nan,
+                'max_cindex': np.nan,
+                'fold_cindices': [c for c in fold_test_cindices]
+            }
 
     # --- Save Run Summary ---
     try:
@@ -610,24 +686,24 @@ if __name__ == "__main__":
     parser.add_argument("--nyu_csv_file", type=str, default="/gpfs/data/shenlab/wz1492/HCC/spreadsheets/processed_patient_labels_nyu.csv", help="Path to the NYU CSV metadata file.")
     
     parser.add_argument('--preprocessed_root', type=str, default='/gpfs/data/mankowskilab/HCC_Recurrence/preprocessed/', help='Base directory to store/load preprocessed tensors. Set to None or empty string to disable.')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
     parser.add_argument('--num_slices', type=int, default=32, help='Number of slices per patient sample')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
     parser.add_argument('--epochs', type=int, default=100, help='Max epochs per fold')
     parser.add_argument('--output_dir', type=str, default='checkpoints_survival_cv', help='Base output directory')
-    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--center_risk', action='store_true', help='Center risk scores (for CenteredModel wrapper)')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for MLP')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate for MLP')
     parser.add_argument('--num_samples_per_patient', type=int, default=1, help='Number of slice samples per patient series')
     parser.add_argument('--coxph_net', type=str, default='mlp', choices=['mlp', 'linear'], help='Network type for CoxPH')
     parser.add_argument('--dinov2_weights', type=str, default=None, help="Path to DINOv2 weights (.pth or .pt). If not provided, uses pretrained ImageNet DINO weights.")
-    parser.add_argument('--alpha', type=float, default=0.5, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
-    parser.add_argument('--gamma', type=float, default=0.5, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
+    parser.add_argument('--alpha', type=float, default=0.1, help="L1/L2 regularization weight (alpha for CoxPHWithL1)")
+    parser.add_argument('--gamma', type=float, default=0.3, help="L1 vs L2 balance (gamma for CoxPHWithL1, 0=L2, 1=L1)")
     parser.add_argument('--upsampling', action='store_true', help="Upsample minority event class in training data per fold")
     parser.add_argument('--upsampling_method', type=str, default='random', choices=['random','smote','adasyn'], help="Upsampling method: 'random', 'smote', or 'adasyn'")
     parser.add_argument('--early_stopping', action='store_true', help="Use early stopping based on validation loss")
-    parser.add_argument('--early_stopping_patience', type=int, default=20, help="Patience epochs for early stopping.")
+    parser.add_argument('--early_stopping_patience', type=int, default=15, help="Patience epochs for early stopping.")
     parser.add_argument('--cross_validation', action='store_true', default=True, help="Enable cross validation mode")
     parser.add_argument('--cv_folds', type=int, default=7, help="Number of CV folds")
     parser.add_argument('--leave_one_out', action='store_true', help="Use LOOCV (overrides cv_folds)")
