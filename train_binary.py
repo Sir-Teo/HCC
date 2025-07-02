@@ -964,7 +964,7 @@ class OptimizedSimpleMLP(nn.Module):
                     nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        return self.layers(x).squeeze()
+        return self.layers(x)
 
 class OptimizedMLPEnsemble(nn.Module):
     """
@@ -988,9 +988,11 @@ class OptimizedMLPEnsemble(nn.Module):
             outputs.append(model(x))
         
         # Weighted average with learnable weights
-        outputs = torch.stack(outputs)
+        outputs = torch.stack(outputs)  # Shape: [n_models, batch_size, 1]
         weights = torch.softmax(self.ensemble_weights, dim=0)
-        ensemble_output = torch.sum(outputs * weights.unsqueeze(1), dim=0)
+        # Reshape weights to [n_models, 1, 1] for proper broadcasting
+        weights = weights.view(-1, 1, 1)
+        ensemble_output = torch.sum(outputs * weights, dim=0)
         return ensemble_output
 
 def cross_validation_mode(args):

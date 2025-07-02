@@ -33,7 +33,7 @@ fi
 # --- Base SLURM Options ---
 # These will be included in every submitted job script
 SBATCH_OPTS=(
-"#SBATCH -p radiology,a100_short,a100_long,gpu4_short,gpu4_medium,gpu4_long,gpu8_medium,gpu8_long"      # Partitions
+"#SBATCH -p radiology,a100_short,a100_long,gpu4_short,gpu4_medium,gpu4_long"      # Partitions
 "#SBATCH --gres=gpu:1"                # Request 1 GPU
 "#SBATCH --nodes=1"                   # Request 1 node
 "#SBATCH --ntasks=1"                  # Request 1 task

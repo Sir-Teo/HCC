@@ -915,4 +915,3 @@ class HCCDataModule:
 
     def collate_fn(self, batch):
         return self.skip_none_collate(batch)
-
