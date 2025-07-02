@@ -1484,20 +1484,24 @@ def cross_validation_mode(args):
             precision = precision_score(y_true, y_pred_labels, zero_division=0)
             recall = recall_score(y_true, y_pred_labels, zero_division=0)
             f1 = f1_score(y_true, y_pred_labels, zero_division=0)
-            # Check if both classes are present for ROC AUC
+            # Check if both classes are present for ROC AUC and AUC-PR
             if len(np.unique(y_true)) > 1:
                 roc_auc = roc_auc_score(y_true, y_pred_scores)
+                auc_pr = average_precision_score(y_true, y_pred_scores)
                 print(f"ROC AUC:   {roc_auc:.4f}")
+                print(f"AUC-PR:    {auc_pr:.4f}")
             else:
                 print("ROC AUC:   Not defined (only one class present)")
+                print("AUC-PR:    Not defined (only one class present)")
                 roc_auc = np.nan
+                auc_pr = np.nan
 
             print(f"Accuracy:  {accuracy:.4f}")
             print(f"Precision: {precision:.4f}")
             print(f"Recall:    {recall:.4f}")
             print(f"F1 Score:  {f1:.4f}")
             print(f"Positive Class Samples: {int(sum(y_true))}/{len(y_true)}")
-            return {'roc_auc': roc_auc, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
+            return {'roc_auc': roc_auc, 'auc_pr': auc_pr, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
         except Exception as e:
             print(f"Error calculating metrics for {description}: {e}")
             return None
@@ -1626,14 +1630,14 @@ def main(args):
         trial_args = copy.deepcopy(base_args)
 
         # --------- Random hyper-parameter sampling ---------
-        # Learning rate (log-uniform 1e-7 – 1e-3)
-        lr_sample = 10 ** random.uniform(-7, -3)
+        # Learning rate (log-uniform 1e-6 – 1e-4, focusing on range that worked best)
+        lr_sample = 10 ** random.uniform(-6, -4)
         trial_args.learning_rate = lr_sample
 
         # Model architecture choice - heavily bias towards architectures that worked best in analysis
         trial_args.model_arch = random.choices(
             ['linear', 'mlp', 'optimized_simple', 'optimized_ensemble', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced'], 
-            weights=[0.01, 0.25, 0.30, 0.20, 0.08, 0.08, 0.05, 0.02, 0.01]  # Heavily favor optimized architectures based on analysis
+            weights=[0.01, 0.15, 0.35, 0.25, 0.08, 0.08, 0.05, 0.02, 0.01]  # Increased weight for optimized_simple and optimized_ensemble based on best results
         )[0]
         
         if trial_args.model_arch in ['mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced']:
@@ -1643,17 +1647,17 @@ def main(args):
                 weights=[0.2, 0.3, 0.3, 0.15, 0.05]
             )[0]
 
-        # Batch size - bias towards smaller batches that performed well
-        bs_choice = random.choices([8, 16, 32], weights=[0.5, 0.4, 0.1])[0]
+        # Batch size - bias towards smaller batches that performed well (best results with batch size 8)
+        bs_choice = random.choices([8, 16, 32], weights=[0.6, 0.3, 0.1])[0]
         trial_args.batch_size = bs_choice
 
-        # Num slices - bias towards successful ranges
-        slices_choice = random.choices([16, 24, 32, 40, 48], weights=[0.1, 0.3, 0.3, 0.2, 0.1])[0]
+        # Num slices - bias towards successful ranges (32 performed best)
+        slices_choice = random.choices([16, 24, 32, 40, 48], weights=[0.1, 0.2, 0.4, 0.2, 0.1])[0]
         trial_args.num_slices = slices_choice
 
-        # Upsampling method - strongly bias towards enhanced random upsampling based on analysis
+        # Upsampling method - strongly bias towards ADASYN which performed best in analysis
         upsampling_choices = ['smote', 'adasyn', 'random']
-        up_method = random.choices(upsampling_choices, weights=[0.2, 0.3, 0.5])[0]  # Favor random which performed best
+        up_method = random.choices(upsampling_choices, weights=[0.2, 0.5, 0.3])[0]  # Favor ADASYN which performed best
         trial_args.upsampling_method = up_method
 
         # Threshold metric for tuning - bias towards precision-recall balance
@@ -1661,7 +1665,7 @@ def main(args):
 
         # Loss function strategy - bias towards precision-focused losses
         loss_strategy = random.choices(['focal', 'precision_recall_focal', 'cost_sensitive', 'label_smooth', 'standard'], 
-                                     weights=[0.2, 0.5, 0.25, 0.03, 0.02])[0]  # Heavily favor precision-focused losses
+                                     weights=[0.3, 0.4, 0.2, 0.05, 0.05])[0]  # Balanced approach with focal and precision_recall_focal
         
         if loss_strategy == 'focal':
             trial_args.focal_loss = True
@@ -1716,33 +1720,36 @@ def main(args):
 
         try:
             roc_auc = summ["metrics"]["overall"]["roc_auc"]
+            auc_pr = summ["metrics"]["overall"]["auc_pr"]
             precision_overall = summ["metrics"]["overall"]["precision"]
         except Exception as e:
             print(f"[SEARCH] Trial {trial_idx+1}: could not parse metrics ({e}). Skipping candidate.")
-            roc_auc, precision_overall = -math.inf, -math.inf
+            roc_auc, auc_pr, precision_overall = -math.inf, -math.inf, -math.inf
 
         # Free GPU memory between trials
         torch.cuda.empty_cache()
 
-        return roc_auc, precision_overall, trial_args.output_dir
+        return roc_auc, auc_pr, precision_overall, trial_args.output_dir
 
     if args.hyper_search_iters > 1:
         print(f"\n========== Starting hyper-parameter search: {args.hyper_search_iters} trials ==========")
 
         base_output_dir = args.output_dir  # keep the user-specified directory as the parent
-        best_auc, best_prec, best_dir = -math.inf, -math.inf, None
+        best_auc, best_auc_pr, best_prec, best_dir = -math.inf, -math.inf, -math.inf, None
 
         for t in range(args.hyper_search_iters):
-            auc, prec_o, out_dir = _run_single_trial(t, args)
-            print(f"[SEARCH] Trial {t+1} finished: AUC={auc:.4f}, Prec_Ov={prec_o:.4f}")
+            auc, auc_pr, prec_o, out_dir = _run_single_trial(t, args)
+            print(f"[SEARCH] Trial {t+1} finished: AUC={auc:.4f}, AUC-PR={auc_pr:.4f}, Prec_Ov={prec_o:.4f}")
 
-            if auc > best_auc or (math.isclose(auc, best_auc) and prec_o > best_prec):
-                best_auc, best_prec, best_dir = auc, prec_o, out_dir
+            # Prioritize ROC AUC, then AUC-PR, then precision
+            if auc > best_auc or (math.isclose(auc, best_auc) and auc_pr > best_auc_pr) or (math.isclose(auc, best_auc) and math.isclose(auc_pr, best_auc_pr) and prec_o > best_prec):
+                best_auc, best_auc_pr, best_prec, best_dir = auc, auc_pr, prec_o, out_dir
 
         print("\n========== Hyper-parameter search completed ==========")
         if best_dir is not None:
             print(f"Best trial directory: {best_dir}")
             print(f"Best ROC-AUC: {best_auc:.4f}")
+            print(f"Best AUC-PR: {best_auc_pr:.4f}")
             print(f"Best Precision: {best_prec:.4f}")
 
             # Copy best run under a canonical name for convenience
@@ -1815,8 +1822,8 @@ if __name__ == "__main__":
     
     # New model architecture options
     parser.add_argument('--model_arch', type=str, default='enhanced_mlp', 
-                        choices=['linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced'],
-                        help="Network architecture: 'linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', or 'advanced'.")
+                        choices=['linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced', 'optimized_simple', 'optimized_ensemble'],
+                        help="Network architecture: 'linear', 'mlp', 'enhanced_mlp', 'ultra_precision', 'precision_weighted_ensemble', 'precision_focused', 'advanced', 'optimized_simple', or 'optimized_ensemble'.")
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for MLP (if used).')
     # Optional focal-loss arguments
     parser.add_argument('--focal_loss', action='store_true',

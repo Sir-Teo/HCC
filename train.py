@@ -483,7 +483,7 @@ def cross_validation_mode(args):
                         print(f"[WARN] Fold {current_fold + 1}: All predictions are identical. C-index calculation may be unreliable.")
                         fold_cindex = np.nan
                     else:
-                        fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
+                fold_cindex = concordance_index(y_test_true_durations, test_risk_scores, event_observed=y_test_true_events)
                         # Sanity check for extreme values
                         if fold_cindex < 0.0 or fold_cindex > 1.0:
                             print(f"[WARN] Fold {current_fold + 1}: Invalid C-index value {fold_cindex:.4f}. Setting to NaN.")
@@ -496,7 +496,7 @@ def cross_validation_mode(args):
                 
                 fold_test_cindices.append(fold_cindex)
                 if not np.isnan(fold_cindex):
-                    print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
+                print(f"[Fold {current_fold + 1}] Final Test Concordance Index: {fold_cindex:.4f}")
                 else:
                     print(f"[Fold {current_fold + 1}] Final Test Concordance Index: NaN (insufficient data)")
             except Exception as e:

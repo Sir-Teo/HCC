@@ -99,12 +99,13 @@ for script_name in "train.py" "train_binary.py"; do
     else # train_binary.py
         base_output_dir="$BASE_OUTPUT_DIR_BINARY"
         # Binary-specific args (optimized for extreme imbalance and precision)
-        specific_args+=("--dropout 0.3")
+        specific_args+=("--dropout 0.2")  # Reduced from 0.3 based on best results
         specific_args+=("--precision_recall_focal")  # Use new precision-recall focal loss
         specific_args+=("--focal_gamma 2.0")
         specific_args+=("--upsampling_method adasyn")  # Best method from recent testing
         specific_args+=("--cv_folds 7")
         specific_args+=("--hyper_search_iters $num_trials")
+        specific_args+=("--model_arch optimized_simple")  # Use best performing architecture
     fi
 
     for fold_strat in "7fold"; do
