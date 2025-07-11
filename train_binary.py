@@ -1036,6 +1036,8 @@ def cross_validation_mode(args):
     # --- Results Storage --- 
     all_fold_results = [] # Store results dictionary for each test patient
     fold_test_accuracies = [] # Store accuracy per fold for averaging
+    # Collect detailed per-fold metrics to compute mean stats later
+    fold_metrics_list = []
 
     # --- Cross-Validation Loop --- 
     total_folds = data_module.get_total_folds()
@@ -1429,6 +1431,31 @@ def cross_validation_mode(args):
             fold_test_accuracies.append(test_accuracy)
             print(f"[Fold {current_fold + 1}] Final Test Accuracy: {test_accuracy:.4f}")
 
+            # --- Compute and store additional fold-level metrics ---
+            try:
+                if len(np.unique(y_test_true)) > 1:
+                    test_roc_auc = roc_auc_score(y_test_true, test_probs)
+                    test_auc_pr = average_precision_score(y_test_true, test_probs)
+                else:
+                    test_roc_auc = np.nan
+                    test_auc_pr = np.nan
+
+                test_precision = precision_score(y_test_true, test_pred_labels, zero_division=0)
+                test_recall    = recall_score(y_test_true, test_pred_labels, zero_division=0)
+                test_f1        = f1_score(y_test_true, test_pred_labels, zero_division=0)
+            except Exception as e:
+                print(f"Error computing fold metrics: {e}")
+                test_roc_auc = test_auc_pr = test_precision = test_recall = test_f1 = np.nan
+
+            fold_metrics_list.append({
+                'accuracy':  test_accuracy,
+                'precision': test_precision,
+                'recall':    test_recall,
+                'f1':        test_f1,
+                'roc_auc':   test_roc_auc,
+                'auc_pr':    test_auc_pr
+            })
+
         # --- Store Fold Results --- 
         # Store predictions and metadata for each patient in the test set of this fold
         for i in range(len(test_patient_info)):
@@ -1537,7 +1564,8 @@ def cross_validation_mode(args):
             "hyperparameters": vars(args),
             "metrics": {
                 "overall": overall_metrics,
-                "cv_fold_stats": fold_stats if fold_stats else None # Include CV stats if available
+                "cv_fold_stats": fold_stats if fold_stats else None, # Include CV stats if available
+                "mean_metrics_across_folds": mean_metrics
             }
         }
         summary_file_path = os.path.join(args.output_dir, "run_summary.json")
