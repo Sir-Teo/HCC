@@ -1036,8 +1036,7 @@ def cross_validation_mode(args):
     # --- Results Storage --- 
     all_fold_results = [] # Store results dictionary for each test patient
     fold_test_accuracies = [] # Store accuracy per fold for averaging
-    # Collect detailed per-fold metrics to compute mean stats later
-    fold_metrics_list = []
+    fold_metrics = [] # Store all metrics per fold for comprehensive reporting
 
     # --- Cross-Validation Loop --- 
     total_folds = data_module.get_total_folds()
@@ -1426,35 +1425,38 @@ def cross_validation_mode(args):
             test_pred_labels = (test_probs >= threshold).astype(int) # use tuned threshold
             y_test_true = y_test_events # Ground truth [n_test,]
 
-            # Calculate test accuracy for this fold
+            # Calculate comprehensive test metrics for this fold
             test_accuracy = accuracy_score(y_test_true, test_pred_labels)
-            fold_test_accuracies.append(test_accuracy)
-            print(f"[Fold {current_fold + 1}] Final Test Accuracy: {test_accuracy:.4f}")
-
-            # --- Compute and store additional fold-level metrics ---
-            try:
-                if len(np.unique(y_test_true)) > 1:
-                    test_roc_auc = roc_auc_score(y_test_true, test_probs)
-                    test_auc_pr = average_precision_score(y_test_true, test_probs)
-                else:
-                    test_roc_auc = np.nan
-                    test_auc_pr = np.nan
-
-                test_precision = precision_score(y_test_true, test_pred_labels, zero_division=0)
-                test_recall    = recall_score(y_test_true, test_pred_labels, zero_division=0)
-                test_f1        = f1_score(y_test_true, test_pred_labels, zero_division=0)
-            except Exception as e:
-                print(f"Error computing fold metrics: {e}")
-                test_roc_auc = test_auc_pr = test_precision = test_recall = test_f1 = np.nan
-
-            fold_metrics_list.append({
-                'accuracy':  test_accuracy,
+            test_precision = precision_score(y_test_true, test_pred_labels, zero_division=0)
+            test_recall = recall_score(y_test_true, test_pred_labels, zero_division=0)
+            test_f1 = f1_score(y_test_true, test_pred_labels, zero_division=0)
+            
+            # Calculate AUC metrics if both classes are present
+            if len(np.unique(y_test_true)) > 1:
+                test_roc_auc = roc_auc_score(y_test_true, test_probs)
+                test_auc_pr = average_precision_score(y_test_true, test_probs)
+            else:
+                test_roc_auc = np.nan
+                test_auc_pr = np.nan
+            
+            # Store all metrics for this fold
+            fold_metrics.append({
+                'fold': current_fold,
+                'accuracy': test_accuracy,
                 'precision': test_precision,
-                'recall':    test_recall,
-                'f1':        test_f1,
-                'roc_auc':   test_roc_auc,
-                'auc_pr':    test_auc_pr
+                'recall': test_recall,
+                'f1': test_f1,
+                'roc_auc': test_roc_auc,
+                'auc_pr': test_auc_pr,
+                'threshold': threshold,
+                'n_samples': len(y_test_true),
+                'n_positive': int(np.sum(y_test_true))
             })
+            
+            fold_test_accuracies.append(test_accuracy)
+            print(f"[Fold {current_fold + 1}] Test Metrics - Accuracy: {test_accuracy:.4f}, Precision: {test_precision:.4f}, Recall: {test_recall:.4f}, F1: {test_f1:.4f}")
+            if not np.isnan(test_roc_auc):
+                print(f"[Fold {current_fold + 1}] Test AUC - ROC: {test_roc_auc:.4f}, PR: {test_auc_pr:.4f}")
 
         # --- Store Fold Results --- 
         # Store predictions and metadata for each patient in the test set of this fold
@@ -1536,27 +1538,101 @@ def cross_validation_mode(args):
     # Overall Metrics (on combined test sets from all folds)
     overall_metrics = calculate_metrics(y_true_all, y_pred_scores_all, y_pred_labels_all, "Overall Test Set (Aggregated)")
 
-    # --- Per-Fold Accuracy Summary --- 
+    # --- Comprehensive Per-Fold Statistics Summary --- 
     fold_stats = {} # Initialize fold stats dict
-    if fold_test_accuracies:
-        mean_accuracy = np.mean(fold_test_accuracies)
-        std_accuracy = np.std(fold_test_accuracies)
-        min_accuracy = np.min(fold_test_accuracies)
-        max_accuracy = np.max(fold_test_accuracies)
-        print("\n--- Cross Validation Accuracy Statistics (Per-Fold Test Set Accuracies) ---")
-        print(f"Mean: {mean_accuracy:.4f}")
-        print(f"Standard Deviation: {std_accuracy:.4f}")
-        print(f"Minimum: {min_accuracy:.4f}")
-        print(f"Maximum: {max_accuracy:.4f}")
+    if fold_metrics:
+        # Extract metrics from all folds
+        metrics_df = pd.DataFrame(fold_metrics)
+        
+        print("\n--- Cross Validation Statistics (Per-Fold Test Set Metrics) ---")
+        print("=" * 80)
+        
+        # Calculate statistics for each metric
+        metric_names = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'auc_pr']
+        fold_summary = {}
+        
+        for metric in metric_names:
+            if metric in metrics_df.columns:
+                values = metrics_df[metric].dropna()  # Remove NaN values for AUC metrics
+                if len(values) > 0:
+                    mean_val = np.mean(values)
+                    std_val = np.std(values)
+                    min_val = np.min(values)
+                    max_val = np.max(values)
+                    
+                    fold_summary[metric] = {
+                        'mean': mean_val,
+                        'std': std_val,
+                        'min': min_val,
+                        'max': max_val,
+                        'values': values.tolist()
+                    }
+                    
+                    print(f"{metric.upper().replace('_', '-'):>12}: Mean={mean_val:.4f} ± {std_val:.4f}, Range=[{min_val:.4f}, {max_val:.4f}]")
+                else:
+                    print(f"{metric.upper().replace('_', '-'):>12}: No valid values")
+        
+        # Additional summary statistics
+        print("\n--- Detailed Fold Summary ---")
+        valid_folds = len(metrics_df)
+        total_samples = metrics_df['n_samples'].sum()
+        total_positive = metrics_df['n_positive'].sum()
+        
+        print(f"Total Folds Completed: {valid_folds}")
+        print(f"Total Test Samples: {total_samples}")
+        print(f"Total Positive Samples: {total_positive} ({100*total_positive/total_samples:.1f}%)")
+        print(f"Average Samples per Fold: {total_samples/valid_folds:.1f}")
+        print(f"Average Positive per Fold: {total_positive/valid_folds:.1f}")
+        
+        # Threshold statistics
+        thresholds = metrics_df['threshold'].values
+        print(f"Threshold Range: [{np.min(thresholds):.3f}, {np.max(thresholds):.3f}], Mean: {np.mean(thresholds):.3f}")
+        
         fold_stats = {
-            'mean_accuracy': mean_accuracy,
-            'std_accuracy': std_accuracy,
-            'min_accuracy': min_accuracy,
-            'max_accuracy': max_accuracy,
-            'fold_accuracies': fold_test_accuracies # Store individual fold accuracies
+            'fold_summary': fold_summary,
+            'total_folds': valid_folds,
+            'total_samples': int(total_samples),
+            'total_positive': int(total_positive),
+            'fold_details': fold_metrics
         }
+        
+        # Legacy compatibility for accuracy
+        if 'accuracy' in fold_summary:
+            fold_stats.update({
+                'mean_accuracy': fold_summary['accuracy']['mean'],
+                'std_accuracy': fold_summary['accuracy']['std'],
+                'min_accuracy': fold_summary['accuracy']['min'],
+                'max_accuracy': fold_summary['accuracy']['max'],
+                'fold_accuracies': fold_summary['accuracy']['values']
+            })
+        
+                 print("=" * 80)
+         
+         # Report best performing fold
+         if len(fold_metrics) > 0:
+             print("\n--- Best Performing Fold ---")
+             
+             # Find best fold by different metrics
+             best_by_accuracy = max(fold_metrics, key=lambda x: x['accuracy'])
+             best_by_f1 = max(fold_metrics, key=lambda x: x['f1'])
+             
+             # For AUC metrics, only consider folds with valid values
+             valid_auc_folds = [f for f in fold_metrics if not np.isnan(f.get('roc_auc', np.nan))]
+             if valid_auc_folds:
+                 best_by_roc_auc = max(valid_auc_folds, key=lambda x: x['roc_auc'])
+                 best_by_auc_pr = max(valid_auc_folds, key=lambda x: x['auc_pr'])
+                 
+                 print(f"Best Accuracy:  Fold {best_by_accuracy['fold']+1} ({best_by_accuracy['accuracy']:.4f})")
+                 print(f"Best F1 Score:  Fold {best_by_f1['fold']+1} ({best_by_f1['f1']:.4f})")
+                 print(f"Best ROC-AUC:   Fold {best_by_roc_auc['fold']+1} ({best_by_roc_auc['roc_auc']:.4f})")
+                 print(f"Best AUC-PR:    Fold {best_by_auc_pr['fold']+1} ({best_by_auc_pr['auc_pr']:.4f})")
+             else:
+                 print(f"Best Accuracy:  Fold {best_by_accuracy['fold']+1} ({best_by_accuracy['accuracy']:.4f})")
+                 print(f"Best F1 Score:  Fold {best_by_f1['fold']+1} ({best_by_f1['f1']:.4f})")
+                 print("AUC metrics: Not available (single class in all folds)")
+         
     else:
-        print("\n--- No per-fold accuracies recorded (likely due to errors or no completed folds) ---")
+        print("\n--- No per-fold metrics recorded (likely due to errors or no completed folds) ---")
 
     # --- Save Run Summary ---
     try:
@@ -1564,8 +1640,7 @@ def cross_validation_mode(args):
             "hyperparameters": vars(args),
             "metrics": {
                 "overall": overall_metrics,
-                "cv_fold_stats": fold_stats if fold_stats else None, # Include CV stats if available
-                "mean_metrics_across_folds": mean_metrics
+                "cv_fold_stats": fold_stats if fold_stats else None # Include CV stats if available
             }
         }
         summary_file_path = os.path.join(args.output_dir, "run_summary.json")
@@ -1588,6 +1663,64 @@ def cross_validation_mode(args):
         print(f"Run summary saved to {summary_file_path}")
     except Exception as e:
         print(f"[ERROR] Failed to save run summary: {e}")
+
+    # --- Final Comprehensive Summary ---
+    print("\n" + "="*100)
+    print("FINAL TRAINING SUMMARY")
+    print("="*100)
+    
+    if overall_metrics and fold_stats:
+        print(f"Dataset: NYU HCC (Cross-Validation with {fold_stats.get('total_folds', 'N/A')} folds)")
+        print(f"Model Architecture: {args.model_arch}")
+        print(f"Total Test Samples: {fold_stats.get('total_samples', 'N/A')}")
+        print(f"Class Distribution: {fold_stats.get('total_positive', 'N/A')} positive / {fold_stats.get('total_samples', 0) - fold_stats.get('total_positive', 0)} negative")
+        
+        print("\n--- OVERALL PERFORMANCE (Aggregated Test Set) ---")
+        if overall_metrics:
+            for metric, value in overall_metrics.items():
+                if value is not None and not (isinstance(value, float) and np.isnan(value)):
+                    print(f"{metric.upper().replace('_', '-'):>12}: {value:.4f}")
+        
+        print("\n--- CROSS-VALIDATION STATISTICS (Mean ± Std) ---")
+        if 'fold_summary' in fold_stats:
+            for metric, stats in fold_stats['fold_summary'].items():
+                mean_val = stats['mean']
+                std_val = stats['std']
+                print(f"{metric.upper().replace('_', '-'):>12}: {mean_val:.4f} ± {std_val:.4f}")
+        
+        # Highlight key findings
+        print("\n--- KEY FINDINGS ---")
+        if 'fold_summary' in fold_stats:
+            if 'roc_auc' in fold_stats['fold_summary']:
+                mean_auc = fold_stats['fold_summary']['roc_auc']['mean']
+                if mean_auc >= 0.8:
+                    print(f"✓ Excellent discriminative performance (Mean ROC-AUC: {mean_auc:.3f})")
+                elif mean_auc >= 0.7:
+                    print(f"✓ Good discriminative performance (Mean ROC-AUC: {mean_auc:.3f})")
+                else:
+                    print(f"! Limited discriminative performance (Mean ROC-AUC: {mean_auc:.3f})")
+            
+            if 'precision' in fold_stats['fold_summary']:
+                mean_precision = fold_stats['fold_summary']['precision']['mean']
+                if mean_precision >= 0.8:
+                    print(f"✓ High precision: {mean_precision:.3f} (low false positive rate)")
+                elif mean_precision >= 0.6:
+                    print(f"○ Moderate precision: {mean_precision:.3f}")
+                else:
+                    print(f"! Low precision: {mean_precision:.3f} (high false positive rate)")
+            
+            if 'recall' in fold_stats['fold_summary']:
+                mean_recall = fold_stats['fold_summary']['recall']['mean']
+                if mean_recall >= 0.8:
+                    print(f"✓ High recall: {mean_recall:.3f} (low false negative rate)")
+                elif mean_recall >= 0.6:
+                    print(f"○ Moderate recall: {mean_recall:.3f}")
+                else:
+                    print(f"! Low recall: {mean_recall:.3f} (high false negative rate)")
+    
+    print("="*100)
+    print("Training completed successfully!")
+    print("="*100)
 
 def precision_focused_threshold_tuning(y_true, y_scores, min_recall=0.3, precision_weight=0.7):
     """
